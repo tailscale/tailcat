@@ -15,8 +15,19 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build ./...
-      - run: go test -count=1 -timeout 120s ./...
+      - run: go test -count=1 -timeout 300s ./...
       - run: go vet ./...
+  libtailcat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: build c-archive and c-shared libraries
+        run: make -C libtailcat all
+      - name: C bindings integration test
+        run: go test -count=1 -timeout 300s ./libtailcat/...
   wasm:
     runs-on: ubuntu-latest
     steps:

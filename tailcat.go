@@ -258,6 +258,13 @@ type Server struct {
 	// destination, not just the server's own address.
 	OnTCPForward func(netip.AddrPort) (handler func(net.Conn))
 
+	// OnClientConnect, if non-nil, is called from its own goroutine
+	// when a new client completes the meow handshake and is added as
+	// a WireGuard peer. It is called at most once per client key.
+	//
+	// It must be set before calling Start.
+	OnClientConnect func(key.NodePublic)
+
 	// ServedTCPPorts, if non-nil, restricts which TCP ports on the
 	// server's own address the packet filter admits new inbound
 	// connections to. If nil, connections to all ports reach OnTCP,
@@ -327,8 +334,13 @@ func NewServer(priv key.NodePrivate, logf logger.Logf, regs ...*tailcfg.DERPRegi
 				// Only reply once the client is fully added as a peer:
 				// "meowed" is the ack that tells the client it can
 				// start dialing. Disallowed clients get no reply.
-				if lb.onMeow(src, discoPub) {
-					mc.SendDERPPacketTo(src, regionID, EncodeMeowed())
+				allowed, isNew := lb.onMeow(src, discoPub)
+				if !allowed {
+					return
+				}
+				mc.SendDERPPacketTo(src, regionID, EncodeMeowed())
+				if isNew && srv.OnClientConnect != nil {
+					srv.OnClientConnect(src)
 				}
 			}()
 			return true
@@ -433,6 +445,25 @@ func (s *Server) Addr() netip.Addr { return s.lb.addr }
 func (s *Server) Start() error {
 	s.lb.sys.Engine.Get().SetFilter(s.buildFilter())
 	return s.lb.Start()
+}
+
+// WaitDERPConnected blocks until the server has an established
+// connection to its DERP relay region, or ctx is done. Start
+// initiates that connection but does not wait for it; a meow from a
+// client that arrives at the relay before the server is connected is
+// lost, so callers that hand out the ConnBlob immediately after Start
+// should wait first.
+func (s *Server) WaitDERPConnected(ctx context.Context) error {
+	regionID := s.lb.derpRegionID()
+	ht := s.lb.sys.HealthTracker.Get()
+	for ht.GetDERPRegionReceivedTime(regionID).IsZero() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 // Close shuts down the server, closing the WireGuard engine and DERP connections.
@@ -885,20 +916,22 @@ func (lb *locoBackend) Start() error {
 }
 
 // onMeow handles a MeowPing from the client with node key src and
-// disco key discoPub, adding it as a WireGuard peer. It reports
-// whether the client is allowed and configured, meaning a "meowed"
-// acknowledgment may be sent.
-func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
+// disco key discoPub, adding it as a WireGuard peer. The allowed
+// result reports whether the client is allowed and configured,
+// meaning a "meowed" acknowledgment may be sent. The isNew result
+// reports whether this call added the client, as opposed to it
+// already being a peer from an earlier meow.
+func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) (allowed, isNew bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("got meow from %v", src.String())
 	if b.allowedClients != nil && !b.allowedClients[src] {
 		b.logf("ignoring meow from %v: not in allowedClients", src.String())
-		return false
+		return false, false
 	}
 
 	if _, ok := b.clients[src]; ok {
-		return true
+		return true, false
 	}
 	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
 	derpRegion := b.derpRegionID()
@@ -943,7 +976,7 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	// No engine reconfig needed: the WireGuard device learns about the
 	// new peer lazily via the config source installed with
 	// SetPeerConfigFunc when the client's handshake arrives.
-	return true
+	return true, true
 }
 
 func (b *locoBackend) Status() *ipnstate.Status {
@@ -1131,6 +1164,12 @@ func NewClient(logf logger.Logf, server ConnBlob, priv key.NodePrivate) (*Client
 
 // PublicKey returns the client's node public key.
 func (c *Client) PublicKey() key.NodePublic { return c.lb.pub }
+
+// Connected returns a channel that is closed once the server has
+// acknowledged this client via the meow handshake, meaning the
+// tunnel is ready for dialing. The handshake happens implicitly on
+// the first Dial or [Client.Ping] call.
+func (c *Client) Connected() <-chan struct{} { return c.meowWait }
 
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
 func (c *Client) Close() error { return c.lb.Close() }
