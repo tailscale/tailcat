@@ -6,6 +6,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -38,9 +40,10 @@ func clientSSHMode(logf logger.Logf) {
 	dst := args[0] // either a derpaddr alone or "user@<derpaddr>"
 	cmdArgs := args[1:]
 
-	connBlobStr := dst
-	if strings.Contains(dst, "@") {
-		_, connBlobStr, _ = strings.Cut(dst, "@")
+	sshUser, connBlobStr, hasUser := strings.Cut(dst, "@")
+	if !hasUser {
+		connBlobStr = sshUser
+		sshUser = ""
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -50,6 +53,10 @@ func clientSSHMode(logf logger.Logf) {
 	if err != nil {
 		log.Fatalf("no ssh client found in $PATH: %v", err)
 	}
+	sshDst := sshDestHost(connBlobStr)
+	if sshUser != "" {
+		sshDst = sshUser + "@" + sshDst
+	}
 	argv := []string{
 		sshExe,
 		"-o", "UpdateHostKeys no",
@@ -57,9 +64,32 @@ func clientSSHMode(logf logger.Logf) {
 		"-o", "UserKnownHostsFile /dev/null",
 		"-o", "LogLevel ERROR",
 		"-o", fmt.Sprintf("ProxyCommand=%s --key=%q %s %s", exe, *flagKey, connBlobStr, portOrIPPort),
-		dst,
+		sshDst,
 	}
 	argv = append(argv, cmdArgs...)
 	err = syscall.Exec(sshExe, argv, os.Environ())
 	log.Fatalf("failed to exec: %v", err)
+}
+
+// sshDestHost returns the hostname to give the system ssh client as the
+// connection destination for a tailcat ConnBlob. It is a short, deterministic
+// function of blob rather than blob itself.
+//
+// ssh substitutes the literal destination hostname into %n in ControlPath
+// (commonly "~/.ssh/master-%r@%n:%p"), and that expansion has to fit in an
+// AF_UNIX socket path (~100 bytes total, including the home directory and
+// ".ssh/master-" prefix). A ConnBlob can run past that on its own, so ssh
+// with connection multiplexing fails with "too long for Unix domain socket"
+// before tailcat is ever invoked (#12). The real blob is unaffected: it's
+// passed to ProxyCommand as its own argument and still does the actual
+// routing, so this string only ever labels the connection for ssh's
+// bookkeeping (%n, and StrictHostKeyChecking is already off).
+//
+// Deterministic hashing, not blob truncation, matters here: ssh's connection
+// sharing keys a control socket off ControlPath, so the same blob must
+// always produce the same short host or multiplexing silently stops
+// reusing (or worse, collides across) the right server.
+func sshDestHost(blob string) string {
+	sum := sha256.Sum256([]byte(blob))
+	return "tailcat-" + hex.EncodeToString(sum[:8])
 }
