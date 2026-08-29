@@ -117,7 +117,7 @@ as 'all_proxy' environment variable to a child process. Destination
 hostnames that are themselves address blobs are dialed as tailcat
 servers, so the <addrblob> argument is optional:
 
-	tailcat socks [<addrblob>] [<cmd> [args...]]
+	tailcat socks [-listen <addr:port>] [<addrblob>] [<cmd> [args...]]
 	tailcat socks <addrblob> curl http://server.tailcat:8081/
 	tailcat socks curl http://<addrblob>:8081/
 
@@ -439,8 +439,32 @@ func clientMode(logf logger.Logf, connStr, optDest string) {
 	}
 }
 
+// This function will only fill in the missing part.
+// 0.0.0.0 and 0 will be used for the address and port respectively.
+// It won't validate the input, we delegate this to the following socket creation
+func normalizeListenAddrPort(s string) string {
+	if host, port, err := net.SplitHostPort(s); err == nil {
+		if host == "" {
+			host = "0.0.0.0"
+		}
+		if port == "" {
+			port = "0"
+		}
+		return net.JoinHostPort(host, port)
+	} else if port, err := strconv.ParseUint(s, 10, 16); err == nil {
+		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	}
+	// Assume it's hostname
+	return s + ":0"
+}
+
 func clientSOCKSMode(logf logger.Logf) {
-	args := flag.Args()[1:] // trim "socks"
+	fs := flag.NewFlagSet("socks", flag.ExitOnError)
+	listen := fs.String("listen", "127.0.0.1:0", "Proxy server's listen address")
+	fs.Parse(flag.Args()[1:]) // stripping off "socks"
+	args := fs.Args()
+
+	lisenAddrPort := normalizeListenAddrPort(*listen)
 
 	// The address blob argument is optional: destination hostnames that
 	// are themselves address blobs are dialed directly (see
@@ -488,7 +512,7 @@ func clientSOCKSMode(logf logger.Logf) {
 		return c
 	}
 
-	socksLn, err := net.Listen("tcp", "localhost:0")
+	socksLn, err := net.Listen("tcp", lisenAddrPort)
 	if err != nil {
 		log.Fatal(err)
 	}

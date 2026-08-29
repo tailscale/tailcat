@@ -135,3 +135,45 @@ func TestClassifySOCKSAddr(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeListenAddrPort(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "integer only",
+			input: "1234",
+			want:  "127.0.0.1:1234",
+		},
+		{
+			name:  "omit address",
+			input: ":1234",
+			want:  "0.0.0.0:1234",
+		},
+		{
+			name:  "omit port with IPv4 address",
+			input: "127.0.0.1",
+			want:  "127.0.0.1:0",
+		},
+		{
+			name:  "omit port with IPv6 address",
+			input: "[2001:db8::1]",
+			want:  "[2001:db8::1]:0",
+		},
+		{
+			name:  "others",
+			input: "foo",
+			want:  "foo:0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeListenAddrPort(tt.input)
+			if got != tt.want {
+				t.Fatalf("classifyListenAddrPort(%q) = %q; want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
