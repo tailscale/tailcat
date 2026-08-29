@@ -117,9 +117,11 @@ as 'all_proxy' environment variable to a child process. Destination
 hostnames that are themselves address blobs are dialed as tailcat
 servers, so the <addrblob> argument is optional:
 
-	tailcat socks [<addrblob>] <cmd> [args...]
+	tailcat socks [<addrblob>] [<cmd> [args...]]
 	tailcat socks <addrblob> curl http://server.tailcat:8081/
 	tailcat socks curl http://<addrblob>:8081/
+
+If you don't specify the cmd, just the proxy server will start.
 
 Parse an address blob and print its encoded fields as JSON:
 
@@ -458,9 +460,6 @@ func clientSOCKSMode(logf logger.Logf) {
 			}
 		}
 	}
-	if len(args) == 0 {
-		usage("tailcat socks [<addrblob>] <cmd> [args...]")
-	}
 	progArgs := args
 
 	var cl *tailcat.Client
@@ -512,20 +511,25 @@ func clientSOCKSMode(logf logger.Logf) {
 			return cl.DialTCP(ctx, dst.dst)
 		},
 	}
-	go func() {
-		log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksLn))
-	}()
 	socksAddr := "socks5h://" + socksLn.Addr().String()
-	logf("SOCKS running at %v", socksAddr)
-	cmd := exec.Command(progArgs[0], progArgs[1:]...)
-	cmd.Env = append(os.Environ(),
-		"all_proxy="+socksAddr,
-	)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Fatal(err)
+	if len(progArgs) > 0 {
+		go func() {
+			log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksLn))
+		}()
+		logf("SOCKS running at %v", socksAddr)
+		cmd := exec.Command(progArgs[0], progArgs[1:]...)
+		cmd.Env = append(os.Environ(),
+			"all_proxy="+socksAddr,
+		)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		fmt.Printf("SOCKS running at %v\n", socksAddr)
+		log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksLn))
 	}
 }
 
