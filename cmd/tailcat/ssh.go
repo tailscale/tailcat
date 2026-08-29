@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/tailscale/tailcat"
 	"tailscale.com/types/logger"
 )
 
@@ -63,12 +64,23 @@ func clientSSHMode(logf logger.Logf) {
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile /dev/null",
 		"-o", "LogLevel ERROR",
-		"-o", fmt.Sprintf("ProxyCommand=%s --key=%q %s %s", exe, *flagKey, connBlobStr, portOrIPPort),
+		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, connBlobStr, portOrIPPort),
 		sshDst,
 	}
 	argv = append(argv, cmdArgs...)
 	err = syscall.Exec(sshExe, argv, os.Environ())
 	log.Fatalf("failed to exec: %v", err)
+}
+
+// sshProxyCommand returns the command passed to OpenSSH to connect the SSH
+// client to a tailcat server. The command is run by OpenSSH, so values that
+// can contain shell-special characters must be quoted.
+func sshProxyCommand(exe, keyName, derpMapURL, connBlob, portOrIPPort string) string {
+	cmd := fmt.Sprintf("%s --key=%q", exe, keyName)
+	if derpMapURL != tailcat.DefaultDERPMapURL {
+		cmd += fmt.Sprintf(" --derpmap-url=%q", derpMapURL)
+	}
+	return fmt.Sprintf("%s %s %s", cmd, connBlob, portOrIPPort)
 }
 
 // sshDestHost returns the hostname to give the system ssh client as the

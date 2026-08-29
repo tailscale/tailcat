@@ -8,7 +8,31 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/tailscale/tailcat"
 )
+
+func TestSSHProxyCommandDERPMap(t *testing.T) {
+	const (
+		exe  = "/path/to/tailcat"
+		key  = "client-default"
+		blob = "tc-short-blob"
+		port = "22"
+		url  = "https://derp.example.com/derpmap.json"
+	)
+
+	got := sshProxyCommand(exe, key, url, blob, port)
+	want := exe + ` --key="client-default" --derpmap-url="https://derp.example.com/derpmap.json" tc-short-blob 22`
+	if got != want {
+		t.Errorf("sshProxyCommand with custom DERP map = %q; want %q", got, want)
+	}
+
+	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, blob, port)
+	want = exe + ` --key="client-default" tc-short-blob 22`
+	if got != want {
+		t.Errorf("sshProxyCommand with default DERP map = %q; want %q", got, want)
+	}
+}
 
 func TestSSHDestHost(t *testing.T) {
 	// A realistic ConnBlob, taken from an existing test fixture elsewhere
