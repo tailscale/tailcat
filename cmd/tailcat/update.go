@@ -144,20 +144,15 @@ func updateMode() {
 	}
 
 	u := newUpdater()
-	if !*check {
-		releaseLock, acquired, err := u.acquireLock()
-		if err != nil {
-			fatalUpdate(err)
-		}
-		if !acquired {
-			fatalUpdate(errors.New("another tailcat update is already in progress"))
-		}
-		defer releaseLock()
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
 	defer cancel()
-	result, err := u.run(ctx, versionString(), !*check)
+	var result updateResult
+	var err error
+	if *check {
+		result, err = u.run(ctx, versionString(), false)
+	} else {
+		result, err = u.runWithLock(ctx, versionString())
+	}
 	if err != nil {
 		fatalUpdate(err)
 	}
@@ -167,6 +162,18 @@ func updateMode() {
 func fatalUpdate(err error) {
 	fmt.Fprintf(os.Stderr, "tailcat update: %v\n", err)
 	os.Exit(1)
+}
+
+func (u *updater) runWithLock(ctx context.Context, current string) (updateResult, error) {
+	releaseLock, acquired, err := u.acquireLock()
+	if err != nil {
+		return updateResult{}, err
+	}
+	if !acquired {
+		return updateResult{}, errors.New("another tailcat update is already in progress")
+	}
+	defer releaseLock()
+	return u.run(ctx, current, true)
 }
 
 func printUpdateResult(result updateResult, checkOnly bool) {

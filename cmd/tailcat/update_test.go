@@ -78,6 +78,28 @@ func TestCompareReleaseVersions(t *testing.T) {
 	}
 }
 
+func TestRunWithLockReleasesLockOnError(t *testing.T) {
+	lockPath := filepath.Join(t.TempDir(), "update.lock")
+	u := &updater{
+		lockPath: func() (string, error) { return lockPath, nil },
+	}
+	if _, err := u.runWithLock(context.Background(), "(devel)"); err == nil {
+		t.Fatal("development build unexpectedly updated")
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("update lock remains after error: %v", err)
+	}
+
+	releaseLock, acquired, err := u.acquireLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquired {
+		t.Fatal("could not reacquire update lock after error")
+	}
+	releaseLock()
+}
+
 func TestChecksumForAsset(t *testing.T) {
 	want := sha256.Sum256([]byte("archive"))
 	checksums := fmt.Appendf(nil, "%x  other.zip\n%x *tailcat.zip\n", sha256.Sum256(nil), want)
