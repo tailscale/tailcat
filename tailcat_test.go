@@ -5,6 +5,7 @@ package tailcat
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-cmp/cmp"
 	"go4.org/mem"
 	"tailscale.com/tailcfg"
@@ -418,6 +420,40 @@ func TestConnBlob(t *testing.T) {
 			if diff := cmp.Diff(want, gotCI); diff != "" {
 				t.Errorf("ParseConnBlob result back diff:\n%s", diff)
 			}
+		})
+	}
+}
+
+func TestParseConnBlobMalformedPublicKey(t *testing.T) {
+	for name, keyBytes := range map[string][]byte{
+		"short": make([]byte, key.NodePublicRawLen-1),
+		"long":  make([]byte, key.NodePublicRawLen+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := cbor.Marshal(map[string][]byte{"p": keyBytes})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cb := ConnBlob("tc" + base64.RawURLEncoding.EncodeToString(raw))
+			assertParseError := func(name string, parse func() error) {
+				t.Helper()
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("%s panicked: %v", name, r)
+					}
+				}()
+				if err := parse(); err == nil {
+					t.Errorf("%s unexpectedly accepted malformed public key", name)
+				}
+			}
+			assertParseError("ParseConnBlob", func() error {
+				_, err := ParseConnBlob(cb)
+				return err
+			})
+			assertParseError("ParseConnBlobRaw", func() error {
+				_, err := ParseConnBlobRaw(cb)
+				return err
+			})
 		})
 	}
 }

@@ -174,6 +174,9 @@ func (p NodePublic) MarshalBinary() ([]byte, error) {
 
 // UnmarshalBinary implements encoding.BinaryUnmarshaler for CBOR deserialization.
 func (p *NodePublic) UnmarshalBinary(x []byte) error {
+	if len(x) != key.NodePublicRawLen {
+		return fmt.Errorf("invalid node public key length %d, want %d", len(x), key.NodePublicRawLen)
+	}
 	p.NodePublic = key.NodePublicFromRaw32(go4mem.B(x))
 	return nil
 }
