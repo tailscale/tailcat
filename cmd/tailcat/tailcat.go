@@ -131,6 +131,11 @@ Parse an address blob and print its encoded fields as JSON:
 
 	tailcat parse <addrblob>
 
+Check for or install a newer release:
+
+	tailcat update --check
+	tailcat update
+
 Resolve a short address blob into a longer self-contained one with
 embedded DERP server info (see also the server's --full-address flag):
 
@@ -195,6 +200,7 @@ func versionString() string {
 }
 
 func main() {
+	cleanupUpdateBackup()
 	flag.Usage = func() { usage("") }
 	flag.Parse()
 	if *flagReadme {
@@ -209,6 +215,10 @@ func main() {
 		tailcat.Verbose = true
 	}
 	args := flag.Args()
+	if len(args) > 0 && args[0] == "update" {
+		updateMode()
+		return
+	}
 	serverMode := len(args) == 0 || *flagServe != ""
 	if len(args) > 0 && serverMode {
 		usage("No positional arguments are valid along with --serve")

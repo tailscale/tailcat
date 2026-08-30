@@ -86,6 +86,29 @@ yay -S tailcat-bin
 
 ## Usage
 
+### Updates
+
+Standalone official release and tagged `go install` binaries can check for or
+install the latest stable release manually when that release contains a
+prebuilt archive for the current platform:
+
+```sh
+$ tailcat update --check
+$ tailcat update
+```
+
+The updater discovers the exact `GOOS`/`GOARCH` asset emitted by the release
+matrix, downloads it, and verifies it against the release's `checksums.txt`
+before replacing the executable. New targets using the existing GoReleaser
+archive naming template are discovered without updater code changes.
+Debian, RPM, and Arch Linux/AUR packages should instead be upgraded through
+their package manager. The same applies to Homebrew, MacPorts, WinGet, Scoop,
+Chocolatey, and Windows installer packages. Nix and container installations
+should be updated through Nix or by pulling a newer image. macOS source
+installations should currently be updated with the `go install ...@latest`
+command above until macOS archives are added to the release matrix; native
+Homebrew packaging is tracked in [#28](https://github.com/tailscale/tailcat/issues/28).
+
 ### Pipe stdin/stdout between two machines
 
 Server starts, printing out its ephemeral address:
