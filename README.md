@@ -71,6 +71,19 @@ $ nix run github:tailscale/tailcat
 $ nix profile install github:tailscale/tailcat
 ```
 
+Or from archlinux AUR:
+
+[![tailcat on AUR](https://img.shields.io/aur/version/tailcat?label=tailcat)](https://aur.archlinux.org/packages/tailcat/)
+[![tailcat-bin on AUR](https://img.shields.io/aur/version/tailcat-bin?label=tailcat-bin)](https://aur.archlinux.org/packages/tailcat-bin/)
+
+```bash
+# Build release package from source
+yay -S tailcat
+
+# OR install the binary release
+yay -S tailcat-bin
+```
+
 ## Usage
 
 ### Pipe stdin/stdout between two machines
