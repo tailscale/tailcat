@@ -549,3 +549,67 @@ func TestFetchDERPMapMemoryCache(t *testing.T) {
 		t.Errorf("fetches = %d; want 1", n)
 	}
 }
+
+// TestParseConnBlobNullInArrays checks that ParseConnBlob rejects blobs whose
+// region or node arrays contain a CBOR null. Those decode to nil pointers, and
+// before this was checked they panicked when dereferenced. Blobs come from
+// untrusted places, so a panic here takes down the process.
+func TestParseConnBlobNullInArrays(t *testing.T) {
+	blob := func(t *testing.T, m map[string]any) ConnBlob {
+		t.Helper()
+		b, err := cbor.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ConnBlob("tc" + base64.RawURLEncoding.EncodeToString(b))
+	}
+	pub := key.NewNode().Public().AppendTo(nil)
+
+	tests := []struct {
+		name string
+		blob ConnBlob
+	}{
+		{
+			name: "null_region",
+			blob: blob(t, map[string]any{"p": pub, "r": []any{nil}}),
+		},
+		{
+			name: "null_node",
+			blob: blob(t, map[string]any{"p": pub, "r": []any{
+				map[string]any{"i": 1, "N": []any{nil}},
+			}}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseConnBlob(tt.blob); err == nil {
+				t.Fatal("ParseConnBlob succeeded; want an error")
+			}
+		})
+	}
+}
+
+// TestParseConnBlobRawKeepsNulls documents that the raw form stays permissive:
+// "tailcat parse" is a diagnostic for looking at a broken blob, so it shows the
+// nulls instead of rejecting them.
+func TestParseConnBlobRawKeepsNulls(t *testing.T) {
+	b, err := cbor.Marshal(map[string]any{
+		"p": key.NewNode().Public().AppendTo(nil),
+		"r": []any{nil},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb := ConnBlob("tc" + base64.RawURLEncoding.EncodeToString(b))
+	got, err := ParseConnBlobRaw(cb)
+	if err != nil {
+		t.Fatalf("ParseConnBlobRaw: %v", err)
+	}
+	w, ok := got.(*wireConnInfo)
+	if !ok {
+		t.Fatalf("got %T; want *wireConnInfo", got)
+	}
+	if len(w.Region) != 1 || w.Region[0] != nil {
+		t.Errorf("Region = %v; want a single nil element", w.Region)
+	}
+}

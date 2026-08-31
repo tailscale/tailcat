@@ -845,7 +845,18 @@ func ParseConnBlob(cb ConnBlob) (ConnInfo, error) {
 	if w.ServerDiscoPublic != nil {
 		ci.ServerDiscoPublic = *w.ServerDiscoPublic
 	}
-	for _, wr := range w.Region {
+	for i, wr := range w.Region {
+		// CBOR nulls decode to nil pointers, and blobs come from
+		// untrusted places (a pasted address, a "tailcat=" TXT record),
+		// so reject them rather than dereferencing them below.
+		if wr == nil {
+			return zero, fmt.Errorf("invalid connection blob: region %d is null", i)
+		}
+		for j, n := range wr.Nodes {
+			if n == nil {
+				return zero, fmt.Errorf("invalid connection blob: region %d node %d is null", i, j)
+			}
+		}
 		ci.Region = append(ci.Region, wr.derpRegion())
 	}
 	for ri, r := range ci.Region {
