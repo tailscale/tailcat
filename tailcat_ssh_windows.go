@@ -18,6 +18,7 @@ import (
 
 	ssh "github.com/tailscale/gliderssh"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // newSessionCommand returns an unstarted command running PowerShell:
@@ -46,6 +47,24 @@ func newSessionCommand(u *user.User, rawCmd string) *exec.Cmd {
 
 // powerShellPath returns the path of the Windows PowerShell executable.
 func powerShellPath() string {
+	// See https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration#configuring-the-default-shell-for-openssh-in-windows
+	if key, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\OpenSSH`, registry.QUERY_VALUE|registry.WOW64_64KEY); err == nil {
+		shell, _, _ := key.GetStringValue("DefaultShell")
+		key.Close()
+		name := strings.ToLower(filepath.Base(shell))
+		if name == "pwsh.exe" || name == "powershell.exe" {
+			if p, err := exec.LookPath(shell); err == nil {
+				return p
+			}
+		}
+	}
+	if p, err := exec.LookPath("pwsh.exe"); err == nil {
+		return p
+	}
+	pwsh := filepath.Join(os.Getenv("ProgramFiles"), "PowerShell", "7", "pwsh.exe")
+	if p, err := exec.LookPath(pwsh); err == nil {
+		return p
+	}
 	if p, err := exec.LookPath("powershell.exe"); err == nil {
 		return p
 	}
