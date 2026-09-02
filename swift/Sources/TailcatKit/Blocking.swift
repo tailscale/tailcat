@@ -29,15 +29,20 @@ enum Blocking {
 
 extension Duration {
     /// The duration in whole milliseconds as the C layer takes timeouts,
-    /// clamped to Int32. Zero means no limit beyond tailcat's own.
+    /// rounded up, since a positive timeout must never become 0, which
+    /// means no limit, and clamped to Int32. Zero or less means no limit
+    /// beyond tailcat's own.
     var millisecondsForC: Int32 {
-        let (seconds, attoseconds) = components
-        if seconds < 0 {
+        guard self > .zero else {
             return 0
         }
+        let (seconds, attoseconds) = components
         if seconds >= Int64(Int32.max) / 1000 {
             return Int32.max
         }
-        return Int32(clamping: seconds * 1000 + attoseconds / 1_000_000_000_000_000)
+        let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+        let (wholeMilliseconds, rest) = attoseconds.quotientAndRemainder(dividingBy: attosecondsPerMillisecond)
+        let milliseconds = seconds * 1000 + wholeMilliseconds + (rest > 0 ? 1 : 0)
+        return Int32(clamping: milliseconds)
     }
 }

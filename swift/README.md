@@ -77,7 +77,10 @@ let long = try await token.resolved()              // self-contained form, relay
 
 Restrict a server to known clients with `ServerConfiguration.allowedClients`
 or `TailcatServer.allow(_:)`, and give clients an `Identity` so their
-public key is stable. With a saved identity, `RelaySelection.automatic`
+public key is stable. The allow list gates registration: a client that
+registered while it was empty stays connected, so list the clients before
+start to lock a server down from the beginning. With a saved identity,
+`RelaySelection.automatic`
 keeps the relay recorded in the key file (a fixed region keeps the token
 stable across restarts); `.region(id)` and `.hosts([...])` override it.
 

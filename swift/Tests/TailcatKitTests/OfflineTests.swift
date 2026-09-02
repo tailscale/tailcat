@@ -19,6 +19,24 @@ func peerRead(_ fd: Int32, max: Int = 4096) -> Data? {
     return n < 0 ? nil : Data(buf[0..<n])
 }
 
+/// Runs body, failing with TailcatError.timeout if it takes longer than
+/// seconds, so that a regression which hangs fails instead of stalling
+/// the whole run.
+func withDeadline<T: Sendable>(_ seconds: Int = 10, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await body() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw TailcatError.timeout
+        }
+        guard let result = try await group.next() else {
+            throw TailcatError.timeout
+        }
+        group.cancelAll()
+        return result
+    }
+}
+
 /// Offline tests of Connection over a plain socketpair, and of the server
 /// and listener life cycle before start.
 final class ConnectionTests: XCTestCase {
@@ -158,6 +176,60 @@ final class ConnectionTests: XCTestCase {
         peerWrite(peer, "later")
         let got = try await conn.receive()
         XCTAssertEqual(String(decoding: got, as: UTF8.self), "later")
+        conn.close()
+        Darwin.close(peer)
+    }
+
+    func testCancellationAtEveryStageOfReceive() async throws {
+        let (conn, peer) = try makePair()
+        // Cancel at varying points of entering receive(): before it runs,
+        // while it registers, and once it waits. None may hang or return
+        // data, and the connection stays usable.
+        try await withDeadline(30) {
+            for i in 0..<300 {
+                let waiting = Task { try await conn.receive() }
+                switch i % 3 {
+                case 1: await Task.yield()
+                case 2: try await Task.sleep(for: .microseconds(50))
+                default: break
+                }
+                waiting.cancel()
+                do {
+                    _ = try await waiting.value
+                    XCTFail("receive \(i) returned for a cancelled task")
+                } catch {
+                    XCTAssertTrue(error is CancellationError, "receive \(i): unexpected error \(error)")
+                }
+            }
+        }
+        peerWrite(peer, "later")
+        let got = try await conn.receive()
+        XCTAssertEqual(String(decoding: got, as: UTF8.self), "later")
+        conn.close()
+        Darwin.close(peer)
+    }
+
+    func testConcurrentReceiveIsRefusedWithoutDisturbingTheFirst() async throws {
+        let (conn, peer) = try makePair()
+        let first = Task { try await conn.receive() }
+        try await Task.sleep(for: .milliseconds(20))
+        // A second receive is refused; cancelling it must not end the
+        // first, whose registration it does not own.
+        for _ in 0..<100 {
+            let second = Task { try await conn.receive() }
+            second.cancel()
+            do {
+                _ = try await second.value
+                XCTFail("a second receive succeeded")
+            } catch is CancellationError {
+            } catch TailcatError.internalError {
+            } catch {
+                XCTFail("unexpected error \(error)")
+            }
+        }
+        peerWrite(peer, "data")
+        let got = try await withDeadline { try await first.value }
+        XCTAssertEqual(String(decoding: got, as: UTF8.self), "data")
         conn.close()
         Darwin.close(peer)
     }
@@ -326,5 +398,126 @@ final class ServerLifecycleTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? TailcatError, .closed)
         }
+    }
+}
+
+/// Offline tests of ListenerCore, the readiness machinery behind
+/// Listener, over a plain socketpair.
+final class ListenerCoreTests: XCTestCase {
+    /// A core over one end of a socketpair, that end, and the peer.
+    func makeCore() -> (ListenerCore, Int32, Int32) {
+        var fds: [Int32] = [-1, -1]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+        return (ListenerCore(fd: fds[0]), fds[0], fds[1])
+    }
+
+    /// Each wait arms a fresh read source. Re-arming right after the
+    /// previous source fired must never be mistaken for a concurrent
+    /// accept.
+    func testRepeatedWaitsDoNotCollide() async throws {
+        let (core, fd, peer) = makeCore()
+        try await withDeadline(60) {
+            for i in 0..<5000 {
+                peerWrite(peer, "x")
+                do {
+                    try await core.waitReadable()
+                } catch {
+                    XCTFail("wait \(i) failed: \(error)")
+                    return
+                }
+                var byte: UInt8 = 0
+                XCTAssertEqual(Darwin.read(fd, &byte, 1), 1)
+            }
+        }
+        core.close()
+        Darwin.close(peer)
+    }
+
+    func testCancellationAtEveryStageOfWait() async throws {
+        let (core, fd, peer) = makeCore()
+        try await withDeadline(30) {
+            for i in 0..<300 {
+                let waiting = Task { try await core.waitReadable() }
+                switch i % 3 {
+                case 1: await Task.yield()
+                case 2: try await Task.sleep(for: .microseconds(50))
+                default: break
+                }
+                waiting.cancel()
+                do {
+                    try await waiting.value
+                    XCTFail("wait \(i) returned for a cancelled task")
+                } catch {
+                    XCTAssertTrue(error is CancellationError, "wait \(i): unexpected error \(error)")
+                }
+            }
+            // The core is still usable afterwards.
+            peerWrite(peer, "x")
+            try await core.waitReadable()
+            var byte: UInt8 = 0
+            XCTAssertEqual(Darwin.read(fd, &byte, 1), 1)
+        }
+        core.close()
+        Darwin.close(peer)
+    }
+
+    func testConcurrentWaitIsRefusedWithoutDisturbingTheFirst() async throws {
+        let (core, fd, peer) = makeCore()
+        let first = Task { try await core.waitReadable() }
+        try await Task.sleep(for: .milliseconds(20))
+        for _ in 0..<100 {
+            let second = Task { try await core.waitReadable() }
+            second.cancel()
+            do {
+                try await second.value
+                XCTFail("a second wait succeeded")
+            } catch is CancellationError {
+            } catch TailcatError.internalError {
+            } catch {
+                XCTFail("unexpected error \(error)")
+            }
+        }
+        peerWrite(peer, "x")
+        try await withDeadline { try await first.value }
+        var byte: UInt8 = 0
+        XCTAssertEqual(Darwin.read(fd, &byte, 1), 1)
+        core.close()
+        Darwin.close(peer)
+    }
+
+    func testCloseEndsWait() async throws {
+        let (core, _, peer) = makeCore()
+        let waiting = Task { try await core.waitReadable() }
+        try await Task.sleep(for: .milliseconds(20))
+        core.close()
+        do {
+            try await withDeadline { try await waiting.value }
+            XCTFail("wait returned after close")
+        } catch {
+            XCTAssertEqual(error as? TailcatError, .closed)
+        }
+        // The descriptor is closed once the source has let go of it: the
+        // peer reads EOF.
+        var pfd = pollfd(fd: peer, events: Int16(POLLIN), revents: 0)
+        XCTAssertEqual(poll(&pfd, 1, 5000), 1)
+        XCTAssertEqual(peerRead(peer), Data())
+        Darwin.close(peer)
+    }
+}
+
+/// Tests of the Duration to C timeout conversion.
+final class DurationTests: XCTestCase {
+    func testMillisecondsForCRoundsUp() {
+        XCTAssertEqual(Duration.zero.millisecondsForC, 0)
+        XCTAssertEqual(Duration.seconds(-1).millisecondsForC, 0)
+        XCTAssertEqual(Duration.microseconds(-500).millisecondsForC, 0)
+        // A positive timeout never becomes 0, which means no limit.
+        XCTAssertEqual(Duration.nanoseconds(1).millisecondsForC, 1)
+        XCTAssertEqual(Duration.microseconds(500).millisecondsForC, 1)
+        XCTAssertEqual(Duration.milliseconds(1).millisecondsForC, 1)
+        XCTAssertEqual((Duration.milliseconds(1) + .nanoseconds(1)).millisecondsForC, 2)
+        XCTAssertEqual(Duration.milliseconds(1500).millisecondsForC, 1500)
+        XCTAssertEqual(Duration.seconds(3).millisecondsForC, 3000)
+        XCTAssertEqual(Duration.seconds(1_000_000_000).millisecondsForC, Int32.max)
     }
 }

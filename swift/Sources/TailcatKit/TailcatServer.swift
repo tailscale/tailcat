@@ -144,9 +144,13 @@ public actor TailcatServer {
         return token
     }
 
-    /// Allows a client by public key, before or after start. Until any
-    /// key is allowed every client may connect; once one is, only allowed
-    /// keys can.
+    /// Allows a client by public key, before or after start. The allow
+    /// list gates registration: until any key is allowed every client may
+    /// register; once one is, only allowed clients can. A client that
+    /// registered while the list was empty stays registered, its pings
+    /// keep succeeding and it can still open connections until the server
+    /// closes or the client restarts; to lock a server down from the
+    /// start, list its clients in ServerConfiguration.allowedClients.
     public func allow(_ key: NodePublicKey) throws {
         let h = try activeHandle()
         try TailcatError.check(key.rawValue.withCString { tailcat_server_allow_client(h, $0) }, handle: h)

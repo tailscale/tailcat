@@ -8,6 +8,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"golang.org/x/sys/unix"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -216,6 +219,20 @@ func connInfo(t *testing.T, l, c cInt) (remote string, localPort int) {
 	return goString(&buf[0]), int(port)
 }
 
+// expectCloseOnExec fails the test unless fd, a descriptor handed to C, is
+// close-on-exec, so that a child process the host spawns does not inherit
+// it and keep the connection alive.
+func expectCloseOnExec(t *testing.T, what string, fd cInt) {
+	t.Helper()
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("fcntl(F_GETFD) on the %s descriptor %d: %v", what, fd, err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("the %s descriptor %d is not close-on-exec", what, fd)
+	}
+}
+
 // waitFor polls cond for up to timeout.
 func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
@@ -242,6 +259,7 @@ func TestEndToEnd(t *testing.T) {
 	setServerRegionForTest(sd, reg)
 	var l80, lAny cInt
 	check(t, "listen 80", sd, TailcatServerListen(sd, 80, &l80))
+	expectCloseOnExec(t, "listener", l80)
 	if rc := TailcatServerListen(sd, 80, &lAny); rc != -1 || errmsg(sd) == "" {
 		t.Fatalf("second listen on port 80: rc=%d, errmsg=%q; want -1 with a message", rc, errmsg(sd))
 	}
@@ -343,8 +361,10 @@ func TestEndToEnd(t *testing.T) {
 	// Dial, accept, exchange data both ways.
 	var c1 cInt
 	check(t, "dial 80", cd, TailcatClientDial(cd, 80, 10000, &c1))
+	expectCloseOnExec(t, "dialed connection", c1)
 	writeAll(t, c1, "hello\n")
 	s1 := accept(t, l80, 10*time.Second)
+	expectCloseOnExec(t, "accepted connection", s1)
 	if got := readLine(t, s1); got != "hello\n" {
 		t.Fatalf("server read %q; want hello", got)
 	}
@@ -600,4 +620,89 @@ func TestServerConfig(t *testing.T) {
 	if rc := TailcatServerStart(9999); rc != cEBADF {
 		t.Fatalf("start on a bogus handle: rc=%d; want EBADF", rc)
 	}
+}
+
+// TestClientPublicKeyDoesNotBlock checks that tailcat_client_public_key
+// answers right away while another thread's first-use ping is fetching
+// the DERP map, instead of waiting behind tailcat's start lock, and that
+// the client's key can no longer change once it has been reported.
+func TestClientPublicKeyDoesNotBlock(t *testing.T) {
+	// A DERP map server that stalls until released, then fails.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enterOnce sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enterOnce.Do(func() { close(entered) })
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		http.Error(w, "no DERP map here", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// A token that references a DERP map region by ID, so the client
+	// must fetch the map, and carries a disco key (the README token
+	// predates those, and a client refuses to start without one).
+	pk := tailcat.NewPrivateKey()
+	pk.Public.RegionID = readmeTokenRegn
+	js, err := json.Marshal(pk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cjs := cString(string(js))
+	var tok *cChar
+	if e := TailcatKeyToken(cjs, &tok); e != nil {
+		t.Fatalf("key_token: %s", gostr(e))
+	}
+	cFree(cjs)
+	ctoken := cString(gostr(tok))
+	defer cFree(ctoken)
+	cd := TailcatClientNew(ctoken)
+	if cd == 0 {
+		t.Fatal("client_new returned 0 for a key_token token")
+	}
+	check(t, "set_logfd", cd, TailcatSetLogFD(cd, -1))
+	curl := cString(srv.URL + "/derpmap.json")
+	check(t, "set_derpmap_url", cd, TailcatClientSetDERPMapURL(cd, curl))
+	cFree(curl)
+
+	pingDone := make(chan cInt, 1)
+	go func() { pingDone <- TailcatClientPing(cd, 5000, nil) }()
+	select {
+	case <-entered:
+	case rc := <-pingDone:
+		t.Fatalf("the ping returned rc=%d before fetching the DERP map: %s", rc, errmsg(cd))
+	case <-time.After(10 * time.Second):
+		t.Fatal("the ping never fetched the DERP map")
+	}
+
+	start := time.Now()
+	pub := readBuf(t, "public_key", cd, func(b *cChar, n cSize) cInt { return TailcatClientPublicKey(cd, b, n) })
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("public_key took %v with a ping in flight; want it not to wait for the DERP map fetch", d)
+	}
+	if !strings.HasPrefix(pub, "nodekey:") {
+		t.Fatalf("public_key = %q", pub)
+	}
+	close(release)
+	if rc := <-pingDone; rc != -1 {
+		t.Fatalf("ping with no DERP map: rc=%d; want -1", rc)
+	}
+	t.Logf("ping with no DERP map: %s", errmsg(cd))
+
+	// The key was reported and the client used: set_key is too late.
+	other, err := json.Marshal(tailcat.NewPrivateKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cother := cString(string(other))
+	if rc := TailcatClientSetKey(cd, cother); rc != -1 {
+		t.Fatalf("set_key after use: rc=%d; want -1", rc)
+	}
+	cFree(cother)
+	if got := readBuf(t, "public_key again", cd, func(b *cChar, n cSize) cInt { return TailcatClientPublicKey(cd, b, n) }); got != pub {
+		t.Fatalf("public_key changed from %s to %s", pub, got)
+	}
+	check(t, "client_close", cd, TailcatClientClose(cd))
 }

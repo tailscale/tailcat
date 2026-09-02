@@ -72,11 +72,32 @@ final class ListenerCore: Sendable {
     private struct State: Sendable {
         var fd: Int32
         var closed = false
-        /// The source armed for the accept in progress, if any. While it
-        /// is set, its cancel handler owns closing the descriptor.
+        /// The source armed for the accept in progress, if any. Its cancel
+        /// handler is the one place the source is retired and the waiter
+        /// resumed, so a following accept never finds a source that is
+        /// still winding down; while it is set, that handler also owns
+        /// closing the descriptor.
         var source: SourceRef?
-        /// The accept waiting for readability, if any.
+        /// The accept waiting for readability, set and cleared together
+        /// with source.
         var waiter: CheckedContinuation<Void, any Error>?
+        /// What happened to the armed source: the descriptor became
+        /// readable, or the waiting task was cancelled.
+        var readable = false
+        var taskCancelled = false
+    }
+
+    /// What one waitReadable call has armed, for its cancellation handler,
+    /// which must act on that arm alone, and whether the task was
+    /// cancelled before the arm was recorded.
+    private struct Registration: Sendable {
+        var ref: SourceRef?
+        var cancelled = false
+    }
+
+    /// Why an armed source was retired.
+    private enum Outcome {
+        case readable, cancelled, closed
     }
 
     private let state: OSAllocatedUnfairLock<State>
@@ -90,6 +111,7 @@ final class ListenerCore: Sendable {
     /// tailcat_accept will not block.
     func waitReadable() async throws {
         try Task.checkCancellation()
+        let registration = OSAllocatedUnfairLock(initialState: Registration())
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 let armed: Result<SourceRef, TailcatError> = state.withLock { s in
@@ -102,6 +124,8 @@ final class ListenerCore: Sendable {
                     let ref = SourceRef(source: DispatchSource.makeReadSource(fileDescriptor: s.fd, queue: Self.queue))
                     s.source = ref
                     s.waiter = continuation
+                    s.readable = false
+                    s.taskCancelled = false
                     return .success(ref)
                 }
                 switch armed {
@@ -109,46 +133,89 @@ final class ListenerCore: Sendable {
                     continuation.resume(throwing: error)
                 case .success(let ref):
                     ref.source.setEventHandler { [state, ref] in
-                        let waiter = state.withLock { s -> CheckedContinuation<Void, any Error>? in
-                            let w = s.waiter
-                            s.waiter = nil
-                            return w
+                        // Note the readability and retire the source; its
+                        // cancel handler resumes the waiter.
+                        state.withLock { s in
+                            if let current = s.source, current.source === ref.source {
+                                s.readable = true
+                            }
                         }
                         ref.source.cancel()
-                        waiter?.resume()
                     }
                     ref.source.setCancelHandler { [state, ref] in
-                        // The source is unregistered now, so the
-                        // descriptor may be closed if close() asked for it.
-                        let (fdToClose, waiter) = state.withLock { s -> (Int32, CheckedContinuation<Void, any Error>?) in
-                            var fdToClose: Int32 = -1
-                            if let current = s.source, current.source === ref.source {
-                                s.source = nil
-                                if s.closed {
-                                    fdToClose = s.fd
-                                    s.fd = -1
-                                }
+                        // The source is unregistered now: retire it, close
+                        // the descriptor if close() asked for that, and
+                        // resume the waiter with what happened.
+                        let (fdToClose, waiter, outcome) = state.withLock { s -> (Int32, CheckedContinuation<Void, any Error>?, Outcome) in
+                            guard let current = s.source, current.source === ref.source else {
+                                return (-1, nil, .closed)
                             }
+                            s.source = nil
                             let w = s.waiter
                             s.waiter = nil
-                            return (fdToClose, w)
+                            var fdToClose: Int32 = -1
+                            if s.closed {
+                                fdToClose = s.fd
+                                s.fd = -1
+                            }
+                            let outcome: Outcome
+                            if s.taskCancelled {
+                                outcome = .cancelled
+                            } else if s.closed || !s.readable {
+                                outcome = .closed
+                            } else {
+                                outcome = .readable
+                            }
+                            return (fdToClose, w, outcome)
                         }
                         if fdToClose >= 0 {
                             _ = Darwin.close(fdToClose)
                         }
-                        waiter?.resume(throwing: TailcatError.closed)
+                        switch outcome {
+                        case .readable:
+                            waiter?.resume()
+                        case .cancelled:
+                            waiter?.resume(throwing: CancellationError())
+                        case .closed:
+                            waiter?.resume(throwing: TailcatError.closed)
+                        }
                     }
                     ref.source.activate()
+                    // Record the arm for the cancellation handler. If the
+                    // task was cancelled before now, that handler found
+                    // nothing to act on, so act here.
+                    let cancelledMeanwhile = registration.withLock { r -> Bool in
+                        r.ref = ref
+                        return r.cancelled
+                    }
+                    if cancelledMeanwhile {
+                        cancelWait(ref)
+                    }
                 }
             }
         } onCancel: {
-            let (ref, waiter) = state.withLock { s -> (SourceRef?, CheckedContinuation<Void, any Error>?) in
-                let w = s.waiter
-                s.waiter = nil
-                return (s.source, w)
+            let ref = registration.withLock { r -> SourceRef? in
+                r.cancelled = true
+                return r.ref
             }
-            ref?.source.cancel()
-            waiter?.resume(throwing: CancellationError())
+            if let ref {
+                cancelWait(ref)
+            }
+        }
+    }
+
+    /// Ends the wait armed with ref, if it is still the current one, with
+    /// CancellationError: the source's cancel handler resumes the waiter.
+    private func cancelWait(_ ref: SourceRef) {
+        let current = state.withLock { s -> Bool in
+            guard let current = s.source, current.source === ref.source else {
+                return false
+            }
+            s.taskCancelled = true
+            return true
+        }
+        if current {
+            ref.source.cancel()
         }
     }
 
@@ -189,23 +256,22 @@ final class ListenerCore: Sendable {
         )
     }
 
-    /// Closes the listener once: wakes a waiting accept with
-    /// TailcatError.closed and closes the descriptor, directly or from the
-    /// armed source's cancel handler.
+    /// Closes the listener once: a waiting accept ends with
+    /// TailcatError.closed, and the descriptor is closed, directly or from
+    /// the armed source's cancel handler once the source has let go of
+    /// it.
     func close() {
-        let (fdToClose, ref, waiter) = state.withLock { s -> (Int32, SourceRef?, CheckedContinuation<Void, any Error>?) in
+        let (fdToClose, ref) = state.withLock { s -> (Int32, SourceRef?) in
             if s.closed {
-                return (-1, nil, nil)
+                return (-1, nil)
             }
             s.closed = true
-            let w = s.waiter
-            s.waiter = nil
             if let ref = s.source {
-                return (-1, ref, w)
+                return (-1, ref)
             }
             let fd = s.fd
             s.fd = -1
-            return (fd, nil, w)
+            return (fd, nil)
         }
         if let ref {
             ref.source.cancel()
@@ -213,6 +279,5 @@ final class ListenerCore: Sendable {
         if fdToClose >= 0 {
             _ = Darwin.close(fdToClose)
         }
-        waiter?.resume(throwing: TailcatError.closed)
     }
 }

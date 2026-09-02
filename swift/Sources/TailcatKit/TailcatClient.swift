@@ -57,9 +57,10 @@ public actor TailcatClient {
         }
     }
 
-    /// The client's node public key, "nodekey:<hex>", generating the
-    /// ephemeral key if no identity was given. Give it to the server's
-    /// allow(_:).
+    /// The client's node public key, "nodekey:<hex>": that of the
+    /// identity given at init, or else of the ephemeral key generated
+    /// then. Give it to the server's allow(_:). It never blocks, not even
+    /// while a ping or connect is bringing the client up.
     public var publicKey: NodePublicKey {
         get throws {
             let h = try activeHandle()
@@ -76,8 +77,9 @@ public actor TailcatClient {
     /// returns the relay round trip (tailcat_client_ping, off-thread).
     /// Each call sends one probe: a server that does not allow this
     /// client, or one still connecting to its relay right after starting,
-    /// shows up as TailcatError.timeout, which is worth a retry. A zero
-    /// timeout means no limit beyond tailcat's own.
+    /// shows up as TailcatError.timeout, which is worth a retry. The
+    /// timeout is rounded up to whole milliseconds; zero means no limit
+    /// beyond tailcat's own.
     public func ping(timeout: Duration = .seconds(10)) async throws -> Duration {
         let h = try activeHandle()
         let ms = timeout.millisecondsForC
@@ -91,8 +93,9 @@ public actor TailcatClient {
 
     /// Reports how packets reach the server (tailcat_client_path_json,
     /// off-thread): a direct path, or the relay carrying them. Calling it
-    /// repeatedly nudges direct path discovery along. A zero timeout means
-    /// no limit beyond tailcat's own.
+    /// repeatedly nudges direct path discovery along. The timeout is
+    /// rounded up to whole milliseconds; zero means no limit beyond
+    /// tailcat's own.
     public func path(timeout: Duration = .seconds(10)) async throws -> PathInfo {
         let h = try activeHandle()
         let ms = timeout.millisecondsForC
@@ -110,7 +113,8 @@ public actor TailcatClient {
     /// Opens a TCP connection to port on the server (tailcat_client_dial,
     /// off-thread). Throws TailcatError.invalidPort for port 0 and
     /// TailcatError.posix(ECONNREFUSED, _) when nothing listens on the
-    /// port. A zero timeout means no limit beyond tailcat's own.
+    /// port. The timeout is rounded up to whole milliseconds; zero means
+    /// no limit beyond tailcat's own.
     public func connect(port: UInt16, timeout: Duration = .seconds(15)) async throws -> Connection {
         guard port != 0 else {
             throw TailcatError.invalidPort

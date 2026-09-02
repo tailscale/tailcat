@@ -42,9 +42,13 @@ public final class Connection: Sendable {
         var reading = false
         var readRequested = 0
         var readDelivered = 0
-        /// The receive waiting for data, if any.
+        /// The receive waiting for data, if any, with the serial of the
+        /// receive() call that registered it, so that a cancellation
+        /// handler acts only on its own registration.
         var receiver: CheckedContinuation<Data, any Error>?
         var receiverMax = 0
+        var receiverSerial: UInt64 = 0
+        var lastSerial: UInt64 = 0
     }
 
     /// Wraps the descriptor, which the connection now owns and closes
@@ -110,16 +114,20 @@ public final class Connection: Sendable {
             throw TailcatError.internalError("receive needs a positive maxLength")
         }
         try Task.checkCancellation()
+        let serial = state.withLock { s -> UInt64 in
+            s.lastSerial += 1
+            return s.lastSerial
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, any Error>) in
                 enum Action {
                     case resume(Data)
-                    case fail(TailcatError)
+                    case fail(any Error)
                     case wait(startRead: Bool)
                 }
                 let action: Action = state.withLock { s in
                     if s.closed {
-                        return .fail(.closed)
+                        return .fail(TailcatError.closed)
                     }
                     if !s.buffer.isEmpty {
                         return .resume(Self.take(&s, maxLength))
@@ -131,10 +139,18 @@ public final class Connection: Sendable {
                         return .resume(Data())
                     }
                     if s.receiver != nil {
-                        return .fail(.internalError("a receive is already in progress"))
+                        return .fail(TailcatError.internalError("a receive is already in progress"))
+                    }
+                    // A cancellation that landed before this point ran the
+                    // handler with nothing registered yet; checking under
+                    // the lock closes that window, since any later one
+                    // finds the registration.
+                    if Task.isCancelled {
+                        return .fail(CancellationError())
                     }
                     s.receiver = continuation
                     s.receiverMax = maxLength
+                    s.receiverSerial = serial
                     if s.reading {
                         return .wait(startRead: false)
                     }
@@ -155,8 +171,12 @@ public final class Connection: Sendable {
                 }
             }
         } onCancel: {
+            // Only this call's registration: another receive may be the
+            // one waiting.
             let receiver = state.withLock { s -> CheckedContinuation<Data, any Error>? in
-                let r = s.receiver
+                guard s.receiverSerial == serial, let r = s.receiver else {
+                    return nil
+                }
                 s.receiver = nil
                 return r
             }

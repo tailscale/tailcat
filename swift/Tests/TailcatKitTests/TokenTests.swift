@@ -73,6 +73,36 @@ final class TokenTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode([NodePublicKey].self, from: encoded), [key])
     }
 
+    /// A DERP map that cannot be fetched is a network failure, not a bad
+    /// token: only a malformed token is reported as invalidToken.
+    func testResolveMapsNetworkFailures() async throws {
+        // Nothing listens on port 9 of the loopback interface, so the
+        // fetch is refused outright.
+        let refused = try XCTUnwrap(URL(string: "http://127.0.0.1:9/derpmap.json"))
+        let token = try XCTUnwrap(ConnectionToken(rawValue: Self.readmeToken))
+        do {
+            _ = try await token.resolved(derpMapURL: refused, timeout: .seconds(5))
+            XCTFail("resolving against a refused DERP map URL succeeded")
+        } catch TailcatError.invalidToken(let message) {
+            XCTFail("a network failure was reported as an invalid token: \(message)")
+        } catch let error as TailcatError {
+            if case .posix(let code, _) = error {
+                XCTAssertEqual(code, ECONNREFUSED)
+            }
+        }
+        // A malformed token is invalid whatever the map.
+        let garbage = try XCTUnwrap(ConnectionToken(rawValue: "tcgarbage"))
+        do {
+            _ = try await garbage.resolved(derpMapURL: refused, timeout: .seconds(5))
+            XCTFail("resolving a malformed token succeeded")
+        } catch TailcatError.invalidToken {
+        }
+        // A token that embeds its relay resolves to itself, offline.
+        let embedded = try XCTUnwrap(ConnectionToken(rawValue: Self.resolvedToken))
+        let same = try await embedded.resolved(derpMapURL: refused, timeout: .seconds(5))
+        XCTAssertEqual(same, embedded)
+    }
+
     func testClientRejectsMalformedToken() throws {
         let token = try XCTUnwrap(ConnectionToken(rawValue: "tcgarbage"))
         XCTAssertThrowsError(try TailcatClient(token: token)) { error in

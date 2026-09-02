@@ -89,8 +89,12 @@ public struct ConnectionToken: Sendable, Hashable, Codable, RawRepresentable, Cu
     /// details embedded so clients need no DERP map fetch (the same as
     /// "tailcat resolve"). A token that already embeds them comes back
     /// unchanged. The DERP map is fetched from derpMapURL, or the default
-    /// map when nil. The work runs off the Swift concurrency threads. A
-    /// zero timeout means no limit beyond the fetch's own.
+    /// map when nil. The work runs off the Swift concurrency threads. The
+    /// timeout is rounded up to whole milliseconds; zero means no limit
+    /// beyond the fetch's own. Throws TailcatError.invalidToken for a
+    /// malformed token, TailcatError.timeout when time runs out, and
+    /// otherwise the fetch's error, such as
+    /// TailcatError.posix(ECONNREFUSED, _) or TailcatError.internalError.
     public func resolved(derpMapURL: URL? = nil, timeout: Duration = .seconds(10)) async throws -> ConnectionToken {
         let token = rawValue
         let url = derpMapURL?.absoluteString
@@ -105,10 +109,14 @@ public struct ConnectionToken: Sendable, Hashable, Codable, RawRepresentable, Cu
             }
             if let message = CStrings.take(err) {
                 free(out)
-                switch TailcatError.classify(message: message) {
-                case .timeout: throw TailcatError.timeout
-                default: throw TailcatError.invalidToken(message)
+                // Resolving fails either because the token is malformed,
+                // which parse() detects offline, or because the DERP map
+                // could not be fetched, which says nothing about the
+                // token.
+                if (try? self.parse()) == nil {
+                    throw TailcatError.invalidToken(message)
                 }
+                throw TailcatError.classify(message: message)
             }
             guard let text = CStrings.take(out) else {
                 throw TailcatError.internalError("tailcat_token_resolve returned no token")

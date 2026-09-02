@@ -54,7 +54,7 @@ var (
 	errNotStarted    = errors.New("server not started")
 	errClientStarted = errors.New("client already started; set options before its first use")
 	errClientClosed  = errors.New("client closed")
-	errKeyFixed      = errors.New("client key already generated; set the key before asking for the public key")
+	errKeyFixed      = errors.New("client key already reported; set the key before asking for the public key")
 )
 
 // objects is the handle table: every tailcat_handle given to C maps to a
@@ -759,7 +759,7 @@ func (s *server) listen(port uint16) (*listener, error) {
 	// The tailcat_listener we return to C is one side of a socketpair(2).
 	// Connections are pushed through it as they arrive, so C can poll(2)
 	// the listener to learn when tailcat_accept won't block.
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	fds, err := socketpair()
 	if err != nil {
 		return nil, err
 	}
@@ -926,6 +926,11 @@ func recvHandoff(lfd int) (connFd int, msg []byte, err error) {
 			if err != nil {
 				return -1, nil, err
 			}
+			// recvmsg installs received descriptors without the close-on-exec
+			// flag (Darwin has no MSG_CMSG_CLOEXEC), so set it here.
+			for _, fd := range fds {
+				syscall.CloseOnExec(fd)
+			}
 			if len(fds) != 1 {
 				for _, fd := range fds {
 					syscall.Close(fd)
@@ -1020,7 +1025,7 @@ type conn struct {
 // newConn wraps the tunnel connection nc in a socketpair, returning the
 // conn and the descriptor for C.
 func newConn(owner *object, nc net.Conn) (*conn, int, error) {
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	fds, err := socketpair()
 	if err != nil {
 		return nil, -1, err
 	}
@@ -1146,13 +1151,32 @@ func peerClosed(f *os.File) bool {
 	return closed
 }
 
+// socketpair returns a connected pair of AF_UNIX stream sockets, both
+// close-on-exec: a child process the host forks must not inherit either
+// end, or the connection would live on after the caller close(2)s its
+// descriptor, and the Go side would never see the EOF or hangup that
+// tears it down. Darwin has no SOCK_CLOEXEC, so the flag is set after
+// the fact, under ForkLock like the net package does, so that a fork on
+// the Go side cannot slip in between.
+func socketpair() ([2]int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return fds, err
+	}
+	syscall.CloseOnExec(fds[0])
+	syscall.CloseOnExec(fds[1])
+	return fds, nil
+}
+
 // client is the state behind a client handle.
 type client struct {
 	obj *object
 
 	mu       sync.Mutex
 	cl       *tailcat.Client
-	keyFixed bool // the key has been read or generated; set_key is too late
+	keyFixed bool // the key has been reported or used; set_key is too late
 	started  bool // the first ping, path or dial has happened
 	closed   bool
 }
@@ -1193,7 +1217,12 @@ func TailcatClientNew(token *C.char) C.int {
 		return 0
 	}
 	o := &object{}
-	o.c = &client{obj: o, cl: &tailcat.Client{Server: blob}}
+	// The identity is generated here rather than lazily by tailcat so
+	// that public_key can report it without calling into tailcat.Client,
+	// whose first use (a ping or dial on another thread) holds its start
+	// lock across the DERP map fetch. tailcat adopts a Key that is set
+	// before first use, so the tunnel uses exactly this key.
+	o.c = &client{obj: o, cl: &tailcat.Client{Server: blob, Key: key.NewNode()}}
 	return newHandle(o)
 }
 
@@ -1238,8 +1267,8 @@ func TailcatClientPublicKey(cd C.int, buf *C.char, buflen C.size_t) C.int {
 		return C.EBADF
 	}
 	c.mu.Lock()
-	c.keyFixed = true // PublicKey generates and pins the ephemeral key
-	pub := c.cl.PublicKey()
+	c.keyFixed = true // the key reported here must stay the one in use
+	pub := c.cl.Key.Public()
 	c.mu.Unlock()
 	return cstrOut(buf, buflen, pub.String())
 }
