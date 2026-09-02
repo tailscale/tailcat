@@ -1,0 +1,6 @@
+# Built by `make xcframework` in ../libtailcat.
+/CTailcat.xcframework
+# SwiftPM, xcodebuild (-derivedDataPath build) and Xcode state.
+/.build
+/build
+/.swiftpm
