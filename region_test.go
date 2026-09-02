@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -412,3 +413,205 @@ func (c staticDERPMapCache) Get(string) (data []byte, etag string, storedAt time
 	return c.j, "", time.Now(), true
 }
 func (staticDERPMapCache) Put(string, []byte, string) error { return nil }
+
+func TestSearchCandidatesCoverage(t *testing.T) {
+	// Every region in the map is a candidate, however many there are:
+	// capping coverage would make a server that moved into the part of
+	// the map that fell off the end simply unfindable, which is the one
+	// thing a search exists to prevent. Only concurrency is bounded.
+	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
+	for id := tailcfg.DERPRegionID(1); id <= 30; id++ {
+		dm.Regions[id] = &tailcfg.DERPRegion{
+			RegionID: id,
+			Nodes:    []*tailcfg.DERPNode{{HostName: fmt.Sprintf("r%d.example.com", id)}},
+		}
+	}
+	named := []probeCandidate{{dm.Regions[1], true}}
+	if got := len(searchCandidates(dm, named, false)); got != 30 {
+		t.Errorf("candidates for a 30-region map = %d; want 30 (all of them)", got)
+	}
+}
+
+func TestSearchCandidatesOrder(t *testing.T) {
+	at := func(id tailcfg.DERPRegionID, lat, lon float64) *tailcfg.DERPRegion {
+		return &tailcfg.DERPRegion{
+			RegionID:  id,
+			Latitude:  lat,
+			Longitude: lon,
+			Nodes:     []*tailcfg.DERPNode{{HostName: fmt.Sprintf("r%d.example.com", id)}},
+		}
+	}
+	ids := func(cands []probeCandidate) string {
+		var sb strings.Builder
+		for i, c := range cands {
+			if i > 0 {
+				sb.WriteString(" ")
+			}
+			fmt.Fprintf(&sb, "%v", c.reg.RegionID)
+		}
+		return sb.String()
+	}
+
+	// A server that re-picks by latency lands near where it was, so the
+	// search works outward from the region the address names rather than
+	// up through the region IDs.
+	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+		1: at(1, 40.7, -74.0),  // New York, the region the address names
+		2: at(2, 35.7, 139.7),  // Tokyo, far
+		3: at(3, 37.8, -122.4), // San Francisco, nearer
+	}}
+	if got, want := ids(searchCandidates(dm, []probeCandidate{{dm.Regions[1], true}}, false)), "1 3 2"; got != want {
+		t.Errorf("candidate order = %q; want %q (nearest first)", got, want)
+	}
+
+	// A region the map gives no coordinates for sorts after the ones it
+	// does, rather than being treated as a point in the Gulf of Guinea.
+	dm.Regions[4] = &tailcfg.DERPRegion{
+		RegionID: 4,
+		Nodes:    []*tailcfg.DERPNode{{HostName: "r4.example.com"}},
+	}
+	if got, want := ids(searchCandidates(dm, []probeCandidate{{dm.Regions[1], true}}, false)), "1 3 2 4"; got != want {
+		t.Errorf("candidate order with an uncoordinated region = %q; want %q", got, want)
+	}
+
+	// Nothing to measure from leaves the ID order alone.
+	noGeo := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+		1: {RegionID: 1, Nodes: []*tailcfg.DERPNode{{HostName: "a.example.com"}}},
+		2: {RegionID: 2, Nodes: []*tailcfg.DERPNode{{HostName: "b.example.com"}}},
+		3: {RegionID: 3, Nodes: []*tailcfg.DERPNode{{HostName: "c.example.com"}}},
+	}}
+	if got, want := ids(searchCandidates(noGeo, []probeCandidate{{noGeo.Regions[2], true}}, false)), "2 1 3"; got != want {
+		t.Errorf("candidate order without coordinates = %q; want %q", got, want)
+	}
+}
+
+func TestSearchTimeoutCoversEveryWave(t *testing.T) {
+	// The budget has to let the pool reach every region, since regions
+	// beyond maxProbeConcurrency are probed a wave at a time. Without
+	// that, raising the coverage cap would just move the cutoff from the
+	// candidate list into the clock.
+	for _, n := range []int{1, 4, 8, 9, 30, 64} {
+		waves := (n + maxProbeConcurrency - 1) / maxProbeConcurrency
+		if want := time.Duration(waves) * probeSlotTimeout; searchTimeout(n) < want {
+			t.Errorf("searchTimeout(%d) = %v; too short for %d waves of %v", n, searchTimeout(n), waves, probeSlotTimeout)
+		}
+	}
+	// A map small enough for one wave keeps the budget it always had.
+	if got := searchTimeout(4); got != probeSearchTimeoutMin {
+		t.Errorf("searchTimeout(4) = %v; want %v", got, probeSearchTimeoutMin)
+	}
+	// An implausibly large map is capped rather than left to run for
+	// minutes.
+	if got := searchTimeout(10000); got != probeSearchTimeoutMax {
+		t.Errorf("searchTimeout(10000) = %v; want %v", got, probeSearchTimeoutMax)
+	}
+}
+
+// fakeRegionCache is an in-memory [RegionCache] that counts its calls.
+type fakeRegionCache struct {
+	mu   sync.Mutex
+	m    map[key.NodePublic]tailcfg.DERPRegionID
+	gets int
+	puts int
+}
+
+func newFakeRegionCache() *fakeRegionCache {
+	return &fakeRegionCache{m: map[key.NodePublic]tailcfg.DERPRegionID{}}
+}
+
+func (c *fakeRegionCache) GetRegion(pub key.NodePublic) (tailcfg.DERPRegionID, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gets++
+	id, ok := c.m[pub]
+	return id, ok
+}
+
+func (c *fakeRegionCache) PutRegion(pub key.NodePublic, id tailcfg.DERPRegionID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.puts++
+	c.m[pub] = id
+	return nil
+}
+
+func (c *fakeRegionCache) counts() (gets, puts int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets, c.puts
+}
+
+func TestDiscoverRegionCache(t *testing.T) {
+	t.Parallel()
+	dm := twoRegionDERPMap(t)
+	srvPriv := key.NewNode()
+	startServer(t, dm, srvPriv, 2, "server")
+
+	cache := newFakeRegionCache()
+	old := staleAddr(srvPriv, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	got, err := DiscoverRegion(ctx, old, key.NewNode(), dm, cache, mkLogger(t, "discover"))
+	if err != nil {
+		t.Fatalf("DiscoverRegion: %v", err)
+	}
+	if ci, _ := ParseAddr(got); ci.RegionID != 2 {
+		t.Fatalf("corrected RegionID = %v; want 2", ci.RegionID)
+	}
+	// Finding the server is what makes the next search unnecessary, so
+	// the region has to be recorded even though the caller may never
+	// publish the corrected address.
+	if id, ok := cache.GetRegion(srvPriv.Public()); !ok || id != 2 {
+		t.Fatalf("cached region = %v, %v; want 2, true", id, ok)
+	}
+
+	// A later connection with the same stale address consults it.
+	gets, _ := cache.counts()
+	if _, err := DiscoverRegion(ctx, old, key.NewNode(), dm, cache, mkLogger(t, "discover2")); err != nil {
+		t.Fatalf("second DiscoverRegion: %v", err)
+	}
+	if nowGets, _ := cache.counts(); nowGets <= gets {
+		t.Error("second DiscoverRegion didn't consult the region cache")
+	}
+
+	// An entry pointing somewhere the server isn't costs a probe and is
+	// then corrected, which is why entries need no expiry.
+	cache.PutRegion(srvPriv.Public(), 1)
+	got, err = DiscoverRegion(ctx, old, key.NewNode(), dm, cache, mkLogger(t, "discover3"))
+	if err != nil {
+		t.Fatalf("DiscoverRegion with a stale cache entry: %v", err)
+	}
+	if ci, _ := ParseAddr(got); ci.RegionID != 2 {
+		t.Errorf("corrected RegionID after a stale cache entry = %v; want 2", ci.RegionID)
+	}
+	if id, ok := cache.GetRegion(srvPriv.Public()); !ok || id != 2 {
+		t.Errorf("cache after correction = %v, %v; want 2, true", id, ok)
+	}
+}
+
+// TestDiscoverRegionCacheKeepsWorkingAddr covers a cached region that
+// answers alongside the one the address names. The cached region is a
+// hint, not an override: rewriting an address that still works would
+// invalidate an address that is published and correct.
+func TestDiscoverRegionCacheKeepsWorkingAddr(t *testing.T) {
+	t.Parallel()
+	dm := twoRegionDERPMap(t)
+	srvPriv := key.NewNode()
+	startServer(t, dm, srvPriv, 1, "server1")
+	startServer(t, dm, srvPriv, 2, "server2")
+
+	cache := newFakeRegionCache()
+	cache.PutRegion(srvPriv.Public(), 2)
+
+	old := staleAddr(srvPriv, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	got, err := DiscoverRegion(ctx, old, key.NewNode(), dm, cache, mkLogger(t, "discover"))
+	if err != nil {
+		t.Fatalf("DiscoverRegion: %v", err)
+	}
+	if got != old {
+		t.Errorf("DiscoverRegion rewrote an address whose own region answers, to %v", got)
+	}
+}

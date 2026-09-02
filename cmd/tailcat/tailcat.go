@@ -765,6 +765,7 @@ func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailc
 		DERPMapURL:   *flagDERPMapURL,
 		DERPMapCache: derpMapCache{},
 		AutoRegion:   *flagAutoRegion,
+		RegionCache:  regionCache{},
 		// Stderr, not stdout: in client mode stdout is the connection
 		// itself, which ssh and scp use as a ProxyCommand.
 		OnRegionDiscovered: func(cur tailcat.Addr, r *tailcfg.DERPRegion) {
@@ -826,6 +827,128 @@ func (c derpMapCache) Put(url string, data []byte, etag string) error {
 		return nil
 	}
 	return os.WriteFile(etagPath, []byte(etag), 0644)
+}
+
+const (
+	// regionCacheMaxAge drops entries for servers not reached in a long
+	// time, so a file that is only ever added to doesn't grow forever.
+	regionCacheMaxAge = 30 * 24 * time.Hour
+
+	// regionCacheMaxEntries bounds the file for a client that reaches
+	// more servers than that within regionCacheMaxAge.
+	regionCacheMaxEntries = 256
+)
+
+// regionCache implements [tailcat.RegionCache] on disk, in
+// $XDG_CACHE_HOME/tailcat/regions.json: one JSON object mapping a
+// server's node key to the DERP region a search last found it in, so
+// that a moved server costs one search rather than one per connection.
+// ssh and cp re-exec tailcat per session, so without this the same
+// search runs again for every one of them.
+//
+// A wrong entry is self-correcting: it is probed alongside the region
+// the address names, so it costs one extra probe and the search that
+// follows overwrites it. That's why entries have no freshness check,
+// only a bound on how many accumulate.
+type regionCache struct{}
+
+type regionCacheEntry struct {
+	RegionID tailcfg.DERPRegionID `json:"r"`
+	At       time.Time            `json:"t"`
+}
+
+// regionCacheMu keeps concurrent calls in one process from clobbering
+// each other's read-modify-write. Separate processes can still lose an
+// entry, which costs one search and is repaired by the next one.
+var regionCacheMu sync.Mutex
+
+func regionCachePath() (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "tailcat", "regions.json"), nil
+}
+
+// readRegionCache returns the stored entries, or an empty map if the
+// file is missing or unreadable: it's a cache, so a bad one only costs
+// the search it would have saved.
+func readRegionCache() map[string]regionCacheEntry {
+	path, err := regionCachePath()
+	if err != nil {
+		return nil
+	}
+	j, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var m map[string]regionCacheEntry
+	if err := json.Unmarshal(j, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+func (regionCache) GetRegion(serverPub key.NodePublic) (tailcfg.DERPRegionID, bool) {
+	regionCacheMu.Lock()
+	defer regionCacheMu.Unlock()
+	e, ok := readRegionCache()[serverPub.String()]
+	if !ok || e.RegionID <= 0 {
+		return 0, false
+	}
+	return e.RegionID, true
+}
+
+func (regionCache) PutRegion(serverPub key.NodePublic, regionID tailcfg.DERPRegionID) error {
+	regionCacheMu.Lock()
+	defer regionCacheMu.Unlock()
+	path, err := regionCachePath()
+	if err != nil {
+		return err
+	}
+	m := readRegionCache()
+	if m == nil {
+		m = map[string]regionCacheEntry{}
+	}
+	m[serverPub.String()] = regionCacheEntry{RegionID: regionID, At: time.Now()}
+
+	cutoff := time.Now().Add(-regionCacheMaxAge)
+	for k, e := range m {
+		if e.At.Before(cutoff) {
+			delete(m, k)
+		}
+	}
+	if len(m) > regionCacheMaxEntries {
+		oldest := slices.SortedFunc(maps.Keys(m), func(a, b string) int {
+			return m[a].At.Compare(m[b].At)
+		})
+		for _, k := range oldest[:len(m)-regionCacheMaxEntries] {
+			delete(m, k)
+		}
+	}
+
+	j, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	// Written whole and renamed into place: a torn file would read back
+	// as an empty cache, silently costing a search on every connection.
+	tmp, err := os.CreateTemp(filepath.Dir(path), "regions-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(j); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func clientPingMode(logf logger.Logf, untilDirect bool, timeout time.Duration, args []string) error {

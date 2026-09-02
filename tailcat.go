@@ -1531,6 +1531,13 @@ type Client struct {
 	// client's first use.
 	AutoRegion bool
 
+	// RegionCache, if non-nil, remembers where AutoRegion found the
+	// server, so later connections with the same stale address look
+	// there first instead of searching the map again. If nil, every
+	// connection that needs a search pays for one. If set, it must be
+	// set before the client's first use.
+	RegionCache RegionCache
+
 	// OnRegionDiscovered, if non-nil, is called when AutoRegion finds
 	// the server in a region other than the one its address named, with
 	// an updated address and the region it was found in. Publishing that
@@ -1732,7 +1739,14 @@ func (c *Client) discoverRegionLocked(ctx context.Context, opts []any) error {
 	if logf == nil {
 		logf = log.Printf
 	}
-	addr, err := DiscoverRegion(ctx, c.Server, c.nodeKeyLocked(), append(slices.Clip(opts), logf)...)
+	// opts is reused below for the DERP map fetch, which rejects option
+	// types it doesn't know, so the region cache goes only to the call
+	// that understands it.
+	discOpts := append(slices.Clip(opts), logf)
+	if c.RegionCache != nil {
+		discOpts = append(discOpts, c.RegionCache)
+	}
+	addr, err := DiscoverRegion(ctx, c.Server, c.nodeKeyLocked(), discOpts...)
 	if err != nil {
 		return err
 	}
