@@ -64,7 +64,11 @@ func clientLSMode(logf logger.Logf, long bool, args []string) error {
 	cl := newClient(logf, tailcatAddrArg(host), clientKey())
 	defer cl.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := 30 * time.Second
+	if *flagAutoRegion {
+		timeout = autoRegionTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	conn, err := cl.DialTCPPort(ctx, 22)
 	if err != nil {

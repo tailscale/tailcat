@@ -44,7 +44,7 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 		port = "22"
 		url  = "https://derp.example.com/derpmap.json"
 	)
-	got, err := sshProxyCommand(exe, key, url, addr, port)
+	got, err := sshProxyCommand(exe, proxyOpts{keyName: key, derpMapURL: url}, addr, port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 		t.Errorf("sshProxyCommand with custom DERP map = %q; want %q", got, want)
 	}
 
-	got, err = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, addr, port)
+	got, err = sshProxyCommand(exe, proxyOpts{keyName: key, derpMapURL: tailcat.DefaultDERPMapURL}, addr, port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 	// No --key flag at all when unset. The shell would collapse
 	// --key="" to --key=, which ff parses by consuming the next
 	// argument, the tailcat address.
-	got, err = sshProxyCommand(exe, "", tailcat.DefaultDERPMapURL, addr, port)
+	got, err = sshProxyCommand(exe, proxyOpts{derpMapURL: tailcat.DefaultDERPMapURL}, addr, port)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,6 +81,20 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("sshProxyCommand with no key = %q; want %q", got, want)
+	}
+
+	// --auto-region has to reach the child: it, not the ssh process,
+	// is what connects.
+	got, err = sshProxyCommand(exe, proxyOpts{derpMapURL: tailcat.DefaultDERPMapURL, autoRegion: true}, addr, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = `'` + exe + `' '--auto-region' 'tc-short-addr' '22'`
+	if runtime.GOOS == "windows" {
+		want = `"/path/to/tailcat" "--auto-region" "tc-short-addr" "22"`
+	}
+	if got != want {
+		t.Errorf("sshProxyCommand with auto-region = %q; want %q", got, want)
 	}
 }
 

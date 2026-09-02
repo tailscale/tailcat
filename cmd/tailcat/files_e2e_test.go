@@ -21,7 +21,7 @@ import (
 // commands, returning its combined output and error.
 func runSFTPBatch(t *testing.T, e *testEnv, addr, batch string) ([]byte, error) {
 	t.Helper()
-	proxyCommand, err := sshProxyCommand(e.bin, "new", e.derpMapURL, addr, "22")
+	proxyCommand, err := sshProxyCommand(e.bin, proxyOpts{keyName: "new", derpMapURL: e.derpMapURL}, addr, "22")
 	if err != nil {
 		t.Fatal(err)
 	}

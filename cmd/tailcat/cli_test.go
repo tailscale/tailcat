@@ -207,8 +207,8 @@ func TestSocksTrailingArgs(t *testing.T) {
 // it (via flag set parenting).
 func TestGlobalFlagPlacement(t *testing.T) {
 	for _, args := range [][]string{
-		{"--key=new", "--derpmap-url=http://d/", "ping", "--timeout=5s", "tcaddr"},
-		{"ping", "--key=new", "--derpmap-url=http://d/", "--timeout=5s", "tcaddr"},
+		{"--key=new", "--derpmap-url=http://d/", "--auto-region", "ping", "--timeout=5s", "tcaddr"},
+		{"ping", "--key=new", "--derpmap-url=http://d/", "--auto-region", "--timeout=5s", "tcaddr"},
 	} {
 		if _, err := parseCLI(t, args...); err != nil {
 			t.Fatalf("parse %q: %v", args, err)
@@ -218,6 +218,9 @@ func TestGlobalFlagPlacement(t *testing.T) {
 		}
 		if *flagDERPMapURL != "http://d/" {
 			t.Errorf("parse %q: --derpmap-url = %q; want http://d/", args, *flagDERPMapURL)
+		}
+		if !*flagAutoRegion {
+			t.Errorf("parse %q: --auto-region = false; want true", args)
 		}
 	}
 }
