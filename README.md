@@ -422,8 +422,16 @@ name a fixed region so clients and future server restarts all
 rendezvous in the same place. (`--region=<name>` pins an explicit one
 instead; `--region=list` shows the choices.)
 
-TODO: make the client more robust here if the DERP map changes over
-time: https://github.com/tailscale/tailcat/issues/7
+If a published token does go stale (the server moved, or the DERP map
+changed), pass `--auto-region` on the client. It searches the current
+map for the same server and prints a corrected token on stderr so you
+can store it. That's a rescue, not a reason to publish `--region=auto`
+tokens; `--fixed-region` is still what you want for anything long-lived.
+The rest of https://github.com/tailscale/tailcat/issues/7 (a server
+in more than one region, lat/long in tokens) is still open.
+
+	tailcat ping --auto-region --verbose tcOLD…
+	tailcat ssh --auto-region tcOLD…
 
 ### Bring your own DERP relay
 
