@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build unix
+//go:build unix && cgo
 
 // Command libtailcat is the Go side of the libtailcat C library, built
 // with -buildmode=c-archive. See include/tailcat.h for the C API and
