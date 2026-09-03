@@ -89,6 +89,17 @@ yay -S tailcat
 yay -S tailcat-bin
 ```
 
+Or from conda-forge:
+
+[![tailcat on conda-forge](https://img.shields.io/conda/vn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
+[![tailcat on conda-forge](https://img.shields.io/conda/pn/conda-forge/tailcat?logo=conda-forge)](https://prefix.dev/channels/conda-forge/packages/tailcat)
+
+```bash
+pixi global install tailcat
+# run without installation
+pixi exec tailcat
+```
+
 ### Packaging from source
 
 The official binaries are built with a list of build tags that omits
