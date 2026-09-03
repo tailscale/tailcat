@@ -173,7 +173,7 @@ func cstrOut(buf *C.char, buflen C.size_t, s string) C.int {
 }
 
 // cerr returns err as a malloc'd C string, or NULL for nil, the
-// convention of the handle-free key and token functions.
+// convention of the handle-free key and address functions.
 func cerr(err error) *C.char {
 	if err == nil {
 		return nil
@@ -259,14 +259,14 @@ type server struct {
 	priv       key.NodePrivate      // zero until first needed
 	ci         tailcat.ConnInfo     // where to listen; RegionID -1 means auto
 	derpMapURL string               // "" means tailcat.DefaultDERPMapURL
-	embed      bool                 // token embeds the relay details
+	embed      bool                 // the address embeds the relay details
 	allowed    []key.NodePublic     // allowed clients, in order of addition
 	logf       logger.Logf          // nil means log.Printf
 	ports      map[uint16]*listener // by port; 0 is the catch-all
 	testRegion *tailcfg.DERPRegion  // set by setServerRegionForTest
 	starting   bool                 // a start is in progress
 	srv        *tailcat.Server      // non-nil once started
-	token      tailcat.ConnBlob     // valid once started
+	addr       tailcat.Addr         // the tailcat address; valid once started
 	closed     bool
 }
 
@@ -489,7 +489,7 @@ func (s *server) start() error {
 	priv := s.privLocked()
 	ci := s.ci
 	// A pre-populated region (relay hosts, from set_relay_hosts or the
-	// key) has no DERP map ID to reference, so its token always embeds
+	// key) has no DERP map ID to reference, so its address always embeds
 	// the relay. Decide before Expand, which zeroes RegionID when it
 	// populates Region.
 	embed := s.embed || len(ci.Region) > 0
@@ -503,7 +503,7 @@ func (s *server) start() error {
 	nAllowed := len(s.allowed)
 	s.mu.Unlock()
 
-	srv, token, err := startServer(priv, ci, embed, url, logf, allowed, s.dispatch)
+	srv, addr, err := startServer(priv, ci, embed, url, logf, allowed, s.dispatch)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -516,7 +516,7 @@ func (s *server) start() error {
 		return errServerClosed
 	}
 	s.srv = srv
-	s.token = token
+	s.addr = addr
 	// Keys allowed while the start was in progress.
 	for _, k := range s.allowed[nAllowed:] {
 		srv.AddAllowedClient(k)
@@ -526,11 +526,11 @@ func (s *server) start() error {
 
 // startServer mirrors the tailcat CLI's server start sequence
 // (cmd/tailcat/tailcat.go, func server): expand ci into a DERP region,
-// trim the region to what's needed, build the token, and start the
-// server. The token is built here rather than with Server.ConnBlob, which
-// always embeds the full region, so that the short form (a DERP map
-// region ID) is available.
-func startServer(priv key.NodePrivate, ci tailcat.ConnInfo, embed bool, derpMapURL string, logf logger.Logf, allowed []key.NodePublic, onTCP func(uint16) func(net.Conn)) (*tailcat.Server, tailcat.ConnBlob, error) {
+// trim the region to what's needed, build the tailcat address, and start
+// the server. The address is built here rather than with
+// Server.TailcatAddr, which always embeds the full region, so that the
+// short form (a DERP map region ID) is available.
+func startServer(priv key.NodePrivate, ci tailcat.ConnInfo, embed bool, derpMapURL string, logf logger.Logf, allowed []key.NodePublic, onTCP func(uint16) func(net.Conn)) (*tailcat.Server, tailcat.Addr, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	opts := []any{tailcat.ExpandForServer}
@@ -548,16 +548,16 @@ func startServer(priv key.NodePrivate, ci tailcat.ConnInfo, embed bool, derpMapU
 	reg := ci.Region[0].Clone()
 	clearUnnecessaryRegionFields(reg)
 
-	tok := tailcat.ConnInfo{
+	info := tailcat.ConnInfo{
 		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
 	}
 	if embed {
-		tok.Region = []*tailcfg.DERPRegion{reg}
+		info.Region = []*tailcfg.DERPRegion{reg}
 	} else {
-		tok.RegionID = reg.RegionID
+		info.RegionID = reg.RegionID
 	}
-	token := tok.ConnBlob()
+	addr := info.Addr()
 
 	srv := &tailcat.Server{
 		Key:            priv,
@@ -569,11 +569,11 @@ func startServer(priv key.NodePrivate, ci tailcat.ConnInfo, embed bool, derpMapU
 	if err := srv.Start(); err != nil {
 		return nil, "", err
 	}
-	return srv, token, nil
+	return srv, addr, nil
 }
 
 // clearUnnecessaryRegionFields is copied from the tailcat CLI: it drops
-// the parts of a DERP map region that neither the server nor the token
+// the parts of a DERP map region that neither the server nor the address
 // needs, keeping a single relay node so both sides use the same one.
 func clearUnnecessaryRegionFields(r *tailcfg.DERPRegion) {
 	r.Latitude = 0
@@ -589,7 +589,7 @@ func clearUnnecessaryRegionFields(r *tailcfg.DERPRegion) {
 }
 
 // setServerRegionForTest makes the server at sd listen on reg without
-// fetching a DERP map, embedding reg in its token, so tests can run
+// fetching a DERP map, embedding reg in its address, so tests can run
 // against an in-process DERP server. Call it before start.
 func setServerRegionForTest(sd C.int, reg *tailcfg.DERPRegion) {
 	_, s := getServer(sd)
@@ -618,23 +618,23 @@ func (s *server) dispatch(port uint16) func(net.Conn) {
 	return func(nc net.Conn) { ln.handoff(nc, port) }
 }
 
-//export TailcatServerToken
-func TailcatServerToken(sd C.int, buf *C.char, buflen C.size_t) C.int {
-	checkBuf("server_token", buf, buflen)
+//export TailcatServerAddr
+func TailcatServerAddr(sd C.int, buf *C.char, buflen C.size_t) C.int {
+	checkBuf("server_addr", buf, buflen)
 	o, s := getServer(sd)
 	if s == nil {
 		*buf = '\x00'
 		return C.EBADF
 	}
 	s.mu.Lock()
-	token := s.token
+	addr := s.addr
 	started := s.srv != nil
 	s.mu.Unlock()
 	if !started {
 		*buf = '\x00'
 		return o.recErr(errNotStarted)
 	}
-	return cstrOut(buf, buflen, string(token))
+	return cstrOut(buf, buflen, string(addr))
 }
 
 //export TailcatServerPublicKey
@@ -1211,9 +1211,9 @@ func (c *client) use() (*tailcat.Client, error) {
 }
 
 //export TailcatClientNew
-func TailcatClientNew(token *C.char) C.int {
-	blob := tailcat.ConnBlob(C.GoString(token))
-	if _, err := tailcat.ParseConnBlob(blob); err != nil {
+func TailcatClientNew(addr *C.char) C.int {
+	a := tailcat.Addr(C.GoString(addr))
+	if _, err := tailcat.ParseAddr(a); err != nil {
 		return 0
 	}
 	o := &object{}
@@ -1222,7 +1222,7 @@ func TailcatClientNew(token *C.char) C.int {
 	// whose first use (a ping or dial on another thread) holds its start
 	// lock across the DERP map fetch. tailcat adopts a Key that is set
 	// before first use, so the tunnel uses exactly this key.
-	o.c = &client{obj: o, cl: &tailcat.Client{Server: blob, Key: key.NewNode()}}
+	o.c = &client{obj: o, cl: &tailcat.Client{Server: a, Key: key.NewNode()}}
 	return newHandle(o)
 }
 
@@ -1407,12 +1407,12 @@ func TailcatKeyPublic(keyJSON *C.char, nodekeyOut **C.char) *C.char {
 	return nil
 }
 
-//export TailcatKeyToken
-func TailcatKeyToken(keyJSON *C.char, tokenOut **C.char) *C.char {
-	if tokenOut == nil {
-		panic("key_token passed nil token_out")
+//export TailcatKeyAddr
+func TailcatKeyAddr(keyJSON *C.char, addrOut **C.char) *C.char {
+	if addrOut == nil {
+		panic("key_addr passed nil addr_out")
 	}
-	*tokenOut = nil
+	*addrOut = nil
 	pk, err := parsePrivateKey(C.GoString(keyJSON))
 	if err != nil {
 		return cerr(err)
@@ -1420,7 +1420,7 @@ func TailcatKeyToken(keyJSON *C.char, tokenOut **C.char) *C.char {
 	ci := pk.Public
 	switch {
 	case ci.RegionID == -1 && len(ci.Region) == 0:
-		return cerr(errors.New("the key's DERP region is auto (-1); the token is only known once the server starts"))
+		return cerr(errors.New("the key's DERP region is auto (-1); the address is only known once the server starts"))
 	case ci.RegionID == 0 && len(ci.Region) == 0:
 		return cerr(errors.New("the key has no DERP region"))
 	}
@@ -1428,17 +1428,17 @@ func TailcatKeyToken(keyJSON *C.char, tokenOut **C.char) *C.char {
 	// exactly these.
 	ci.ServerPublic = tailcat.NodePublic{NodePublic: pk.Private.Public()}
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(pk.Private)
-	*tokenOut = C.CString(string(ci.ConnBlob()))
+	*addrOut = C.CString(string(ci.Addr()))
 	return nil
 }
 
-//export TailcatTokenParse
-func TailcatTokenParse(token *C.char, jsonOut **C.char) *C.char {
+//export TailcatAddrParse
+func TailcatAddrParse(addr *C.char, jsonOut **C.char) *C.char {
 	if jsonOut == nil {
-		panic("token_parse passed nil json_out")
+		panic("addr_parse passed nil json_out")
 	}
 	*jsonOut = nil
-	v, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(C.GoString(token)))
+	v, err := tailcat.ParseAddrRaw(tailcat.Addr(C.GoString(addr)))
 	if err != nil {
 		return cerr(err)
 	}
@@ -1450,12 +1450,12 @@ func TailcatTokenParse(token *C.char, jsonOut **C.char) *C.char {
 	return nil
 }
 
-//export TailcatTokenResolve
-func TailcatTokenResolve(token, derpMapURL *C.char, timeoutMs C.int, tokenOut **C.char) *C.char {
-	if tokenOut == nil {
-		panic("token_resolve passed nil token_out")
+//export TailcatAddrResolve
+func TailcatAddrResolve(addr, derpMapURL *C.char, timeoutMs C.int, addrOut **C.char) *C.char {
+	if addrOut == nil {
+		panic("addr_resolve passed nil addr_out")
 	}
-	*tokenOut = nil
+	*addrOut = nil
 	ctx, cancel := timeoutContext(timeoutMs)
 	defer cancel()
 	var opts []any
@@ -1464,10 +1464,10 @@ func TailcatTokenResolve(token, derpMapURL *C.char, timeoutMs C.int, tokenOut **
 			opts = append(opts, tailcat.DERPMapURL(u))
 		}
 	}
-	rb, err := tailcat.ConnBlob(C.GoString(token)).Resolve(ctx, opts...)
+	resolved, err := tailcat.Addr(C.GoString(addr)).Resolve(ctx, opts...)
 	if err != nil {
 		return cerr(err)
 	}
-	*tokenOut = C.CString(string(rb))
+	*addrOut = C.CString(string(resolved))
 	return nil
 }

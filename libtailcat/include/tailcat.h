@@ -5,8 +5,8 @@
 //
 // tailcat is a control-plane-free network pipe built on Tailscale's data
 // plane (WireGuard encryption, NAT traversal, DERP relays as bootstrap and
-// fallback). A server announces a connection token; clients holding the
-// token can dial TCP ports on the server, which hands each accepted
+// fallback). A server announces a tailcat address; clients holding the
+// address can dial TCP ports on the server, which hands each accepted
 // connection to the caller as a file descriptor.
 //
 // Every connection given to C is one end of a socketpair(2) pumped by the
@@ -19,7 +19,7 @@
 // caller spawns does not inherit it and keep the connection alive.
 //
 // Every function is safe to call from any thread. Functions documented as
-// blocking (server start, client ping, path, dial, token resolve) do
+// blocking (server start, client ping, path, dial, address resolve) do
 // network work and must not be called on a UI thread.
 
 #include <stddef.h>
@@ -101,7 +101,7 @@ extern int tailcat_server_set_region_id(tailcat_handle sd, int region_id);
 // from the DERP map: hosts is a comma-separated list of DERP server
 // hostnames. Like the tailcat CLI, the server connects to the first host
 // listed. Because such a relay has no DERP map region ID to reference, the
-// token always embeds the relay details. It overrides the region from the
+// address always embeds the relay details. It overrides the region from the
 // key and any earlier tailcat_server_set_region_id call.
 //
 // Call before start.
@@ -114,10 +114,10 @@ extern int tailcat_server_set_relay_hosts(tailcat_handle sd, const char* hosts);
 // Call before start.
 extern int tailcat_server_set_derpmap_url(tailcat_handle sd, const char* url);
 
-// tailcat_server_set_embed_relay controls the token form. With embed set
-// to 1, the token embeds the relay's details (hostname and addresses) so
-// that clients need no DERP map fetch; it is longer, like the output of
-// "tailcat serve --full-address". With 0 (the default) the token carries
+// tailcat_server_set_embed_relay controls the address form. With embed set
+// to 1, the address embeds the relay's details (hostname and IP addresses)
+// so that clients need no DERP map fetch; it is longer, like the output of
+// "tailcat serve --full-address". With 0 (the default) the address carries
 // just the DERP map region ID. Relay hosts set with
 // tailcat_server_set_relay_hosts are always embedded.
 //
@@ -163,12 +163,12 @@ extern int tailcat_server_listen(tailcat_handle sd, int port, tailcat_listener* 
 // Returns zero on success or -1 on error, call tailcat_errmsg for details.
 extern int tailcat_server_start(tailcat_handle sd);
 
-// tailcat_server_token writes the server's connection token, the string
+// tailcat_server_addr writes the server's tailcat address, the string
 // clients pass to tailcat_client_new (or to the tailcat CLI), to buf.
 // Valid after start.
 //
 // Returns 0, EBADF, ERANGE or -1 as described at the top of this file.
-extern int tailcat_server_token(tailcat_handle sd, char* buf, size_t buflen);
+extern int tailcat_server_addr(tailcat_handle sd, char* buf, size_t buflen);
 
 // tailcat_server_public_key writes the server's node public key
 // ("nodekey:<hex>") to buf. Valid any time after tailcat_server_new.
@@ -222,13 +222,13 @@ extern int tailcat_conn_info(tailcat_listener l, tailcat_conn c, char* remote_bu
 
 // Client.
 
-// tailcat_client_new creates a client for the server named by token.
-// It returns 0 if the token is malformed (there is no handle to record an
-// error on), otherwise a handle. Nothing happens on the network until the
-// first ping, path or dial, which brings the client up: it resolves the
-// server's relay (fetching the DERP map if the token doesn't embed it),
-// connects to it and registers with the server.
-extern tailcat_handle tailcat_client_new(const char* token);
+// tailcat_client_new creates a client for the server named by addr, its
+// tailcat address. It returns 0 if the address is malformed (there is no
+// handle to record an error on), otherwise a handle. Nothing happens on
+// the network until the first ping, path or dial, which brings the client
+// up: it resolves the server's relay (fetching the DERP map if the address
+// doesn't embed it), connects to it and registers with the server.
+extern tailcat_handle tailcat_client_new(const char* addr);
 
 // tailcat_client_set_key sets the client's identity from key_json, the JSON
 // of a tailcat.PrivateKey (only its Private part is used), so a server can
@@ -237,8 +237,9 @@ extern tailcat_handle tailcat_client_new(const char* token);
 // tailcat_client_public_key; afterwards it fails with -1.
 extern int tailcat_client_set_key(tailcat_handle cd, const char* key_json);
 
-// tailcat_client_set_derpmap_url sets the DERP map URL used when the token
-// doesn't embed the relay details. Call before the client's first use.
+// tailcat_client_set_derpmap_url sets the DERP map URL used when the
+// address doesn't embed the relay details. Call before the client's first
+// use.
 extern int tailcat_client_set_derpmap_url(tailcat_handle cd, const char* url);
 
 // tailcat_client_public_key writes the client's node public key
@@ -297,7 +298,7 @@ extern int tailcat_client_dial(tailcat_handle cd, int port, int timeout_ms, tail
 // 	-1    - other error, details go to the logger
 extern int tailcat_client_close(tailcat_handle cd);
 
-// Keys and tokens. These take no handle. They return NULL on success or a
+// Keys and addresses. These take no handle. They return NULL on success or a
 // malloc'd error string. All outputs are malloc'd and NUL-terminated; the
 // caller releases outputs and error strings with free().
 
@@ -311,25 +312,26 @@ extern char* tailcat_key_generate(char** key_json_out);
 // identity in key_json to *nodekey_out.
 extern char* tailcat_key_public(const char* key_json, char** nodekey_out);
 
-// tailcat_key_token writes the token that a server using key_json will
-// announce to *token_out. That is only known ahead of time when the key
-// names a fixed DERP region or embeds relay hosts; with automatic region
-// selection (RegionID -1) it fails, and the token must instead be read
-// from the running server with tailcat_server_token.
-extern char* tailcat_key_token(const char* key_json, char** token_out);
+// tailcat_key_addr writes the tailcat address that a server using key_json
+// will announce to *addr_out. That is only known ahead of time when the
+// key names a fixed DERP region or embeds relay hosts; with automatic
+// region selection (RegionID -1) it fails, and the address must instead be
+// read from the running server with tailcat_server_addr.
+extern char* tailcat_key_addr(const char* key_json, char** addr_out);
 
-// tailcat_token_parse decodes token and writes its fields as JSON to
-// *json_out: ServerPublic, ServerDiscoPublic, and either RegionID or the
-// embedded Region. It is the same output as "tailcat parse".
-extern char* tailcat_token_parse(const char* token, char** json_out);
+// tailcat_addr_parse decodes the tailcat address addr and writes its
+// fields as JSON to *json_out: ServerPublic, ServerDiscoPublic, and either
+// RegionID or the embedded Region. It is the same output as "tailcat
+// parse".
+extern char* tailcat_addr_parse(const char* addr, char** json_out);
 
-// tailcat_token_resolve writes a self-contained form of token, with the
-// relay's details embedded, to *token_out, the same as "tailcat resolve".
-// A token that already embeds them is returned unchanged. The DERP map is
-// fetched from derpmap_url, or the default map when derpmap_url is NULL
-// or empty. It blocks for up to timeout_ms milliseconds (0 or less: no
-// limit beyond the fetch's own).
-extern char* tailcat_token_resolve(const char* token, const char* derpmap_url, int timeout_ms, char** token_out);
+// tailcat_addr_resolve writes a self-contained form of the tailcat address
+// addr, with the relay's details embedded, to *addr_out, the same as
+// "tailcat resolve". An address that already embeds them is returned
+// unchanged. The DERP map is fetched from derpmap_url, or the default map
+// when derpmap_url is NULL or empty. It blocks for up to timeout_ms
+// milliseconds (0 or less: no limit beyond the fetch's own).
+extern char* tailcat_addr_resolve(const char* addr, const char* derpmap_url, int timeout_ms, char** addr_out);
 
 #ifdef __cplusplus
 }

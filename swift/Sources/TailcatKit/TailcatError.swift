@@ -9,13 +9,13 @@ public enum TailcatError: Error, Sendable, Equatable, CustomStringConvertible {
     /// The underlying C handle is not valid, typically because the object
     /// was closed.
     case invalidHandle
-    /// The connection token is malformed; the payload is the parser's
+    /// The tailcat address is malformed; the payload is the parser's
     /// message.
-    case invalidToken(String)
+    case invalidAddress(String)
     /// The identity JSON is malformed; the payload is the parser's message.
     case invalidKey(String)
     /// The identity leaves the relay to be picked when a server starts, so
-    /// its token is only known once such a server is running.
+    /// its address is only known once such a server is running.
     case relayNotFixed
     /// The operation needs a started server.
     case notStarted
@@ -36,9 +36,9 @@ public enum TailcatError: Error, Sendable, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .invalidHandle: "invalid handle"
-        case .invalidToken(let message): "invalid connection token: \(message)"
+        case .invalidAddress(let message): "invalid tailcat address: \(message)"
         case .invalidKey(let message): "invalid identity: \(message)"
-        case .relayNotFixed: "the identity's relay is chosen at start; the token is only known once a server using it has started"
+        case .relayNotFixed: "the identity's relay is chosen at start; the address is only known once a server using it has started"
         case .notStarted: "the server is not started"
         case .alreadyStarted: "the server is already started"
         case .closed: "closed"

@@ -4,12 +4,12 @@
 // tailcat-demo exercises TailcatKit from the command line and doubles as
 // the interop check against the Go tailcat CLI.
 //
-//   tailcat-demo serve <port>            start a server, print its token on stderr,
-//                                        echo every connection's bytes back uppercased
-//   tailcat-demo connect <token> <port>  ping (print latency and path), connect, send
-//                                        stdin, print what comes back until EOF
-//   tailcat-demo parse <token>           print the token's contents
-//   tailcat-demo genkey                  print a new identity JSON and its public key
+//   tailcat-demo serve <port>              start a server, print its address on stderr,
+//                                          echo every connection's bytes back uppercased
+//   tailcat-demo connect <address> <port>  ping (print latency and path), connect, send
+//                                          stdin, print what comes back until EOF
+//   tailcat-demo parse <address>           print the address's contents
+//   tailcat-demo genkey                    print a new identity JSON and its public key
 //
 // Set TAILCAT_VERBOSE=1 to see the Go side's logs on stderr.
 
@@ -34,9 +34,9 @@ func parsePort(_ text: String) -> UInt16 {
     return port
 }
 
-func parseToken(_ text: String) -> ConnectionToken {
-    guard let token = ConnectionToken(rawValue: text) else { fail("invalid token \(text)") }
-    return token
+func parseAddress(_ text: String) -> TailcatAddress {
+    guard let address = TailcatAddress(rawValue: text) else { fail("invalid address \(text)") }
+    return address
 }
 
 func milliseconds(_ d: Duration) -> String {
@@ -67,15 +67,15 @@ func serve(port: UInt16) async throws {
     let server = try TailcatServer(configuration: .init(), logger: makeLogger())
     let listener = try await server.listen(on: port)
     note("# public key: \(server.publicKey)")
-    let token = try await server.start()
-    note("# Server listening on port \(port) with new address: \(token)")
+    let address = try await server.start()
+    note("# Server listening on port \(port) with new address: \(address)")
     for try await connection in listener.connections {
         Task { await echo(connection) }
     }
 }
 
-func connect(token: ConnectionToken, port: UInt16) async throws {
-    let client = try TailcatClient(token: token, logger: makeLogger())
+func connect(address: TailcatAddress, port: UInt16) async throws {
+    let client = try TailcatClient(address: address, logger: makeLogger())
     // A server that just started may still be connecting to its relay,
     // in which case the first probe times out; try a few times.
     var latency: Duration?
@@ -119,8 +119,8 @@ func connect(token: ConnectionToken, port: UInt16) async throws {
     await client.close()
 }
 
-func parse(token: ConnectionToken) throws {
-    let info = try token.parse()
+func parse(address: TailcatAddress) throws {
+    let info = try address.parse()
     print("server public key: \(info.serverPublicKey)")
     if let region = info.regionID {
         print("DERP region ID: \(region)")
@@ -143,13 +143,13 @@ do {
     case "serve" where args.count == 2:
         try await serve(port: parsePort(args[1]))
     case "connect" where args.count == 3:
-        try await connect(token: parseToken(args[1]), port: parsePort(args[2]))
+        try await connect(address: parseAddress(args[1]), port: parsePort(args[2]))
     case "parse" where args.count == 2:
-        try parse(token: parseToken(args[1]))
+        try parse(address: parseAddress(args[1]))
     case "genkey" where args.count == 1:
         try genkey()
     default:
-        note("usage: tailcat-demo serve <port> | connect <token> <port> | parse <token> | genkey")
+        note("usage: tailcat-demo serve <port> | connect <address> <port> | parse <address> | genkey")
         exit(2)
     }
 } catch {

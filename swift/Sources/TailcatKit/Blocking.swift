@@ -6,7 +6,7 @@ import Dispatch
 /// Runs blocking C calls off the Swift concurrency thread pool.
 ///
 /// tailcat_server_start, tailcat_client_ping, tailcat_client_path_json,
-/// tailcat_client_dial and tailcat_token_resolve block for the duration
+/// tailcat_client_dial and tailcat_addr_resolve block for the duration
 /// of their network work, so they run on a dedicated dispatch queue and
 /// callers await a continuation. They are never called on an actor
 /// executor or on the cooperative pool.

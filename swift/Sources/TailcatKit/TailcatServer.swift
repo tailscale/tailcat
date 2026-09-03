@@ -4,18 +4,18 @@
 import CTailcat
 import Foundation
 
-/// A tailcat server: it announces a connection token, and clients holding
-/// the token dial TCP ports on it, which Listeners accept.
+/// A tailcat server: it announces a tailcat address, and clients holding
+/// the address dial TCP ports on it, which Listeners accept.
 ///
 /// Create it, register listeners, then start() (which does the network
-/// work off the Swift concurrency threads) and share the token. Ports may
+/// work off the Swift concurrency threads) and share the address. Ports may
 /// also be registered after start.
 public actor TailcatServer {
     /// The server's node public key, "nodekey:<hex>", known before start.
     public nonisolated let publicKey: NodePublicKey
 
-    /// The connection token, once start() has returned it.
-    public private(set) var token: ConnectionToken?
+    /// The tailcat address, once start() has returned it.
+    public private(set) var address: TailcatAddress?
 
     private var handle: Int32
     private var state: State = .idle
@@ -56,7 +56,7 @@ public actor TailcatServer {
             if let url = configuration.derpMapURL {
                 try TailcatError.check(url.absoluteString.withCString { tailcat_server_set_derpmap_url(h, $0) }, handle: h)
             }
-            if configuration.embedRelayInToken {
+            if configuration.embedRelayInAddress {
                 try TailcatError.check(tailcat_server_set_embed_relay(h, 1), handle: h)
             }
             for client in configuration.allowedClients {
@@ -101,12 +101,12 @@ public actor TailcatServer {
 
     /// Starts the server (tailcat_server_start, off-thread): resolves the
     /// relay, fetching the DERP map and measuring latencies as needed, and
-    /// returns the connection token, also kept in `token`. Throws
+    /// returns the tailcat address, also kept in `address`. Throws
     /// TailcatError.alreadyStarted on a second call. Like the tailcat CLI
     /// it returns once the server is configured; the relay connection
     /// completes in the background right after, so a client pinging
     /// within the first seconds may time out and should retry.
-    public func start() async throws -> ConnectionToken {
+    public func start() async throws -> TailcatAddress {
         switch state {
         case .closed:
             throw TailcatError.closed
@@ -134,14 +134,14 @@ public actor TailcatServer {
             throw TailcatError.closed
         }
         var buf = [CChar](repeating: 0, count: 4096)
-        try TailcatError.check(buf.withUnsafeMutableBufferPointer { tailcat_server_token(h, $0.baseAddress, $0.count) }, handle: h)
-        guard let token = ConnectionToken(rawValue: CStrings.string(buf)) else {
-            throw TailcatError.internalError("unexpected token format")
+        try TailcatError.check(buf.withUnsafeMutableBufferPointer { tailcat_server_addr(h, $0.baseAddress, $0.count) }, handle: h)
+        guard let address = TailcatAddress(rawValue: CStrings.string(buf)) else {
+            throw TailcatError.internalError("unexpected address format")
         }
-        self.token = token
+        self.address = address
         state = .running
-        logger.log("TailcatServer: started, token \(token)")
-        return token
+        logger.log("TailcatServer: started, address \(address)")
+        return address
     }
 
     /// Allows a client by public key, before or after start. The allow

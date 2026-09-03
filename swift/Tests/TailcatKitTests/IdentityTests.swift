@@ -19,9 +19,9 @@ final class IdentityTests: XCTestCase {
         XCTAssertNotEqual(try Identity.generate().publicKey, identity.publicKey)
     }
 
-    func testTokenNeedsFixedRelay() throws {
+    func testAddressNeedsFixedRelay() throws {
         let identity = try Identity.generate()
-        XCTAssertThrowsError(try identity.token()) { error in
+        XCTAssertThrowsError(try identity.address()) { error in
             XCTAssertEqual(error as? TailcatError, .relayNotFixed)
         }
     }
@@ -46,8 +46,8 @@ final class IdentityTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(Identity.self, from: Data("\"{}\"".utf8)))
     }
 
-    func testFixedRegionToken() throws {
-        // Pin the generated key to region 302 and check the token it
+    func testFixedRegionAddress() throws {
+        // Pin the generated key to region 302 and check the address it
         // yields names that region and this key.
         let identity = try Identity.generate()
         var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(identity.json.utf8)) as? [String: Any])
@@ -56,9 +56,9 @@ final class IdentityTests: XCTestCase {
         json["Public"] = pub
         let pinned = try Identity(json: String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self))
         XCTAssertEqual(pinned.publicKey, identity.publicKey)
-        let token = try pinned.token()
-        XCTAssertTrue(token.rawValue.hasPrefix("tc"))
-        let info = try token.parse()
+        let address = try pinned.address()
+        XCTAssertTrue(address.rawValue.hasPrefix("tc"))
+        let info = try address.parse()
         XCTAssertEqual(info.serverPublicKey, identity.publicKey)
         XCTAssertEqual(info.regionID, 302)
         XCTAssertEqual(info.relayHosts, [])

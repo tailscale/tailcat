@@ -30,11 +30,11 @@ final class EndToEndTests: XCTestCase {
     static func roundTrip() async throws {
         let server = try TailcatServer(configuration: .init(relay: .automatic), logger: BlackholeLogger())
         let listener = try await server.listen(on: 7000)
-        let token = try await server.start()
-        XCTAssertTrue(token.rawValue.hasPrefix("tc"))
-        let kept = await server.token
-        XCTAssertEqual(kept, token)
-        let info = try token.parse()
+        let address = try await server.start()
+        XCTAssertTrue(address.rawValue.hasPrefix("tc"))
+        let kept = await server.address
+        XCTAssertEqual(kept, address)
+        let info = try address.parse()
         XCTAssertEqual(info.serverPublicKey, server.publicKey)
         XCTAssertNotNil(info.regionID)
 
@@ -57,7 +57,7 @@ final class EndToEndTests: XCTestCase {
             return eof.isEmpty
         }
 
-        let client = try TailcatClient(token: token, logger: BlackholeLogger())
+        let client = try TailcatClient(address: address, logger: BlackholeLogger())
         // The relay connection completes shortly after start() returns,
         // so the first probe may time out.
         var latency: Duration?

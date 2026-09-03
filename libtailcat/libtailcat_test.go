@@ -24,11 +24,12 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// The token from the README, and what "tailcat parse" shows for it.
+// The tailcat address from the README, and what "tailcat parse" shows
+// for it.
 const (
-	readmeToken     = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu"
-	readmeTokenKey  = "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34"
-	readmeTokenRegn = 302
+	readmeAddr       = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu"
+	readmeAddrKey    = "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34"
+	readmeAddrRegion = 302
 )
 
 func mkLogger(t testing.TB, name string) logger.Logf {
@@ -263,23 +264,23 @@ func TestEndToEnd(t *testing.T) {
 	if rc := TailcatServerListen(sd, 80, &lAny); rc != -1 || errmsg(sd) == "" {
 		t.Fatalf("second listen on port 80: rc=%d, errmsg=%q; want -1 with a message", rc, errmsg(sd))
 	}
-	if rc := TailcatServerToken(sd, new(cChar), 1); rc != -1 {
-		t.Fatalf("token before start: rc=%d; want -1", rc)
+	if rc := TailcatServerAddr(sd, new(cChar), 1); rc != -1 {
+		t.Fatalf("addr before start: rc=%d; want -1", rc)
 	}
 	check(t, "start", sd, TailcatServerStart(sd))
 	if rc := TailcatServerStart(sd); rc != -1 {
 		t.Fatalf("second start: rc=%d; want -1", rc)
 	}
 	check(t, "listen 0", sd, TailcatServerListen(sd, 0, &lAny))
-	token := readBuf(t, "token", sd, func(b *cChar, n cSize) cInt { return TailcatServerToken(sd, b, n) })
+	addr := readBuf(t, "addr", sd, func(b *cChar, n cSize) cInt { return TailcatServerAddr(sd, b, n) })
 	serverKey := readBuf(t, "public_key", sd, func(b *cChar, n cSize) cInt { return TailcatServerPublicKey(sd, b, n) })
-	t.Logf("server token %s, key %s", token, serverKey)
-	if !strings.HasPrefix(token, "tc") || !strings.HasPrefix(serverKey, "nodekey:") {
-		t.Fatalf("malformed token %q or key %q", token, serverKey)
+	t.Logf("server address %s, key %s", addr, serverKey)
+	if !strings.HasPrefix(addr, "tc") || !strings.HasPrefix(serverKey, "nodekey:") {
+		t.Fatalf("malformed address %q or key %q", addr, serverKey)
 	}
 	var small [4]cChar
-	if rc := TailcatServerToken(sd, &small[0], cSize(len(small))); rc != cERANGE || small[3] != 0 || goString(&small[0]) != token[:3] {
-		t.Fatalf("token into a small buffer: rc=%d, got %q; want ERANGE and a NUL-terminated prefix", rc, goString(&small[0]))
+	if rc := TailcatServerAddr(sd, &small[0], cSize(len(small))); rc != cERANGE || small[3] != 0 || goString(&small[0]) != addr[:3] {
+		t.Fatalf("addr into a small buffer: rc=%d, got %q; want ERANGE and a NUL-terminated prefix", rc, goString(&small[0]))
 	}
 	var status *cChar
 	check(t, "status_json", sd, TailcatServerStatusJSON(sd, &status))
@@ -288,11 +289,11 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// Client.
-	ctoken := cString(token)
-	defer cFree(ctoken)
-	cd := TailcatClientNew(ctoken)
+	caddr := cString(addr)
+	defer cFree(caddr)
+	cd := TailcatClientNew(caddr)
 	if cd == 0 {
-		t.Fatal("client_new returned 0 for the server's token")
+		t.Fatal("client_new returned 0 for the server's address")
 	}
 	clientLogFD, _ := logFD(t, "client")
 	check(t, "client set_logfd", cd, TailcatSetLogFD(cd, clientLogFD))
@@ -344,9 +345,9 @@ func TestEndToEnd(t *testing.T) {
 	// Now that the server is known to be reachable, a client that isn't
 	// allowed must be ignored: its ping times out and the server logs
 	// the rejection.
-	cd2 := TailcatClientNew(ctoken)
+	cd2 := TailcatClientNew(caddr)
 	if cd2 == 0 {
-		t.Fatal("client_new returned 0 for the server's token")
+		t.Fatal("client_new returned 0 for the server's address")
 	}
 	check(t, "client2 set_logfd", cd2, TailcatSetLogFD(cd2, -1))
 	key2 := readBuf(t, "client2 public_key", cd2, func(b *cChar, n cSize) cInt { return TailcatClientPublicKey(cd2, b, n) })
@@ -431,8 +432,8 @@ func TestEndToEnd(t *testing.T) {
 		t.Logf("dial to an unregistered port: rc=%d: %s", rc, errmsg(cd))
 	}
 
-	// Keys and tokens.
-	var keyJSON, nodekey, tok, parsed *cChar
+	// Keys and addresses.
+	var keyJSON, nodekey, keyAddr, parsed *cChar
 	if e := TailcatKeyGenerate(&keyJSON); e != nil {
 		t.Fatalf("key_generate: %s", gostr(e))
 	}
@@ -451,33 +452,33 @@ func TestEndToEnd(t *testing.T) {
 	if got, want := gostr(nodekey), pk.Private.Public().String(); got != want {
 		t.Fatalf("key_public = %q; want %q", got, want)
 	}
-	if e := TailcatKeyToken(ckj, &tok); e == nil || tok != nil {
-		t.Fatalf("key_token on an auto-region key succeeded: %q", gostr(tok))
+	if e := TailcatKeyAddr(ckj, &keyAddr); e == nil || keyAddr != nil {
+		t.Fatalf("key_addr on an auto-region key succeeded: %q", gostr(keyAddr))
 	} else {
-		t.Logf("key_token on an auto-region key: %s", gostr(e))
+		t.Logf("key_addr on an auto-region key: %s", gostr(e))
 	}
 	cFree(ckj)
-	pk.Public.RegionID = readmeTokenRegn
+	pk.Public.RegionID = readmeAddrRegion
 	fixed, err := json.Marshal(pk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfixed := cString(string(fixed))
-	if e := TailcatKeyToken(cfixed, &tok); e != nil {
-		t.Fatalf("key_token on a fixed-region key: %s", gostr(e))
+	if e := TailcatKeyAddr(cfixed, &keyAddr); e != nil {
+		t.Fatalf("key_addr on a fixed-region key: %s", gostr(e))
 	}
 	cFree(cfixed)
-	ci, err := tailcat.ParseConnBlob(tailcat.ConnBlob(gostr(tok)))
+	ci, err := tailcat.ParseAddr(tailcat.Addr(gostr(keyAddr)))
 	if err != nil {
-		t.Fatalf("parsing key_token output: %v", err)
+		t.Fatalf("parsing key_addr output: %v", err)
 	}
-	if ci.RegionID != readmeTokenRegn || ci.ServerPublic.NodePublic != pk.Private.Public() || ci.ServerDiscoPublic.IsZero() {
-		t.Fatalf("key_token output parsed to %+v", ci)
+	if ci.RegionID != readmeAddrRegion || ci.ServerPublic.NodePublic != pk.Private.Public() || ci.ServerDiscoPublic.IsZero() {
+		t.Fatalf("key_addr output parsed to %+v", ci)
 	}
 
-	creadme := cString(readmeToken)
-	if e := TailcatTokenParse(creadme, &parsed); e != nil {
-		t.Fatalf("token_parse: %s", gostr(e))
+	creadme := cString(readmeAddr)
+	if e := TailcatAddrParse(creadme, &parsed); e != nil {
+		t.Fatalf("addr_parse: %s", gostr(e))
 	}
 	cFree(creadme)
 	var fields struct {
@@ -486,19 +487,19 @@ func TestEndToEnd(t *testing.T) {
 	}
 	pj := gostr(parsed)
 	if err := json.Unmarshal([]byte(pj), &fields); err != nil {
-		t.Fatalf("token_parse JSON: %v\n%s", err, pj)
+		t.Fatalf("addr_parse JSON: %v\n%s", err, pj)
 	}
-	if fields.ServerPublic != readmeTokenKey || fields.RegionID != readmeTokenRegn {
-		t.Fatalf("token_parse = %+v; want key %s and region %d", fields, readmeTokenKey, readmeTokenRegn)
+	if fields.ServerPublic != readmeAddrKey || fields.RegionID != readmeAddrRegion {
+		t.Fatalf("addr_parse = %+v; want key %s and region %d", fields, readmeAddrKey, readmeAddrRegion)
 	}
 	cbad := cString("nope")
-	if e := TailcatTokenParse(cbad, &parsed); e == nil {
-		t.Fatal("token_parse accepted a malformed token")
+	if e := TailcatAddrParse(cbad, &parsed); e == nil {
+		t.Fatal("addr_parse accepted a malformed address")
 	} else {
 		cFree(e)
 	}
 	if h := TailcatClientNew(cbad); h != 0 {
-		t.Fatalf("client_new on a malformed token = %d; want 0", h)
+		t.Fatalf("client_new on a malformed address = %d; want 0", h)
 	}
 	cFree(cbad)
 	cempty := cString("{}")
@@ -641,26 +642,26 @@ func TestClientPublicKeyDoesNotBlock(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// A token that references a DERP map region by ID, so the client
-	// must fetch the map, and carries a disco key (the README token
+	// An address that references a DERP map region by ID, so the client
+	// must fetch the map, and carries a disco key (the README address
 	// predates those, and a client refuses to start without one).
 	pk := tailcat.NewPrivateKey()
-	pk.Public.RegionID = readmeTokenRegn
+	pk.Public.RegionID = readmeAddrRegion
 	js, err := json.Marshal(pk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cjs := cString(string(js))
-	var tok *cChar
-	if e := TailcatKeyToken(cjs, &tok); e != nil {
-		t.Fatalf("key_token: %s", gostr(e))
+	var keyAddr *cChar
+	if e := TailcatKeyAddr(cjs, &keyAddr); e != nil {
+		t.Fatalf("key_addr: %s", gostr(e))
 	}
 	cFree(cjs)
-	ctoken := cString(gostr(tok))
-	defer cFree(ctoken)
-	cd := TailcatClientNew(ctoken)
+	caddr := cString(gostr(keyAddr))
+	defer cFree(caddr)
+	cd := TailcatClientNew(caddr)
 	if cd == 0 {
-		t.Fatal("client_new returned 0 for a key_token token")
+		t.Fatal("client_new returned 0 for a key_addr address")
 	}
 	check(t, "set_logfd", cd, TailcatSetLogFD(cd, -1))
 	curl := cString(srv.URL + "/derpmap.json")

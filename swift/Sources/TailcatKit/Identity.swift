@@ -49,14 +49,14 @@ public struct Identity: Sendable, Codable, Hashable {
     /// init.
     public var publicKey: NodePublicKey { cachedPublicKey }
 
-    /// The token a server using this identity will announce
-    /// (tailcat_key_token). It is only known ahead of time when the key
+    /// The tailcat address a server using this identity will announce
+    /// (tailcat_key_addr). It is only known ahead of time when the key
     /// names a fixed DERP region or embeds relay hosts; with automatic
-    /// selection it throws TailcatError.relayNotFixed, and the token must
+    /// selection it throws TailcatError.relayNotFixed, and the address must
     /// be read from a started TailcatServer instead.
-    public func token() throws -> ConnectionToken {
+    public func address() throws -> TailcatAddress {
         var out: UnsafeMutablePointer<CChar>? = nil
-        let err = json.withCString { tailcat_key_token($0, &out) }
+        let err = json.withCString { tailcat_key_addr($0, &out) }
         if let message = CStrings.take(err) {
             free(out)
             if message.lowercased().contains("region") {
@@ -64,10 +64,10 @@ public struct Identity: Sendable, Codable, Hashable {
             }
             throw TailcatError.invalidKey(message)
         }
-        guard let text = CStrings.take(out), let token = ConnectionToken(rawValue: text) else {
-            throw TailcatError.internalError("tailcat_key_token returned an unexpected token")
+        guard let text = CStrings.take(out), let address = TailcatAddress(rawValue: text) else {
+            throw TailcatError.internalError("tailcat_key_addr returned an unexpected address")
         }
-        return token
+        return address
     }
 
     /// Decodes the key JSON (as a single string), validating it.

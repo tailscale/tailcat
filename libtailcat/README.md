@@ -35,7 +35,7 @@ system frameworks the Go runtime uses on Darwin, typically
 Every function is safe to call from any thread. Handle functions return
 0 on success, `EBADF` for a bad handle, `ERANGE` for a too-small output
 buffer and -1 for other errors, whose text `tailcat_errmsg` returns.
-Blocking calls (server start, client ping, path, dial, token resolve)
+Blocking calls (server start, client ping, path, dial, address resolve)
 do network work; keep them off UI threads.
 
 A server:
@@ -53,8 +53,8 @@ if (tailcat_server_start(sd) != 0) {       // blocks: DERP map, latency check, r
 	tailcat_errmsg(sd, err, sizeof err);
 	// ...
 }
-char token[512];
-tailcat_server_token(sd, token, sizeof token);   // give this to clients
+char addr[512];
+tailcat_server_addr(sd, addr, sizeof addr);      // the tailcat address; give this to clients
 
 for (;;) {
 	struct pollfd pfd = {.fd = ln, .events = POLLIN};
@@ -73,7 +73,7 @@ tailcat_server_close(sd);
 A client:
 
 ```c
-tailcat_handle cd = tailcat_client_new(token);   // 0 if the token is malformed
+tailcat_handle cd = tailcat_client_new(addr);    // 0 if the address is malformed
 double ms;
 tailcat_client_ping(cd, 10000, &ms);       // blocks; brings the tunnel up
 tailcat_conn c;
@@ -86,8 +86,8 @@ tailcat_client_close(cd);
 ```
 
 Connections are one end of a socketpair pumped by Go, so they behave like
-sockets; on Apple platforms they have `SO_NOSIGPIPE` set. Keys and tokens
-can be handled without a handle: `tailcat_key_generate`,
-`tailcat_key_public`, `tailcat_key_token`, `tailcat_token_parse` and
-`tailcat_token_resolve` return `NULL` or a malloc'd error string, and
+sockets; on Apple platforms they have `SO_NOSIGPIPE` set. Keys and
+addresses can be handled without a handle: `tailcat_key_generate`,
+`tailcat_key_public`, `tailcat_key_addr`, `tailcat_addr_parse` and
+`tailcat_addr_resolve` return `NULL` or a malloc'd error string, and
 their outputs are malloc'd too; `free()` all of them.

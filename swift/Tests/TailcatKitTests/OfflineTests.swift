@@ -257,19 +257,19 @@ final class ServerLifecycleTests: XCTestCase {
         XCTAssertNil(config.identity)
         XCTAssertEqual(config.relay, .automatic)
         XCTAssertNil(config.derpMapURL)
-        XCTAssertFalse(config.embedRelayInToken)
+        XCTAssertFalse(config.embedRelayInAddress)
         XCTAssertEqual(config.allowedClients, [])
-        let custom = ServerConfiguration(relay: .region(302), embedRelayInToken: true)
+        let custom = ServerConfiguration(relay: .region(302), embedRelayInAddress: true)
         XCTAssertEqual(custom.relay, .region(302))
-        XCTAssertTrue(custom.embedRelayInToken)
+        XCTAssertTrue(custom.embedRelayInAddress)
     }
 
     func testServerBeforeStart() async throws {
         let identity = try Identity.generate()
         let server = try TailcatServer(configuration: .init(identity: identity, relay: .region(302), allowedClients: [identity.publicKey]))
         XCTAssertEqual(server.publicKey, identity.publicKey)
-        let token = await server.token
-        XCTAssertNil(token)
+        let address = await server.address
+        XCTAssertNil(address)
         do {
             _ = try await server.status()
             XCTFail("status before start succeeded")
@@ -378,10 +378,10 @@ final class ServerLifecycleTests: XCTestCase {
     }
 
     func testClientBeforeUse() async throws {
-        let token = try XCTUnwrap(ConnectionToken(rawValue: TokenTests.readmeToken))
+        let address = try XCTUnwrap(TailcatAddress(rawValue: AddressTests.readmeAddress))
         let identity = try Identity.generate()
-        let client = try TailcatClient(token: token, identity: identity, derpMapURL: URL(string: "https://example.invalid/derpmap.json"))
-        XCTAssertEqual(client.token, token)
+        let client = try TailcatClient(address: address, identity: identity, derpMapURL: URL(string: "https://example.invalid/derpmap.json"))
+        XCTAssertEqual(client.address, address)
         let key = try await client.publicKey
         XCTAssertEqual(key, identity.publicKey)
         do {

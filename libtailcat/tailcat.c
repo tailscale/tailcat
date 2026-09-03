@@ -22,7 +22,7 @@ extern int TailcatServerSetEmbedRelay(int sd, int embed);
 extern int TailcatServerAllowClient(int sd, char* nodekey);
 extern int TailcatServerListen(int sd, int port, int* listenerOut);
 extern int TailcatServerStart(int sd);
-extern int TailcatServerToken(int sd, char* buf, size_t buflen);
+extern int TailcatServerAddr(int sd, char* buf, size_t buflen);
 extern int TailcatServerPublicKey(int sd, char* buf, size_t buflen);
 extern int TailcatServerStatusJSON(int sd, char** jsonOut);
 extern int TailcatServerClose(int sd);
@@ -30,7 +30,7 @@ extern int TailcatServerClose(int sd);
 extern int TailcatAccept(int l, int* connOut);
 extern int TailcatConnInfo(int l, int c, char* remoteBuf, size_t remoteBuflen, int* localPortOut);
 
-extern int TailcatClientNew(char* token);
+extern int TailcatClientNew(char* addr);
 extern int TailcatClientSetKey(int cd, char* keyJSON);
 extern int TailcatClientSetDERPMapURL(int cd, char* url);
 extern int TailcatClientPublicKey(int cd, char* buf, size_t buflen);
@@ -41,9 +41,9 @@ extern int TailcatClientClose(int cd);
 
 extern char* TailcatKeyGenerate(char** keyJSONOut);
 extern char* TailcatKeyPublic(char* keyJSON, char** nodekeyOut);
-extern char* TailcatKeyToken(char* keyJSON, char** tokenOut);
-extern char* TailcatTokenParse(char* token, char** jsonOut);
-extern char* TailcatTokenResolve(char* token, char* derpmapURL, int timeoutMs, char** tokenOut);
+extern char* TailcatKeyAddr(char* keyJSON, char** addrOut);
+extern char* TailcatAddrParse(char* addr, char** jsonOut);
+extern char* TailcatAddrResolve(char* addr, char* derpmapURL, int timeoutMs, char** addrOut);
 
 int tailcat_errmsg(tailcat_handle h, char* buf, size_t buflen) {
 	return TailcatErrmsg(h, buf, buflen);
@@ -89,8 +89,8 @@ int tailcat_server_start(tailcat_handle sd) {
 	return TailcatServerStart(sd);
 }
 
-int tailcat_server_token(tailcat_handle sd, char* buf, size_t buflen) {
-	return TailcatServerToken(sd, buf, buflen);
+int tailcat_server_addr(tailcat_handle sd, char* buf, size_t buflen) {
+	return TailcatServerAddr(sd, buf, buflen);
 }
 
 int tailcat_server_public_key(tailcat_handle sd, char* buf, size_t buflen) {
@@ -113,8 +113,8 @@ int tailcat_conn_info(tailcat_listener l, tailcat_conn c, char* remote_buf, size
 	return TailcatConnInfo(l, c, remote_buf, remote_buflen, local_port_out);
 }
 
-tailcat_handle tailcat_client_new(const char* token) {
-	return TailcatClientNew((char*)token);
+tailcat_handle tailcat_client_new(const char* addr) {
+	return TailcatClientNew((char*)addr);
 }
 
 int tailcat_client_set_key(tailcat_handle cd, const char* key_json) {
@@ -153,14 +153,14 @@ char* tailcat_key_public(const char* key_json, char** nodekey_out) {
 	return TailcatKeyPublic((char*)key_json, nodekey_out);
 }
 
-char* tailcat_key_token(const char* key_json, char** token_out) {
-	return TailcatKeyToken((char*)key_json, token_out);
+char* tailcat_key_addr(const char* key_json, char** addr_out) {
+	return TailcatKeyAddr((char*)key_json, addr_out);
 }
 
-char* tailcat_token_parse(const char* token, char** json_out) {
-	return TailcatTokenParse((char*)token, json_out);
+char* tailcat_addr_parse(const char* addr, char** json_out) {
+	return TailcatAddrParse((char*)addr, json_out);
 }
 
-char* tailcat_token_resolve(const char* token, const char* derpmap_url, int timeout_ms, char** token_out) {
-	return TailcatTokenResolve((char*)token, (char*)derpmap_url, timeout_ms, token_out);
+char* tailcat_addr_resolve(const char* addr, const char* derpmap_url, int timeout_ms, char** addr_out) {
+	return TailcatAddrResolve((char*)addr, (char*)derpmap_url, timeout_ms, addr_out);
 }

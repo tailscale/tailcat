@@ -4,7 +4,7 @@
 import CTailcat
 import Foundation
 
-/// A tailcat client: given a server's connection token, it pings the
+/// A tailcat client: given a server's tailcat address, it pings the
 /// server and dials TCP ports on it.
 ///
 /// Nothing happens on the network until the first ping, path or connect,
@@ -12,27 +12,27 @@ import Foundation
 /// registering with the server). Those calls run off the Swift
 /// concurrency threads.
 public actor TailcatClient {
-    /// The server's connection token.
-    public nonisolated let token: ConnectionToken
+    /// The server's tailcat address.
+    public nonisolated let address: TailcatAddress
 
     private var handle: Int32
     private let logger: any LogSink
 
-    /// Creates a client for the server named by token (tailcat_client_new),
+    /// Creates a client for the server named by address (tailcat_client_new),
     /// with an optional identity (so the server can allow it by public
-    /// key; ephemeral otherwise) and DERP map URL (used when the token
-    /// references a region by ID). Throws TailcatError.invalidToken for a
-    /// malformed token.
-    public init(token: ConnectionToken, identity: Identity? = nil, derpMapURL: URL? = nil, logger: any LogSink = BlackholeLogger()) throws {
-        let h = token.rawValue.withCString { tailcat_client_new($0) }
+    /// key; ephemeral otherwise) and DERP map URL (used when the address
+    /// references a region by ID). Throws TailcatError.invalidAddress for a
+    /// malformed address.
+    public init(address: TailcatAddress, identity: Identity? = nil, derpMapURL: URL? = nil, logger: any LogSink = BlackholeLogger()) throws {
+        let h = address.rawValue.withCString { tailcat_client_new($0) }
         guard h != 0 else {
-            var message = "malformed token"
+            var message = "malformed address"
             do {
-                _ = try token.parse()
-            } catch TailcatError.invalidToken(let text) {
+                _ = try address.parse()
+            } catch TailcatError.invalidAddress(let text) {
                 message = text
             } catch {}
-            throw TailcatError.invalidToken(message)
+            throw TailcatError.invalidAddress(message)
         }
         do {
             try TailcatError.check(tailcat_set_logfd(h, logger.logFileDescriptor ?? -1), handle: h)
@@ -46,7 +46,7 @@ public actor TailcatClient {
             _ = tailcat_client_close(h)
             throw error
         }
-        self.token = token
+        self.address = address
         self.handle = h
         self.logger = logger
     }
