@@ -104,7 +104,7 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 	if err != nil {
 		log.Fatalf("no scp found in $PATH: %v", err)
 	}
-	proxyCommand, err := sshProxyCommand(exe, *flagKey, *flagDERPMapURL, addr, portOrIPPort)
+	proxyCommand, err := sshProxyCommand(exe, proxyFlags(), addr, portOrIPPort)
 	if err != nil {
 		return err
 	}

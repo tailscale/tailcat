@@ -58,6 +58,7 @@ var (
 	flagFullAddress *bool
 	flagJSON        *bool
 	flagDERPMapURL  *string
+	flagAutoRegion  *bool
 )
 
 // The genkey subcommand's flags, likewise set by newRootCommand.
@@ -91,6 +92,7 @@ func newRootCommand() *ff.Command {
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
+	flagAutoRegion = rootFS.BoolLong("auto-region", "in client modes, if the server doesn't answer in the DERP region its address says, search the DERP map for the region it moved to and print its current address. Useful for a server whose key was made with 'genkey --region=auto', which re-picks a region at every startup")
 
 	serveFS := ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
@@ -102,7 +104,7 @@ func newRootCommand() *ff.Command {
 
 	pingFS := ff.NewFlagSet("ping").SetParent(rootFS)
 	pingUntilDirect := pingFS.BoolLong("until-direct", "keep pinging until a pong arrives over a direct (non-DERP) path; exit non-zero if that doesn't happen before --timeout")
-	pingTimeout := pingFS.DurationLong("timeout", 10*time.Second, "give up after this long")
+	pingTimeout := pingFS.DurationLong("timeout", 10*time.Second, "give up after this long (default 60s with --auto-region, which has a whole DERP map to search)")
 
 	socksFS := ff.NewFlagSet("socks").SetParent(rootFS)
 	socksListen := socksFS.StringLong("listen", "127.0.0.1:0", "SOCKS5 proxy listen [address]:port; a bare port means localhost, a bare address means an OS-assigned port")
@@ -153,7 +155,11 @@ func newRootCommand() *ff.Command {
 				LongHelp:  pingLongHelp,
 				Flags:     pingFS,
 				Exec: func(ctx context.Context, args []string) error {
-					return clientPingMode(getLogf(), *pingUntilDirect, *pingTimeout, args)
+					timeout := *pingTimeout
+					if f, ok := pingFS.GetFlag("timeout"); *flagAutoRegion && ok && !f.IsSet() {
+						timeout = autoRegionTimeout
+					}
+					return clientPingMode(getLogf(), *pingUntilDirect, timeout, args)
 				},
 			},
 			{
@@ -319,6 +325,7 @@ relay or a direct path. --until-direct keeps pinging (bounded by
 
 	tailcat ping <tc-addr>
 	tailcat ping --until-direct <tc-addr>
+	tailcat ping --auto-region <tc-addr>
 
 Client mode, ssh:
 
@@ -743,8 +750,13 @@ func clientKey() key.NodePrivate {
 	return conf.Private
 }
 
+// autoRegionTimeout is the deadline the client modes give an operation
+// when --auto-region is set, in place of a shorter default: a search can
+// need a DERP map fetch and a probe of every region in it.
+const autoRegionTimeout = 60 * time.Second
+
 // newClient returns a [tailcat.Client] configured with the global
-// --derpmap-url flag and the disk DERP map cache.
+// --derpmap-url and --auto-region flags and the disk DERP map cache.
 func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailcat.Client {
 	return &tailcat.Client{
 		Server:       addr,
@@ -752,6 +764,14 @@ func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailc
 		Logf:         logf,
 		DERPMapURL:   *flagDERPMapURL,
 		DERPMapCache: derpMapCache{},
+		AutoRegion:   *flagAutoRegion,
+		RegionCache:  regionCache{},
+		// Stderr, not stdout: in client mode stdout is the connection
+		// itself, which ssh and scp use as a ProxyCommand.
+		OnRegionDiscovered: func(cur tailcat.Addr, r *tailcfg.DERPRegion) {
+			fmt.Fprintf(os.Stderr, "# server moved to DERP region %v (%v); its current address is:\n#   %v\n",
+				r.RegionID, cmp.Or(r.RegionCode, r.RegionName), cur)
+		},
 	}
 }
 
@@ -807,6 +827,128 @@ func (c derpMapCache) Put(url string, data []byte, etag string) error {
 		return nil
 	}
 	return os.WriteFile(etagPath, []byte(etag), 0644)
+}
+
+const (
+	// regionCacheMaxAge drops entries for servers not reached in a long
+	// time, so a file that is only ever added to doesn't grow forever.
+	regionCacheMaxAge = 30 * 24 * time.Hour
+
+	// regionCacheMaxEntries bounds the file for a client that reaches
+	// more servers than that within regionCacheMaxAge.
+	regionCacheMaxEntries = 256
+)
+
+// regionCache implements [tailcat.RegionCache] on disk, in
+// $XDG_CACHE_HOME/tailcat/regions.json: one JSON object mapping a
+// server's node key to the DERP region a search last found it in, so
+// that a moved server costs one search rather than one per connection.
+// ssh and cp re-exec tailcat per session, so without this the same
+// search runs again for every one of them.
+//
+// A wrong entry is self-correcting: it is probed alongside the region
+// the address names, so it costs one extra probe and the search that
+// follows overwrites it. That's why entries have no freshness check,
+// only a bound on how many accumulate.
+type regionCache struct{}
+
+type regionCacheEntry struct {
+	RegionID tailcfg.DERPRegionID `json:"r"`
+	At       time.Time            `json:"t"`
+}
+
+// regionCacheMu keeps concurrent calls in one process from clobbering
+// each other's read-modify-write. Separate processes can still lose an
+// entry, which costs one search and is repaired by the next one.
+var regionCacheMu sync.Mutex
+
+func regionCachePath() (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "tailcat", "regions.json"), nil
+}
+
+// readRegionCache returns the stored entries, or an empty map if the
+// file is missing or unreadable: it's a cache, so a bad one only costs
+// the search it would have saved.
+func readRegionCache() map[string]regionCacheEntry {
+	path, err := regionCachePath()
+	if err != nil {
+		return nil
+	}
+	j, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var m map[string]regionCacheEntry
+	if err := json.Unmarshal(j, &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+func (regionCache) GetRegion(serverPub key.NodePublic) (tailcfg.DERPRegionID, bool) {
+	regionCacheMu.Lock()
+	defer regionCacheMu.Unlock()
+	e, ok := readRegionCache()[serverPub.String()]
+	if !ok || e.RegionID <= 0 {
+		return 0, false
+	}
+	return e.RegionID, true
+}
+
+func (regionCache) PutRegion(serverPub key.NodePublic, regionID tailcfg.DERPRegionID) error {
+	regionCacheMu.Lock()
+	defer regionCacheMu.Unlock()
+	path, err := regionCachePath()
+	if err != nil {
+		return err
+	}
+	m := readRegionCache()
+	if m == nil {
+		m = map[string]regionCacheEntry{}
+	}
+	m[serverPub.String()] = regionCacheEntry{RegionID: regionID, At: time.Now()}
+
+	cutoff := time.Now().Add(-regionCacheMaxAge)
+	for k, e := range m {
+		if e.At.Before(cutoff) {
+			delete(m, k)
+		}
+	}
+	if len(m) > regionCacheMaxEntries {
+		oldest := slices.SortedFunc(maps.Keys(m), func(a, b string) int {
+			return m[a].At.Compare(m[b].At)
+		})
+		for _, k := range oldest[:len(m)-regionCacheMaxEntries] {
+			delete(m, k)
+		}
+	}
+
+	j, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	// Written whole and renamed into place: a torn file would read back
+	// as an empty cache, silently costing a search on every connection.
+	tmp, err := os.CreateTemp(filepath.Dir(path), "regions-*.json")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(j); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func clientPingMode(logf logger.Logf, untilDirect bool, timeout time.Duration, args []string) error {

@@ -94,7 +94,7 @@ func clientSSHMode(portOrIPPort string, args []string) error {
 	if sshUser != "" {
 		sshDst = sshUser + "@" + sshDst
 	}
-	proxyCommand, err := sshProxyCommand(exe, *flagKey, *flagDERPMapURL, addrStr, portOrIPPort)
+	proxyCommand, err := sshProxyCommand(exe, proxyFlags(), addrStr, portOrIPPort)
 	if err != nil {
 		return err
 	}
@@ -142,18 +142,38 @@ func validatedAddr(arg string) (string, error) {
 	return string(addr), nil
 }
 
+// proxyOpts are the global tailcat flags that a ProxyCommand has to
+// carry into the child process, which is the one that actually connects.
+type proxyOpts struct {
+	keyName    string
+	derpMapURL string
+	autoRegion bool
+}
+
+// proxyFlags returns the global flags as given on this invocation.
+func proxyFlags() proxyOpts {
+	return proxyOpts{
+		keyName:    *flagKey,
+		derpMapURL: *flagDERPMapURL,
+		autoRegion: *flagAutoRegion,
+	}
+}
+
 // sshProxyCommand returns the command passed to OpenSSH to connect the SSH
 // client to a tailcat server. The command is run by OpenSSH, so values that
 // can contain shell-special characters must be quoted.
-func sshProxyCommand(exe, keyName, derpMapURL, addr, portOrIPPort string) (string, error) {
+func sshProxyCommand(exe string, o proxyOpts, addr, portOrIPPort string) (string, error) {
 	args := []string{exe}
 	// No --key flag at all when unset: ff parses --key= by consuming the
 	// tailcat address as the flag's value.
-	if keyName != "" {
-		args = append(args, "--key="+keyName)
+	if o.keyName != "" {
+		args = append(args, "--key="+o.keyName)
 	}
-	if derpMapURL != tailcat.DefaultDERPMapURL {
-		args = append(args, "--derpmap-url="+derpMapURL)
+	if o.derpMapURL != tailcat.DefaultDERPMapURL {
+		args = append(args, "--derpmap-url="+o.derpMapURL)
+	}
+	if o.autoRegion {
+		args = append(args, "--auto-region")
 	}
 	args = append(args, addr, portOrIPPort)
 	if runtime.GOOS == "windows" {

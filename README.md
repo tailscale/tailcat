@@ -446,8 +446,28 @@ name a fixed region so clients and future server restarts all
 rendezvous in the same place. (`--region=<name>` pins an explicit one
 instead; `--region=list` shows the choices.)
 
-TODO: make the client more robust here if the DERP map changes over
-time: https://github.com/tailscale/tailcat/issues/7
+If a published address does go stale (the server moved, or the DERP
+map changed), pass `--auto-region` on the client. It searches the
+current map for the same server and prints a corrected address on
+stderr so you can store it. That's a rescue, not a reason to publish
+`--region=auto` addresses; `--fixed-region` is still what you want for
+anything long-lived. The rest of
+https://github.com/tailscale/tailcat/issues/7 (a server in more than
+one region, lat/long in addresses) is still open.
+
+The search covers every region the DERP map publishes, however many
+that grows to, probing eight at a time so a stale address costs a
+bounded number of connections rather than one per region. It works
+outward from the region the address names, since a server that re-picks
+by latency usually lands near where it was, and asks each relay
+outright whether it has the server, which is answered in a round trip
+rather than a timeout. Where it finds the server is remembered in
+`$XDG_CACHE_HOME/tailcat/regions.json`, so a moved server costs one
+search and not one per connection; deleting that file only costs
+another search.
+
+	tailcat ping --auto-region --verbose tcOLD…
+	tailcat ssh --auto-region tcOLD…
 
 ### Bring your own DERP relay
 
