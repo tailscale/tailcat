@@ -103,9 +103,10 @@ public actor TailcatServer {
     /// relay, fetching the DERP map and measuring latencies as needed, and
     /// returns the tailcat address, also kept in `address`. Throws
     /// TailcatError.alreadyStarted on a second call. Like the tailcat CLI
-    /// it returns once the server is configured; the relay connection
-    /// completes in the background right after, so a client pinging
-    /// within the first seconds may time out and should retry.
+    /// it returns once the server is configured and its address is known;
+    /// the relay connection completes in the background right after, and
+    /// pings resend until acknowledged, so a client pinging right after
+    /// start succeeds within its timeout.
     public func start() async throws -> TailcatAddress {
         switch state {
         case .closed:

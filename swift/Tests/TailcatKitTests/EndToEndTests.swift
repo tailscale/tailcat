@@ -58,18 +58,9 @@ final class EndToEndTests: XCTestCase {
         }
 
         let client = try TailcatClient(address: address, logger: BlackholeLogger())
-        // The relay connection completes shortly after start() returns,
-        // so the first probe may time out.
-        var latency: Duration?
-        for attempt in 1...6 {
-            do {
-                latency = try await client.ping(timeout: .seconds(5))
-                break
-            } catch TailcatError.timeout where attempt < 6 {
-                continue
-            }
-        }
-        let rtt = try XCTUnwrap(latency)
+        // The relay connection completes shortly after start() returns;
+        // pings resend until acknowledged, so one ping suffices.
+        let rtt = try await client.ping(timeout: .seconds(15))
         XCTAssertGreaterThan(rtt, .zero)
 
         let path = try await client.path()

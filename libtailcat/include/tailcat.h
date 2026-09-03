@@ -155,10 +155,11 @@ extern int tailcat_server_listen(tailcat_handle sd, int port, tailcat_listener* 
 // the duration, typically a few seconds; never call it on a UI thread. A
 // server starts once.
 //
-// Like the tailcat CLI, it returns once the server is configured; the
-// connection to the relay itself completes in the background shortly
-// after. A client pinging in that window gets no answer (see
-// tailcat_client_ping) and should retry.
+// Like the tailcat CLI, it returns once the server is configured and its
+// address is known (see tailcat_server_addr); the connection to the relay
+// itself completes in the background shortly after. Pings resend until
+// acknowledged (see tailcat_client_ping), so a client pinging right after
+// start succeeds within its timeout.
 //
 // Returns zero on success or -1 on error, call tailcat_errmsg for details.
 extern int tailcat_server_start(tailcat_handle sd);
@@ -255,10 +256,11 @@ extern int tailcat_client_public_key(tailcat_handle cd, char* buf, size_t buflen
 // NULL). It blocks for up to timeout_ms milliseconds; a timeout of 0 or
 // less means no limit beyond tailcat's own internal one.
 //
-// Each call sends one probe. A server that doesn't allow this client never
-// answers, so a rejected client shows up as a timeout; so does a server
-// that is still connecting to its relay right after tailcat_server_start,
-// which is worth a retry.
+// The probe is resent every second until the server acknowledges it or
+// the timeout expires, so a server still connecting to its relay right
+// after tailcat_server_start is reached as soon as it is on the relay. A
+// server that doesn't allow this client never answers, so a rejected
+// client shows up as a timeout.
 //
 // Returns zero on success or -1 on error, call tailcat_errmsg for details.
 extern int tailcat_client_ping(tailcat_handle cd, int timeout_ms, double* latency_ms_out);

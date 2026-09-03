@@ -76,18 +76,7 @@ func serve(port: UInt16) async throws {
 
 func connect(address: TailcatAddress, port: UInt16) async throws {
     let client = try TailcatClient(address: address, logger: makeLogger())
-    // A server that just started may still be connecting to its relay,
-    // in which case the first probe times out; try a few times.
-    var latency: Duration?
-    for attempt in 1...4 {
-        do {
-            latency = try await client.ping(timeout: .seconds(5))
-            break
-        } catch TailcatError.timeout where attempt < 4 {
-            note("# ping timed out, retrying")
-        }
-    }
-    guard let latency else { fail("no answer from the server") }
+    let latency = try await client.ping(timeout: .seconds(15))
     note("# pong in \(milliseconds(latency)) via the relay")
     let path = try await client.path()
     if path.isDirect {

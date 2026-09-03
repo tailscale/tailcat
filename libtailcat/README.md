@@ -38,6 +38,11 @@ buffer and -1 for other errors, whose text `tailcat_errmsg` returns.
 Blocking calls (server start, client ping, path, dial, address resolve)
 do network work; keep them off UI threads.
 
+`tailcat_server_start` returns once the server is configured and its
+address is known; the relay connection completes in the background, and
+pings resend until acknowledged, so a client's `tailcat_client_ping`
+right after start succeeds within its timeout.
+
 A server:
 
 ```c
@@ -48,7 +53,7 @@ A server:
 tailcat_handle sd = tailcat_server_new();
 tailcat_listener ln;
 tailcat_server_listen(sd, 8080, &ln);      // 0 = every port not otherwise listened on
-if (tailcat_server_start(sd) != 0) {       // blocks: DERP map, latency check, relay connect
+if (tailcat_server_start(sd) != 0) {       // blocks: DERP map, latency check
 	char err[256];
 	tailcat_errmsg(sd, err, sizeof err);
 	// ...

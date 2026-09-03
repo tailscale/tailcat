@@ -75,9 +75,10 @@ public actor TailcatClient {
 
     /// Checks that the server is reachable and accepts this client, and
     /// returns the relay round trip (tailcat_client_ping, off-thread).
-    /// Each call sends one probe: a server that does not allow this
-    /// client, or one still connecting to its relay right after starting,
-    /// shows up as TailcatError.timeout, which is worth a retry. The
+    /// The probe is resent every second until acknowledged or the timeout
+    /// expires, so a ping right after the server started succeeds as soon
+    /// as the server is on its relay; a server that does not allow this
+    /// client never answers, which shows up as TailcatError.timeout. The
     /// timeout is rounded up to whole milliseconds; zero means no limit
     /// beyond tailcat's own.
     public func ping(timeout: Duration = .seconds(10)) async throws -> Duration {

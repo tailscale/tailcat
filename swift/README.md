@@ -55,7 +55,7 @@ A client:
 
 ```swift
 let client = try TailcatClient(address: address)
-let rtt = try await client.ping()                  // brings the tunnel up; retry on .timeout right after the server started
+let rtt = try await client.ping()                  // brings the tunnel up
 let path = try await client.path()                 // direct endpoint or relay region
 let connection = try await client.connect(port: 8080)
 try await connection.send(Data("hello\n".utf8))
@@ -94,10 +94,10 @@ stable across restarts); `.region(id)` and `.hosts([...])` override it.
   data has been handed to the tunnel, `closeWrite` is a TCP half-close,
   and `close` (also run by deinit) closes the descriptor exactly once.
   One receive at a time; `incoming` is a pull-based stream over it.
-- `start()` returns once the server is configured, like the tailcat CLI;
-  the relay connection completes in the background right after, so a
-  client's first `ping` may throw `TailcatError.timeout` and is worth
-  retrying.
+- `start()` returns once the server is configured and its address is
+  known, like the tailcat CLI; the relay connection completes in the
+  background right after, and pings resend until acknowledged, so a
+  client's `ping` right after `start()` succeeds within its timeout.
 - Closing a server or client also closes its listeners and connections
   on the Go side: their reads see EOF and their accepts throw
   `TailcatError.closed`. The Swift objects still own their descriptors

@@ -322,18 +322,9 @@ func TestEndToEnd(t *testing.T) {
 	check(t, "allow client", sd, TailcatServerAllowClient(sd, ckey))
 	cFree(ckey)
 	// The server finishes connecting to the relay in the background
-	// after start, and a ping sends a single meow that a server not yet
-	// on the relay never sees, so retry until one gets through.
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if rc := TailcatClientPing(cd, 2000, &latency); rc == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("ping: %s", errmsg(cd))
-		}
-		t.Logf("ping: %s; retrying", errmsg(cd))
-	}
+	// after start; the ping resends its meow until the server answers,
+	// so one call with a generous timeout suffices.
+	check(t, "ping", cd, TailcatClientPing(cd, 15000, &latency))
 	if latency <= 0 {
 		t.Fatalf("ping latency = %v ms; want > 0", latency)
 	}
