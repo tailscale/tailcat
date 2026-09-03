@@ -58,8 +58,10 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	go4mem "go4.org/mem"
 	"go4.org/netipx"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -1943,8 +1945,77 @@ func ProxyConns(a, b net.Conn) {
 	go cp(a, b)
 	go cp(b, a)
 	wg.Wait()
-	a.Close()
-	b.Close()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		closeProxyConn(a)
+	}()
+	go func() {
+		defer wg.Done()
+		closeProxyConn(b)
+	}()
+	wg.Wait()
+}
+
+const proxyConnDrainTimeout = 5 * time.Second
+
+// closeProxyConn waits up to proxyConnDrainTimeout for a gVisor TCP connection
+// whose peer has already closed to acknowledge our FIN, then closes it.
+// Calling Close immediately after CloseWrite can race gVisor's protocol
+// teardown and lose the FIN if its first transmission is dropped. Other
+// connections can be closed immediately.
+func closeProxyConn(c net.Conn) {
+	closeProxyConnTimeout(c, proxyConnDrainTimeout)
+}
+
+func closeProxyConnTimeout(c net.Conn, timeout time.Duration) {
+	if c, ok := c.(*gonet.TCPConn); ok {
+		ep, wq := gonetTCPConnInternals(c)
+		e, ch := waiter.NewChannelEntry(waiter.EventHUp)
+		wq.EventRegister(&e)
+		// Check after registering so a concurrent state transition cannot be
+		// missed between observing the state and subscribing to its event.
+		timer := time.NewTimer(timeout)
+		for {
+			switch tcp.EndpointState(ep.State()) {
+			case tcp.StateClosing, tcp.StateLastAck:
+			default:
+				timer.Stop()
+				wq.EventUnregister(&e)
+				c.Close()
+				return
+			}
+			select {
+			case <-ch:
+			case <-timer.C:
+				wq.EventUnregister(&e)
+				c.Close()
+				return
+			}
+		}
+	}
+	c.Close()
+}
+
+type tcpStateEndpoint interface {
+	State() uint32
+}
+
+// gonetTCPConnInternals returns c's unexported gVisor TCP endpoint and waiter
+// queue.
+//
+// TODO(bradfitz): add an exported accessor upstream and delete this
+// reflect+unsafe cheat.
+func gonetTCPConnInternals(c *gonet.TCPConn) (ep tcpStateEndpoint, wq *waiter.Queue) {
+	cv := reflect.ValueOf(c).Elem()
+	epv := cv.FieldByName("ep")
+	wqv := cv.FieldByName("wq")
+	if !epv.IsValid() || !wqv.IsValid() {
+		panic("gonet.TCPConn internals changed in gVisor dependency")
+	}
+	ep = reflect.NewAt(epv.Type(), unsafe.Pointer(epv.UnsafeAddr())).Elem().Interface().(tcpStateEndpoint)
+	wq = reflect.NewAt(wqv.Type(), unsafe.Pointer(wqv.UnsafeAddr())).Elem().Interface().(*waiter.Queue)
+	return ep, wq
 }
 
 // Status returns the current WireGuard and DERP connection status.

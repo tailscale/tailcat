@@ -21,12 +21,196 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-cmp/cmp"
 	"go4.org/mem"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 )
+
+const testNICID = 1
+
+func newTestTCPStack(t *testing.T, addr tcpip.Address) (*stack.Stack, *channel.Endpoint) {
+	t.Helper()
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	})
+	ep := channel.New(16, 1500, "")
+	if err := s.CreateNIC(testNICID, ep); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if err := s.AddProtocolAddress(testNICID, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: addr.WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: testNICID}})
+	t.Cleanup(func() {
+		ep.Close()
+		s.Close()
+		s.Wait()
+	})
+	return s, ep
+}
+
+func relayTestPackets(ctx context.Context, src, dst *channel.Endpoint, packet func(*stack.PacketBuffer) bool) {
+	for {
+		pkt := src.ReadContext(ctx)
+		if pkt == nil {
+			return
+		}
+		forward := packet == nil || packet(pkt)
+		if forward {
+			in := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: pkt.ToBuffer()})
+			dst.InjectInbound(pkt.NetworkProtocolNumber, in)
+			in.DecRef()
+		}
+		pkt.DecRef()
+	}
+}
+
+func testPacketTCPFlags(pkt *stack.PacketBuffer) header.TCPFlags {
+	v := pkt.ToView()
+	defer v.Release()
+	ip := header.IPv4(v.AsSlice())
+	if ip.TransportProtocol() != tcp.ProtocolNumber {
+		return 0
+	}
+	return header.TCP(ip[ip.HeaderLength():]).Flags()
+}
+
+type testTCPStateEndpoint interface {
+	tcpStateEndpoint
+	LockUser()
+	UnlockUser()
+}
+
+func checkTestTCPState(t *testing.T, c *gonet.TCPConn, want tcp.EndpointState) {
+	t.Helper()
+	ep, _ := gonetTCPConnInternals(c)
+	lep := ep.(testTCPStateEndpoint)
+	lep.LockUser()
+	got := tcp.EndpointState(ep.State())
+	lep.UnlockUser()
+	if got != want {
+		t.Fatalf("TCP state = %v; want %v", got, want)
+	}
+}
+
+func TestCloseProxyConnRetransmitsFIN(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	clientAddr := tcpip.AddrFrom4([4]byte{192, 0, 2, 1})
+	serverAddr := tcpip.AddrFrom4([4]byte{192, 0, 2, 2})
+	clientStack, clientLink := newTestTCPStack(t, clientAddr)
+	serverStack, serverLink := newTestTCPStack(t, serverAddr)
+
+	go relayTestPackets(ctx, clientLink, serverLink, nil)
+	firstServerFIN := make(chan struct{})
+	secondServerFIN := make(chan struct{})
+	finCount := 0
+	go relayTestPackets(ctx, serverLink, clientLink, func(pkt *stack.PacketBuffer) bool {
+		if testPacketTCPFlags(pkt)&header.TCPFlagFin == 0 {
+			return true
+		}
+		finCount++
+		switch finCount {
+		case 1:
+			close(firstServerFIN)
+			return false
+		case 2:
+			close(secondServerFIN)
+		}
+		return true
+	})
+
+	ln, err := gonet.ListenTCP(serverStack, tcpip.FullAddress{
+		NIC:  testNICID,
+		Addr: serverAddr,
+		Port: 1234,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan *gonet.TCPConn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c.(*gonet.TCPConn)
+	}()
+	client, err := gonet.DialTCP(clientStack, tcpip.FullAddress{
+		NIC:  testNICID,
+		Addr: serverAddr,
+		Port: 1234,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer client.Close()
+	server := <-accepted
+
+	// Put the server in LAST-ACK: first receive the client's FIN, then send
+	// the server FIN. The packet relay deliberately drops that first FIN.
+	if err := client.CloseWrite(); err != nil {
+		t.Fatalf("client CloseWrite: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, server); err != nil {
+		t.Fatalf("server read to EOF: %v", err)
+	}
+	checkTestTCPState(t, server, tcp.StateCloseWait)
+	if err := server.CloseWrite(); err != nil {
+		t.Fatalf("server CloseWrite: %v", err)
+	}
+	select {
+	case <-firstServerFIN:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not send its first FIN")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		closeProxyConnTimeout(server, time.Second)
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("closeProxyConn returned before the dropped FIN was retransmitted")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-secondServerFIN:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not retransmit its FIN")
+	}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("client SetReadDeadline: %v", err)
+	}
+	if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("client read after retransmitted FIN = %d, %v; want 0, EOF", n, err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		sep, _ := gonetTCPConnInternals(server)
+		cep, _ := gonetTCPConnInternals(client)
+		t.Logf("states: server=%v client=%v", tcp.EndpointState(sep.State()), tcp.EndpointState(cep.State()))
+		t.Fatal("closeProxyConn did not return after the retransmitted FIN was acknowledged")
+	}
+}
 
 func mkLogger(t testing.TB, name string) logger.Logf {
 	return func(format string, args ...any) {
