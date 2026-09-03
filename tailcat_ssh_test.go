@@ -327,6 +327,30 @@ func TestSSHSuite(t *testing.T) {
 		}
 	})
 
+	t.Run("PeerKeyEnv", func(t *testing.T) {
+		// The served process should see the connecting peer's
+		// authenticated node key in TAILCAT_PEER_KEY, matching the
+		// client's own public key (in --allow's "nodekey:..." form).
+		sess, err := env.sshClient(t).NewSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.Close()
+
+		cmd := "echo peer=$TAILCAT_PEER_KEY"
+		if runtime.GOOS == "windows" {
+			cmd = `echo "peer=$env:TAILCAT_PEER_KEY"`
+		}
+		out, err := sess.Output(cmd)
+		if err != nil {
+			t.Fatalf("Output: %v", err)
+		}
+		want := "peer=" + env.client.PublicKey().String()
+		if got := strings.TrimSpace(string(out)); got != want {
+			t.Fatalf("TAILCAT_PEER_KEY = %q, want %q", got, want)
+		}
+	})
+
 	t.Run("PTYAllocated", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
 			t.Skip("no tty command or /dev tty names on Windows")

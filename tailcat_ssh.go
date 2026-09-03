@@ -24,6 +24,7 @@ import (
 
 	ssh "github.com/tailscale/gliderssh"
 	gossh "golang.org/x/crypto/ssh"
+	"tailscale.com/types/key"
 )
 
 const sshInteractiveMOTD = "🐈 Connected via tailcat SSH.\r\n"
@@ -65,7 +66,7 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 			c.Close()
 			return
 		}
-		handler := sessionHandler
+		handler := s.sessionHandler
 		if !opts.Shell {
 			handler = func(sess ssh.Session) {
 				fmt.Fprintf(sess.Stderr(), "this tailcat server only offers file transfer (SFTP); shell and exec sessions are disabled\r\n")
@@ -94,7 +95,7 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 }
 
 // sessionHandler handles a single SSH session (shell or exec).
-func sessionHandler(sess ssh.Session) {
+func (s *Server) sessionHandler(sess ssh.Session) {
 	u, err := user.Current()
 	if err != nil {
 		fmt.Fprintf(sess.Stderr(), "failed to get current user: %v\r\n", err)
@@ -112,6 +113,15 @@ func sessionHandler(sess ssh.Session) {
 		}
 	}
 
+	// Surface the connecting peer's authenticated node key to the
+	// served process as TAILCAT_PEER_KEY. The tunnel has already
+	// authenticated the peer by this key (and --allow, if set, gated on
+	// it), so a shell wrapper can tell which allowed peer it's talking
+	// to. The value matches --allow's format ("nodekey:...").
+	if k, ok := s.peerKeyForSession(sess); ok {
+		cmd.Env = append(cmd.Env, "TAILCAT_PEER_KEY="+k.String())
+	}
+
 	ptyReq, winCh, isPTY := sess.Pty()
 	if isPTY && sess.RawCommand() == "" {
 		io.WriteString(sess, sshInteractiveMOTD)
@@ -122,6 +132,19 @@ func sessionHandler(sess ssh.Session) {
 	} else {
 		runWithPipes(sess, cmd)
 	}
+}
+
+// peerKeyForSession returns the node public key of the peer on the
+// other end of sess. The session's remote address is the peer's
+// tailcat IP (derived from its key by tcAddrForKey); peerByIP reverses
+// that back to the key the tunnel authenticated. It returns ok=false
+// if the address can't be mapped to a known peer.
+func (s *Server) peerKeyForSession(sess ssh.Session) (key.NodePublic, bool) {
+	ta, ok := sess.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		return key.NodePublic{}, false
+	}
+	return s.lb.peerByIP(ta.AddrPort().Addr().Unmap())
 }
 
 // runWithPipes runs cmd with stdin/stdout/stderr pipes (no PTY).

@@ -420,7 +420,9 @@ to the same port on localhost. Service names are:
 	exit-node    run an exit node for all addresses
 	ssh          SSH server requiring a public key listed by
 	             --ssh-authorized-keys
-	no-auth-ssh  auth-free SSH server (the tunnel provides identity)
+	no-auth-ssh  auth-free SSH server (the tunnel provides identity;
+	             the served process gets the peer's node key in
+	             $TAILCAT_PEER_KEY)
 	files        file server for SFTP clients like scp and sftp,
 	             rooted in the --files directory (default: the
 	             current directory, read-only)
