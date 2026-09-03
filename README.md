@@ -592,6 +592,37 @@ $ ./client tcomFwWCAWf933BLELdzd3RkHiOufJ...
 hello from port 80
 ```
 
+UDP uses a connected packet connection for each client flow, preserving
+datagram boundaries and both endpoint addresses:
+
+```go
+s.OnUDP = func(port uint16) func(tailcat.ConnPacketConn) {
+	if port != 53 {
+		return nil
+	}
+	return func(c tailcat.ConnPacketConn) {
+		defer c.Close()
+		buf := make([]byte, tailcat.MaxUDPPayload)
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+			c.Write(buf[:n])
+		}
+	}
+}
+
+pc, err := cl.DialUDPPort(context.Background(), 53)
+```
+
+`ConnPacketConn` implements both `net.Conn` and `net.PacketConn`. Keep payloads
+at or below `tailcat.MaxUDPPayload` (1232 bytes) to fit the IPv6 tunnel MTU
+without fragmentation. Use `OnUDPForward` and `DialUDP` for exit-node traffic;
+`ProxyPacketConns` provides datagram-safe bidirectional forwarding. Inactive
+server-side UDP flows close after `tailcat.DefaultUDPIdleTimeout` (two minutes);
+set `Server.UDPIdleTimeout` to change the timeout.
+
 ## How it works
 
 ### Tailcat addresses

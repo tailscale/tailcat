@@ -14,8 +14,9 @@
 // just like the normal Tailscale data plane. DERP remains available as a
 // fallback relay if a direct path cannot be established.
 //
-// Once connected, the two sides exchange arbitrary TCP traffic over the
-// WireGuard tunnel with no Tailscale account or coordination server required.
+// Once connected, the two sides exchange arbitrary TCP streams and UDP
+// datagrams over the WireGuard tunnel with no Tailscale account or coordination
+// server required.
 // Optionally, the server can run an SSH server on port 22, either requiring
 // authorized public keys or relying on the tunnel for client identity.
 //
@@ -83,6 +84,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
@@ -390,9 +392,9 @@ func (b *locoBackend) Close() error {
 }
 
 // Server listens for clients over a WireGuard tunnel relayed through DERP.
-// Incoming TCP connections are dispatched via [Server.OnTCP] (for connections
-// addressed to the server itself) and [Server.OnTCPForward] (for connections
-// the server relays to other addresses, acting as an exit node).
+// Incoming TCP connections and UDP flows are dispatched via the OnTCP/OnUDP
+// callbacks (for traffic addressed to the server itself) and their Forward
+// counterparts (for traffic the server relays to other addresses).
 //
 // The zero value is a usable server: optionally populate the
 // configuration fields, then call [Server.Start], which picks
@@ -469,6 +471,25 @@ type Server struct {
 	// destination, not just the server's own address.
 	OnTCPForward func(netip.AddrPort) (handler func(net.Conn))
 
+	// OnUDP, if non-nil, specifies a func that returns a handler for an
+	// incoming UDP flow to the provided port. Each handler receives a connected
+	// packet connection for one client source IP:port. Datagram boundaries are
+	// preserved, and LocalAddr and RemoteAddr report the destination and source
+	// of the flow. If nil or if it returns nil, the flow is dropped.
+	//
+	// This only applies to packets addressed directly to the server node and not
+	// when being a subnet router. See OnUDPForward for relayed packets.
+	//
+	// It must be set before calling Start.
+	OnUDP func(port uint16) (handler func(ConnPacketConn))
+
+	// OnUDPForward is like OnUDP for UDP flows addressed through the server to
+	// another IP:port. Setting it also widens the packet filter installed at
+	// Start to admit UDP traffic to any destination.
+	//
+	// It must be set before calling Start.
+	OnUDPForward func(netip.AddrPort) (handler func(ConnPacketConn))
+
 	// ServedTCPPorts, if non-nil, restricts which TCP ports on the
 	// server's own address the packet filter admits new inbound
 	// connections to. If nil, connections to all ports reach OnTCP,
@@ -481,7 +502,38 @@ type Server struct {
 	//
 	// It must be set before calling Start.
 	ServedTCPPorts []filter.PortRange
+
+	// ServedUDPPorts, if non-nil, restricts which UDP ports on the server's own
+	// address the packet filter admits. If nil, packets to all ports reach
+	// OnUDP, which remains the per-flow gate either way.
+	//
+	// It must be set before calling Start.
+	ServedUDPPorts []filter.PortRange
+
+	// UDPIdleTimeout is how long an inactive incoming UDP flow remains open.
+	// A zero value uses [DefaultUDPIdleTimeout]. Successful reads and writes
+	// reset the timeout. It must be set before calling Start.
+	UDPIdleTimeout time.Duration
 }
+
+// ConnPacketConn is a connected datagram socket. Read and Write preserve UDP
+// datagram boundaries, while the net.PacketConn methods are available to code
+// that prefers packet-oriented APIs. LocalAddr and RemoteAddr identify the
+// destination and source endpoints of an incoming server flow.
+type ConnPacketConn interface {
+	net.Conn
+	net.PacketConn
+}
+
+// MaxUDPPayload is the largest UDP payload that fits the tunnel's 1280-byte
+// IPv6 MTU without IP fragmentation (1280 minus 40 bytes of IPv6 header and 8
+// bytes of UDP header). Applications should keep datagrams at or below this
+// size; larger writes are not guaranteed to reach the peer.
+const MaxUDPPayload = 1232
+
+// DefaultUDPIdleTimeout is the amount of inactivity after which an incoming
+// UDP flow is closed.
+const DefaultUDPIdleTimeout = 2 * time.Minute
 
 // Start connects to the DERP relay and begins accepting clients,
 // first picking defaults for any unset configuration fields: a new
@@ -490,6 +542,9 @@ type Server struct {
 func (s *Server) Start() error {
 	if s.lb != nil {
 		return errors.New("tailcat: Server.Start called twice")
+	}
+	if s.UDPIdleTimeout < 0 {
+		return errors.New("tailcat: Server.UDPIdleTimeout must not be negative")
 	}
 	logf := s.Logf
 	if logf == nil {
@@ -604,6 +659,26 @@ func (s *Server) Start() error {
 		}
 		return s.OnTCPForward(dst), true
 	}
+	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+		var h func(ConnPacketConn)
+		if dst.Addr() == lb.addr {
+			if s.OnUDP != nil {
+				h = s.OnUDP(dst.Port())
+			}
+		} else if s.OnUDPForward != nil {
+			if nat64Prefix.Contains(dst.Addr()) {
+				var a4 [4]byte
+				d6 := dst.Addr().As16()
+				copy(a4[:], d6[12:16])
+				dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
+			}
+			h = s.OnUDPForward(dst)
+		}
+		if h == nil {
+			return nil, true
+		}
+		return func(c nettype.ConnPacketConn) { h(newIdlePacketConn(c, s.udpIdleTimeout())) }, true
+	}
 	lb.ns = ns
 	sys.Set(ns)
 
@@ -630,19 +705,26 @@ func (s *Server) Start() error {
 	return nil
 }
 
-var allTCPPorts = filter.PortRange{First: 0, Last: 65535}
+func (s *Server) udpIdleTimeout() time.Duration {
+	if s.UDPIdleTimeout != 0 {
+		return s.UDPIdleTimeout
+	}
+	return DefaultUDPIdleTimeout
+}
 
-// buildFilter returns the packet filter enforcing what the server is
-// configured to serve: new inbound TCP connections are admitted only
-// to the server's own address (limited to ServedTCPPorts if set),
-// plus to any destination when OnTCPForward is set (exit node mode).
+var allPorts = filter.PortRange{First: 0, Last: 65535}
+
+// buildFilter returns the packet filter enforcing what the server is configured
+// to serve: inbound TCP connections and UDP flows are admitted only to the
+// server's own configured ports, plus to any destination for protocols whose
+// Forward callback is set (exit node mode).
 // Everything else from the tunnel is dropped before reaching
 // netstack; the OnTCP/OnTCPForward callbacks remain the
 // per-connection gates behind it.
 func (s *Server) buildFilter() *filter.Filter {
 	lb := s.lb
 
-	selfPorts := []filter.PortRange{allTCPPorts}
+	selfPorts := []filter.PortRange{allPorts}
 	if s.ServedTCPPorts != nil {
 		selfPorts = s.ServedTCPPorts
 	}
@@ -655,15 +737,39 @@ func (s *Server) buildFilter() *filter.Filter {
 		Srcs:    []netip.Prefix{allIPv6},
 		Dsts:    selfDsts,
 	}}
+	if s.OnUDP != nil {
+		udpPorts := []filter.PortRange{allPorts}
+		if s.ServedUDPPorts != nil {
+			udpPorts = s.ServedUDPPorts
+		}
+		udpDsts := make([]filter.NetPortRange, 0, len(udpPorts))
+		for _, pr := range udpPorts {
+			udpDsts = append(udpDsts, filter.NetPortRange{Net: lb.addrPrefix, Ports: pr})
+		}
+		matches = append(matches, filter.Match{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
+			Srcs:    []netip.Prefix{allIPv6},
+			Dsts:    udpDsts,
+		})
+	}
 
 	var localNets netipx.IPSetBuilder
 	localNets.AddPrefix(lb.addrPrefix)
-	if s.OnTCPForward != nil {
+	if s.OnTCPForward != nil || s.OnUDPForward != nil {
 		localNets.AddPrefix(allIPv6)
+	}
+	if s.OnTCPForward != nil {
 		matches = append(matches, filter.Match{
 			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
 			Srcs:    []netip.Prefix{allIPv6},
-			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allTCPPorts}},
+			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allPorts}},
+		})
+	}
+	if s.OnUDPForward != nil {
+		matches = append(matches, filter.Match{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
+			Srcs:    []netip.Prefix{allIPv6},
+			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allPorts}},
 		})
 	}
 	local, _ := localNets.IPSet()
@@ -1609,8 +1715,8 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 
 // Client connects to a [Server] over a WireGuard tunnel relayed through DERP.
 // Populate Server (the only required field, or use the [NewClient]
-// shorthand), then just dial: [Client.Dial], [Client.DialTCPPort],
-// and [Client.DialTCP] lazily establish the tunnel on first use,
+// shorthand), then just dial: [Client.Dial], the DialTCP methods, and the
+// DialUDP methods lazily establish the tunnel on first use,
 // picking defaults for any unset fields. [Client.Ping] does the same
 // and is useful to test connectivity first or to measure the relay
 // round-trip time.
@@ -1770,7 +1876,11 @@ func (c *Client) initLocked() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		udpConn, err := ns.DialContextUDPWithBind(ctx, lb.addr, dst)
+		if err != nil {
+			return nil, err
+		}
+		return udpConn, nil
 	}
 	sys.Tun.Get().Start()
 
@@ -2022,6 +2132,42 @@ func (c *Client) DialTCP(ctx context.Context, ap netip.AddrPort) (net.Conn, erro
 	return c.lb.ns.DialContextTCP(ctx, ap)
 }
 
+// DialUDPPort opens a connected UDP packet connection to the given port on the
+// server. Each Write sends one datagram and each Read receives one datagram.
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDPPort(ctx context.Context, port uint16) (ConnPacketConn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	return c.dialUDP(ctx, netip.AddrPortFrom(c.serverAddr, port))
+}
+
+// DialUDP opens a connected UDP packet connection to an arbitrary IP:port
+// through the server, which must be configured to forward UDP (see
+// [Server.OnUDPForward]). IPv4 addresses are mapped into the NAT64 prefix for
+// transport over the IPv6-only WireGuard tunnel.
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDP(ctx context.Context, ap netip.AddrPort) (ConnPacketConn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	if ap.Addr().Is4() {
+		a := nat64PrefixBytes
+		a4 := ap.Addr().As4()
+		copy(a[12:], a4[:])
+		ap = netip.AddrPortFrom(netip.AddrFrom16(a), ap.Port())
+	}
+	return c.dialUDP(ctx, ap)
+}
+
+func (c *Client) dialUDP(ctx context.Context, ap netip.AddrPort) (ConnPacketConn, error) {
+	udpConn, err := c.lb.ns.DialContextUDPWithBind(ctx, c.lb.addr, ap)
+	if err != nil {
+		return nil, err
+	}
+	return udpConn, nil
+}
+
 func pfxOf(a netip.Addr) netip.Prefix {
 	return netip.PrefixFrom(a, a.BitLen())
 }
@@ -2128,6 +2274,124 @@ func gonetTCPConnInternals(c *gonet.TCPConn) (ep tcpStateEndpoint, wq *waiter.Qu
 	ep = reflect.NewAt(epv.Type(), unsafe.Pointer(epv.UnsafeAddr())).Elem().Interface().(tcpStateEndpoint)
 	wq = reflect.NewAt(wqv.Type(), unsafe.Pointer(wqv.UnsafeAddr())).Elem().Interface().(*waiter.Queue)
 	return ep, wq
+}
+
+// ProxyPacketConns copies whole datagrams between a and b until either socket
+// fails or is closed, then closes both sockets. The maximum-size UDP buffer
+// avoids turning a large datagram into multiple writes or truncating it.
+func ProxyPacketConns(a, b ConnPacketConn) {
+	done := make(chan struct{}, 2)
+	pump := func(dst, src ConnPacketConn) {
+		buf := make([]byte, 65535)
+		for {
+			n, err := src.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go pump(a, b)
+	go pump(b, a)
+	<-done
+	a.Close()
+	b.Close()
+	<-done
+}
+
+// idlePacketConn closes c after timeout without a successful read or write.
+// It is used for server-side UDP flows, which do not otherwise have a natural
+// close signal from the peer.
+type idlePacketConn struct {
+	ConnPacketConn
+	timeout  time.Duration
+	timer    *time.Timer
+	deadline time.Time
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func newIdlePacketConn(c ConnPacketConn, timeout time.Duration) *idlePacketConn {
+	ic := &idlePacketConn{ConnPacketConn: c, timeout: timeout, deadline: time.Now().Add(timeout)}
+	ic.timer = time.AfterFunc(timeout, ic.checkIdle)
+	return ic
+}
+
+// checkIdle closes the flow if the deadline has passed. If activity extended
+// the deadline while the timer was firing, it reschedules instead of closing,
+// so a concurrent touch cannot be followed by a spurious close.
+func (c *idlePacketConn) checkIdle() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if remaining := time.Until(c.deadline); remaining > 0 {
+		c.timer.Reset(remaining)
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+	c.ConnPacketConn.Close()
+}
+
+func (c *idlePacketConn) touch() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.deadline = time.Now().Add(c.timeout)
+	c.timer.Reset(c.timeout)
+}
+
+func (c *idlePacketConn) Read(b []byte) (int, error) {
+	n, err := c.ConnPacketConn.Read(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.ConnPacketConn.ReadFrom(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, addr, err
+}
+
+func (c *idlePacketConn) Write(b []byte) (int, error) {
+	n, err := c.ConnPacketConn.Write(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := c.ConnPacketConn.WriteTo(b, addr)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.closed = true
+	c.timer.Stop()
+	c.mu.Unlock()
+	return c.ConnPacketConn.Close()
 }
 
 // Status returns the current WireGuard and DERP connection status.

@@ -1025,16 +1025,7 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 			if err != nil {
 				return nil, err
 			}
-			if dst.addr != "" {
-				return clientForAddr(dst.addr).DialTCPPort(ctx, dst.port)
-			}
-			if cl == nil {
-				return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
-			}
-			if dst.toServer {
-				return cl.DialTCPPort(ctx, dst.port)
-			}
-			return cl.DialTCP(ctx, dst.dst)
+			return dialSOCKSTarget(ctx, network, dst, cl, clientForAddr)
 		},
 	}
 	socksAddr := "socks5h://" + socksLn.Addr().String()
@@ -1058,6 +1049,36 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 		log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksLn))
 	}
 	return nil
+}
+
+// dialSOCKSTarget dials a classified SOCKS destination over the tailcat
+// tunnel. UDP ASSOCIATE targets (network == "udp") use the connected packet
+// connections from [tailcat.Client.DialUDPPort] and [tailcat.Client.DialUDP],
+// which satisfy net.Conn with datagram-preserving Read/Write as the SOCKS5
+// UDP relay expects; everything else dials TCP as before.
+func dialSOCKSTarget(ctx context.Context, network string, dst socksTarget, cl *tailcat.Client, clientForAddr func(tailcat.Addr) *tailcat.Client) (net.Conn, error) {
+	if network == "udp" {
+		if dst.addr != "" {
+			return clientForAddr(dst.addr).DialUDPPort(ctx, dst.port)
+		}
+		if cl == nil {
+			return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
+		}
+		if dst.toServer {
+			return cl.DialUDPPort(ctx, dst.port)
+		}
+		return cl.DialUDP(ctx, dst.dst)
+	}
+	if dst.addr != "" {
+		return clientForAddr(dst.addr).DialTCPPort(ctx, dst.port)
+	}
+	if cl == nil {
+		return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
+	}
+	if dst.toServer {
+		return cl.DialTCPPort(ctx, dst.port)
+	}
+	return cl.DialTCP(ctx, dst.dst)
 }
 
 // socksTarget is where a SOCKS5 destination address should be dialed.

@@ -4,6 +4,7 @@
 package tailcat
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -319,6 +320,433 @@ func TestTailcat(t *testing.T) {
 		t.Fatalf("DialTCP = %v, %v", conn, err)
 	}
 
+}
+
+func TestUDP(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	type flow struct {
+		local, remote netip.AddrPort
+	}
+	flows := make(chan flow, 2)
+	handlerErr := make(chan error, 2)
+	var onUDPCalls atomic.Int32
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDP = func(port uint16) func(ConnPacketConn) {
+		onUDPCalls.Add(1)
+		if port != 53 {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			defer c.Close()
+			local, err := netip.ParseAddrPort(c.LocalAddr().String())
+			if err != nil {
+				handlerErr <- err
+				return
+			}
+			remote, err := netip.ParseAddrPort(c.RemoteAddr().String())
+			if err != nil {
+				handlerErr <- err
+				return
+			}
+			flows <- flow{local, remote}
+			for range 2 {
+				buf := make([]byte, 65535)
+				n, err := c.Read(buf)
+				if err != nil {
+					handlerErr <- err
+					return
+				}
+				if _, err := c.Write(buf[:n]); err != nil {
+					handlerErr <- err
+					return
+				}
+			}
+			handlerErr <- nil
+		}
+	}
+	s.ServedUDPPorts = []filter.PortRange{{First: 53, Last: 53}}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	clients := []*Client{
+		{Server: s.ConnBlob(), Logf: mkLogger(t, "client1")},
+		{Server: s.ConnBlob(), Logf: mkLogger(t, "client2")},
+	}
+	for _, c := range clients {
+		t.Cleanup(func() { c.Close() })
+		PingForTest(t, s, c)
+		pc, err := c.DialUDPPort(t.Context(), 53)
+		if err != nil {
+			t.Fatalf("DialUDPPort: %v", err)
+		}
+		defer pc.Close()
+		if err := pc.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// MaxUDPPayload is the largest datagram that fits Tailcat's 1280-byte
+		// IPv6 tunnel MTU without fragmentation.
+		for _, payload := range [][]byte{[]byte("small datagram"), bytes.Repeat([]byte("m"), MaxUDPPayload)} {
+			if n, err := pc.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("UDP Write = %d, %v; want %d, nil", n, err, len(payload))
+			}
+			got := make([]byte, len(payload)+1)
+			n, err := pc.Read(got)
+			if err != nil {
+				t.Fatalf("UDP Read: %v", err)
+			}
+			if !bytes.Equal(got[:n], payload) {
+				t.Fatalf("UDP echo = %d bytes; want %d-byte datagram", n, len(payload))
+			}
+		}
+		gotFlow := <-flows
+		if gotFlow.local != netip.AddrPortFrom(s.Addr(), 53) {
+			t.Errorf("server flow local address = %v; want %v:53", gotFlow.local, s.Addr())
+		}
+		clientLocal, err := netip.ParseAddrPort(pc.LocalAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotFlow.remote != clientLocal {
+			t.Errorf("server flow remote address = %v; want client %v", gotFlow.remote, clientLocal)
+		}
+		if err := <-handlerErr; err != nil {
+			t.Fatalf("UDP handler: %v", err)
+		}
+	}
+
+	// Dialing a filtered UDP port creates a local socket immediately, but its
+	// datagrams must be silently dropped before reaching OnUDP.
+	pc, err := clients[0].DialUDPPort(t.Context(), 54)
+	if err != nil {
+		t.Fatalf("DialUDPPort(54): %v", err)
+	}
+	defer pc.Close()
+	pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := pc.Write([]byte("drop me")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := pc.Read(make([]byte, 32)); err == nil {
+		t.Fatalf("filtered UDP read = %d, nil; want timeout", n)
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("filtered UDP read error = %v; want timeout", err)
+	}
+	if got := onUDPCalls.Load(); got != int32(len(clients)) {
+		t.Fatalf("OnUDP called %d times; want %d served flows and no filtered flow", got, len(clients))
+	}
+}
+
+func TestUDPForward(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	backend, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := backend.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := backend.WriteToUDP(buf[:n], src); err != nil {
+				return
+			}
+		}
+	}()
+	backendAddr := backend.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDPForward = func(dst netip.AddrPort) func(ConnPacketConn) {
+		if dst != backendAddr {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			upstream, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				c.Close()
+				return
+			}
+			ProxyPacketConns(c, upstream)
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	forwarded, err := c.DialUDP(t.Context(), backendAddr)
+	if err != nil {
+		t.Fatalf("DialUDP(%v): %v", backendAddr, err)
+	}
+	defer forwarded.Close()
+	forwarded.SetDeadline(time.Now().Add(5 * time.Second))
+	const payload = "forwarded datagram"
+	if _, err := forwarded.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := forwarded.Read(buf)
+	if err != nil {
+		t.Fatalf("reading forwarded UDP echo: %v", err)
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Fatalf("forwarded UDP echo = %q; want %q", got, payload)
+	}
+}
+
+func TestUDPIdleTimeout(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan error, 1)
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 50 * time.Millisecond,
+		OnUDP: func(port uint16) func(ConnPacketConn) {
+			if port != 53 {
+				return nil
+			}
+			return func(c ConnPacketConn) {
+				defer c.Close()
+				close(handlerStarted)
+				buf := make([]byte, 1)
+				if _, err := c.Read(buf); err != nil {
+					handlerDone <- err
+					return
+				}
+				_, err := c.Read(buf)
+				handlerDone <- err
+			}
+		},
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP handler did not start")
+	}
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("UDP flow ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP flow did not time out")
+	}
+}
+
+func TestServerRejectsNegativeUDPIdleTimeout(t *testing.T) {
+	s := &Server{UDPIdleTimeout: -time.Second}
+	if err := s.Start(); err == nil {
+		t.Fatal("Server.Start succeeded with a negative UDP idle timeout")
+	}
+}
+
+func TestUDPIdleTimeoutDefault(t *testing.T) {
+	if got := (&Server{}).udpIdleTimeout(); got != DefaultUDPIdleTimeout {
+		t.Fatalf("zero UDPIdleTimeout = %v; want DefaultUDPIdleTimeout %v", got, DefaultUDPIdleTimeout)
+	}
+	const custom = 5 * time.Second
+	if got := (&Server{UDPIdleTimeout: custom}).udpIdleTimeout(); got != custom {
+		t.Fatalf("custom UDPIdleTimeout = %v; want %v", got, custom)
+	}
+}
+
+func TestUDPForwardIdleTimeout(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	backend, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := backend.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := backend.WriteToUDP(buf[:n], src); err != nil {
+				return
+			}
+		}
+	}()
+	backendAddr := backend.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	handlerDone := make(chan struct{})
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 50 * time.Millisecond,
+	}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDPForward = func(dst netip.AddrPort) func(ConnPacketConn) {
+		if dst != backendAddr {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			defer close(handlerDone)
+			upstream, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				c.Close()
+				return
+			}
+			ProxyPacketConns(c, upstream)
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	forwarded, err := c.DialUDP(t.Context(), backendAddr)
+	if err != nil {
+		t.Fatalf("DialUDP(%v): %v", backendAddr, err)
+	}
+	defer forwarded.Close()
+	if err := forwarded.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	const payload = "forwarded datagram"
+	if _, err := forwarded.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := forwarded.Read(buf)
+	if err != nil {
+		t.Fatalf("reading forwarded UDP echo: %v", err)
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Fatalf("forwarded UDP echo = %q; want %q", got, payload)
+	}
+	// Now go idle: the server-side forward flow must time out and the
+	// ProxyPacketConns handler must return.
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarded UDP flow did not time out")
+	}
+}
+
+func TestUDPIdleTimeoutReset(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	handlerDone := make(chan error, 1)
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 200 * time.Millisecond,
+		OnUDP: func(port uint16) func(ConnPacketConn) {
+			if port != 53 {
+				return nil
+			}
+			return func(c ConnPacketConn) {
+				defer c.Close()
+				buf := make([]byte, 32)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						handlerDone <- err
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						handlerDone <- err
+						return
+					}
+				}
+			}
+		},
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if err := pc.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Each exchange resets the 200ms idle timer; the flow must survive
+	// well past the original deadline as long as activity continues.
+	for i := range 4 {
+		msg := []byte{byte('a' + i)}
+		if _, err := pc.Write(msg); err != nil {
+			t.Fatalf("UDP Write %d: %v", i, err)
+		}
+		buf := make([]byte, 32)
+		n, err := pc.Read(buf)
+		if err != nil {
+			t.Fatalf("UDP Read %d (flow closed despite activity): %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], msg) {
+			t.Fatalf("UDP echo %d = %q; want %q", i, buf[:n], msg)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Now go idle: the server must close the flow.
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("UDP flow ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP flow did not time out after going idle")
+	}
 }
 
 // TestHalfClose tests that a client's write shutdown (CloseWrite)
