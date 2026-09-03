@@ -76,6 +76,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
@@ -374,6 +375,17 @@ type Server struct {
 	// destination, not just the server's own address.
 	OnTCPForward func(netip.AddrPort) (handler func(net.Conn))
 
+	// OnUDPForward, if non-nil, specifies a func that returns a handler to handle
+	// incoming UDP packets to the provided IP:port. If nil or if it returns nil,
+	// then the packet is dropped.
+	//
+	// This only applies to UDP packets relayed through the server (exit node mode)
+	// and not to the server itself.
+	//
+	// It must be set before calling Start. Setting it also widens the
+	// packet filter installed at Start to admit UDP traffic to any destination.
+	OnUDPForward func(netip.AddrPort) (handler func(nettype.ConnPacketConn))
+
 	// ServedTCPPorts, if non-nil, restricts which TCP ports on the
 	// server's own address the packet filter admits new inbound
 	// connections to. If nil, connections to all ports reach OnTCP,
@@ -466,7 +478,14 @@ func (s *Server) Start() error {
 				// "meowed" is the ack that tells the client it can
 				// start dialing. Disallowed clients get no reply.
 				if lb.onMeow(src, discoPub) {
-					mc.SendDERPPacketTo(src, regionID, EncodeMeowed())
+					var caps uint8
+					if s.OnTCPForward != nil {
+						caps |= CapExitTCP
+					}
+					if s.OnUDPForward != nil {
+						caps |= CapExitUDP
+					}
+					mc.SendDERPPacketTo(src, regionID, EncodeMeowedWithCaps(caps))
 				}
 			}()
 			return true
@@ -501,7 +520,25 @@ func (s *Server) Start() error {
 			copy(a4[:], d6[12:16])
 			dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
 		}
+		if s.AllowProxy != nil && !s.AllowProxy(dst) {
+			return nil, true // send RST
+		}
 		return s.OnTCPForward(dst), true
+	}
+	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+		if s.OnUDPForward == nil {
+			return nil, true
+		}
+		if nat64Prefix.Contains(dst.Addr()) {
+			var a4 [4]byte
+			d6 := dst.Addr().As16()
+			copy(a4[:], d6[12:16])
+			dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
+		}
+		if s.AllowProxy != nil && !s.AllowProxy(dst) {
+			return nil, true
+		}
+		return s.OnUDPForward(dst), true
 	}
 	lb.ns = ns
 	sys.Set(ns)
@@ -514,7 +551,7 @@ func (s *Server) Start() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		return ns.DialContextUDP(ctx, dst)
 	}
 
 	sys.Tun.Get().Start()
@@ -557,10 +594,19 @@ func (s *Server) buildFilter() *filter.Filter {
 
 	var localNets netipx.IPSetBuilder
 	localNets.AddPrefix(lb.addrPrefix)
-	if s.OnTCPForward != nil {
+	if s.OnTCPForward != nil || s.OnUDPForward != nil {
 		localNets.AddPrefix(allIPv6)
+	}
+	if s.OnTCPForward != nil {
 		matches = append(matches, filter.Match{
 			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
+			Srcs:    []netip.Prefix{allIPv6},
+			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allTCPPorts}},
+		})
+	}
+	if s.OnUDPForward != nil {
+		matches = append(matches, filter.Match{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
 			Srcs:    []netip.Prefix{allIPv6},
 			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allTCPPorts}},
 		})
@@ -1534,7 +1580,8 @@ type Client struct {
 	key     key.NodePrivate // the effective node identity; Key or generated
 	started bool
 
-	upDone atomic.Bool // whether the server has meowed us at least once
+	serverCaps atomic.Uint32 // capability bitfield from server's meowed response
+	upDone     atomic.Bool   // whether the server has meowed us at least once
 }
 
 // nodeKeyLocked returns the client's effective node private key,
@@ -1617,6 +1664,7 @@ func (c *Client) initLocked() error {
 			return false
 		}
 		if IsMeowedPacket(pkt) {
+			c.serverCaps.Store(uint32(ParseMeowedCaps(pkt)))
 			go onMeowed()
 			return true
 		}
@@ -1656,7 +1704,7 @@ func (c *Client) initLocked() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		return ns.DialContextUDP(ctx, dst)
 	}
 	sys.Tun.Get().Start()
 
@@ -1906,6 +1954,34 @@ func (c *Client) DialTCP(ctx context.Context, ap netip.AddrPort) (net.Conn, erro
 		ap = netip.AddrPortFrom(netip.AddrFrom16(a), ap.Port())
 	}
 	return c.lb.ns.DialContextTCP(ctx, ap)
+}
+
+// ServerCaps returns the capability bitfield advertised by the server in its meowed response.
+func (c *Client) ServerCaps() uint8 {
+	return uint8(c.serverCaps.Load())
+}
+
+// HasServerCap reports whether the server advertised the specified capability.
+func (c *Client) HasServerCap(cap uint8) bool {
+	return (c.ServerCaps() & cap) != 0
+}
+
+// DialUDP opens a UDP connection to an arbitrary IP:port through the server,
+// which must be configured as an exit node (see [Server.OnUDPForward]).
+// IPv4 addresses are mapped into the NAT64 prefix (64:ff9b::/96) for
+// transport over the IPv6-only WireGuard tunnel.
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDP(ctx context.Context, ap netip.AddrPort) (net.Conn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	if ap.Addr().Is4() {
+		a := nat64PrefixBytes
+		a4 := ap.Addr().As4()
+		copy(a[12:], a4[:])
+		ap = netip.AddrPortFrom(netip.AddrFrom16(a), ap.Port())
+	}
+	return c.lb.ns.DialContextUDP(ctx, ap)
 }
 
 func pfxOf(a netip.Addr) netip.Prefix {

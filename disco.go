@@ -68,3 +68,26 @@ func ParseMeowPing(pkt []byte) (nodeKey key.NodePublic, discoKey key.DiscoPublic
 func IsMeowedPacket(pkt []byte) bool {
 	return len(pkt) >= 5 && [4]byte(pkt[:4]) == meowMagic && pkt[4] == meowTypePong
 }
+
+// Exit node capability flags advertised in a meowed acknowledgment packet.
+const (
+	CapExitTCP uint8 = 1 << 0 // server supports exit-node TCP forwarding
+	CapExitUDP uint8 = 1 << 1 // server supports exit-node UDP forwarding
+)
+
+// EncodeMeowedWithCaps encodes a meowed packet with a capability trailer.
+func EncodeMeowedWithCaps(caps uint8) []byte {
+	b := make([]byte, 0, 4+1+1)
+	b = append(b, meowMagic[:]...)
+	b = append(b, meowTypePong, caps)
+	return b
+}
+
+// ParseMeowedCaps returns the capability flags from a meowed packet.
+// Legacy 5-byte meowed packets (no trailer) return 0.
+func ParseMeowedCaps(pkt []byte) uint8 {
+	if len(pkt) >= 6 && IsMeowedPacket(pkt) {
+		return pkt[5]
+	}
+	return 0
+}

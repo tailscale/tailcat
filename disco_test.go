@@ -47,6 +47,23 @@ func TestMeowedRoundTrip(t *testing.T) {
 	if _, _, ok := ParseMeowPing(pkt); ok {
 		t.Error("ParseMeowPing accepted a meowed packet")
 	}
+	if ParseMeowedCaps(pkt) != 0 {
+		t.Errorf("legacy meowed caps = %d; want 0", ParseMeowedCaps(pkt))
+	}
+}
+
+func TestMeowedCapsRoundTrip(t *testing.T) {
+	want := CapExitTCP | CapExitUDP
+	pkt := EncodeMeowedWithCaps(want)
+	if !IsMeowedPacket(pkt) {
+		t.Fatal("EncodeMeowedWithCaps output is not a meowed packet")
+	}
+	if got := ParseMeowedCaps(pkt); got != want {
+		t.Errorf("ParseMeowedCaps = %02x; want %02x", got, want)
+	}
+	if ParseMeowedCaps(EncodeMeowed()) != 0 {
+		t.Error("ParseMeowedCaps of 5-byte meowed must be 0")
+	}
 }
 
 func TestIsMeowPacket(t *testing.T) {

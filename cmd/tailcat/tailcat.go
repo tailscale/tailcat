@@ -43,6 +43,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
@@ -1250,9 +1251,60 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 	}
 
+	udpForwardTo := func(ipPortStr string) func(nettype.ConnPacketConn) {
+		return func(c nettype.ConnPacketConn) {
+			defer c.Close()
+			rAddr, err := net.ResolveUDPAddr("udp", ipPortStr)
+			if err != nil {
+				logf("error resolving UDP %v: %v", ipPortStr, err)
+				return
+			}
+			remoteConn, err := net.DialUDP("udp", nil, rAddr)
+			if err != nil {
+				logf("error dialing UDP to %v: %v", ipPortStr, err)
+				return
+			}
+			defer remoteConn.Close()
+
+			done := make(chan struct{}, 2)
+			go func() {
+				buf := make([]byte, 65535)
+				for {
+					_ = c.SetReadDeadline(time.Now().Add(60 * time.Second))
+					n, err := c.Read(buf)
+					if err != nil {
+						break
+					}
+					if _, err := remoteConn.Write(buf[:n]); err != nil {
+						break
+					}
+				}
+				done <- struct{}{}
+			}()
+			go func() {
+				buf := make([]byte, 65535)
+				for {
+					_ = remoteConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+					n, err := remoteConn.Read(buf)
+					if err != nil {
+						break
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						break
+					}
+				}
+				done <- struct{}{}
+			}()
+			<-done
+		}
+	}
+
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
 			return tcpForwardTo(dst.String())
+		}
+		s.OnUDPForward = func(dst netip.AddrPort) (handler func(nettype.ConnPacketConn)) {
+			return udpForwardTo(dst.String())
 		}
 	}
 

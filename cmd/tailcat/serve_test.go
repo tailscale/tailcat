@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -14,8 +15,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tailscale/tailcat"
+	"tailscale.com/types/nettype"
 )
 
 // startEchoListener starts a TCP echo server on a 127.0.0.1 ephemeral
@@ -229,4 +234,134 @@ func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn 
 	}
 	c.SetDeadline(time.Time{})
 	return c
+}
+
+func TestServeExitNodeUDP(t *testing.T) {
+	e := newTestEnv(t)
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port))
+
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			_, _ = pc.WriteTo(buf[:n], from)
+		}
+	}()
+
+	_, addr, _ := e.startServer("--serve=exit-node")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	client := tailcat.NewClient(tailcat.Addr(addr))
+	client.DERPMapURL = e.derpMapURL
+	defer client.Close()
+
+	conn, err := client.DialUDP(ctx, dst)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer conn.Close()
+
+	const msg = "udp echo through tailcat exit node"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatalf("Write UDP: %v", err)
+	}
+
+	replyBuf := make([]byte, len(msg))
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(replyBuf)
+	if err != nil {
+		t.Fatalf("Read UDP reply: %v", err)
+	}
+	if string(replyBuf[:n]) != msg {
+		t.Fatalf("UDP echo got %q, want %q", string(replyBuf[:n]), msg)
+	}
+
+	if !client.HasServerCap(tailcat.CapExitUDP) {
+		t.Errorf("server did not advertise CapExitUDP: caps = %02x", client.ServerCaps())
+	}
+
+	if _, err := conn.Write([]byte{}); err != nil {
+		t.Fatalf("Write zero-length UDP: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	zeroReply := make([]byte, 100)
+	nZero, err := conn.Read(zeroReply)
+	if err != nil {
+		t.Fatalf("Read zero-length UDP reply: %v", err)
+	}
+	if nZero != 0 {
+		t.Fatalf("expected zero-length reply, got %d bytes", nZero)
+	}
+}
+
+func TestAllowProxyRejection(t *testing.T) {
+	e := newTestEnv(t)
+
+	var tcpForwardInvoked atomic.Bool
+	var udpForwardInvoked atomic.Bool
+
+	echoPort := startEchoListener(t)
+	allowedDst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), echoPort)
+	prohibitedDst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 80)
+
+	srv := &tailcat.Server{
+		DERPMapURL: e.derpMapURL,
+		AllowProxy: func(dst netip.AddrPort) bool {
+			return dst == allowedDst
+		},
+		OnTCPForward: func(dst netip.AddrPort) func(net.Conn) {
+			tcpForwardInvoked.Store(true)
+			return func(c net.Conn) { c.Close() }
+		},
+		OnUDPForward: func(dst netip.AddrPort) func(nettype.ConnPacketConn) {
+			udpForwardInvoked.Store(true)
+			return func(c nettype.ConnPacketConn) { c.Close() }
+		},
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("srv.Start: %v", err)
+	}
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	client := tailcat.NewClient(srv.TailcatAddr())
+	client.DERPMapURL = e.derpMapURL
+	defer client.Close()
+
+	tcpConn, err := client.DialTCP(ctx, prohibitedDst)
+	if err == nil {
+		buf := make([]byte, 10)
+		_ = tcpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, _ = tcpConn.Read(buf)
+		tcpConn.Close()
+	}
+	if tcpForwardInvoked.Load() {
+		t.Errorf("OnTCPForward was invoked for prohibited destination %v", prohibitedDst)
+	}
+
+	udpConn, err := client.DialUDP(ctx, prohibitedDst)
+	if err == nil {
+		_, _ = udpConn.Write([]byte("prohibited-udp-packet"))
+		_ = udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 100)
+		_, _ = udpConn.Read(buf)
+		udpConn.Close()
+	}
+	if udpForwardInvoked.Load() {
+		t.Errorf("OnUDPForward was invoked for prohibited destination %v", prohibitedDst)
+	}
 }
