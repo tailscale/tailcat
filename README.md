@@ -69,7 +69,14 @@ Or build from source with a Go toolchain:
 $ go install github.com/tailscale/tailcat/cmd/tailcat@latest
 ```
 
-Or with Nix flakes, run it directly or install it:
+Or with Nix, from [nixpkgs](https://search.nixos.org/packages?channel=unstable&query=tailcat):
+
+```sh
+$ nix profile install nixpkgs#tailcat
+$ nix-env -iA nixpkgs.tailcat  # or with classic nix-env
+```
+
+Or with Nix flakes from this repo, run it directly or install it:
 
 ```sh
 $ nix run github:tailscale/tailcat
