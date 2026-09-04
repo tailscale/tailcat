@@ -126,7 +126,7 @@ func newRootCommand() *ff.Command {
 	genkeyList = genkeyFS.BoolLong("list", "list saved key names and exit")
 	genkeyRegion = genkeyFS.StringLong("region", "auto", "region ID, code, or substring to use. Or a hostname(s) comma-separated to use a custom DERP server(s). If 'auto', one is picked based on latency at each server startup. If 'list', list all regions.")
 	genkeyFixedRegion = genkeyFS.BoolLong("fixed-region", "discover the nearest DERP region once, now, and bake it into the key and tailcat address, so future server startups (and clients) use it without re-probing")
-	genkeyEmbedDERPMap = genkeyFS.BoolLong("embed-derp-map", "embed the DERP map nodes in the tailcat address")
+	genkeyEmbedDERPMap = genkeyFS.BoolLong("embed-derp-map", "embed the DERP map nodes in the tailcat address. Needs a region chosen now, so it implies --fixed-region unless --region names one")
 	genkeyPSK = genkeyFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the generated server key and tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	return &ff.Command{
@@ -1712,6 +1712,21 @@ func genKey(args []string) error {
 		// The empty region means "pick the best region now", below.
 		*region = ""
 	}
+	if *embedDERPMap {
+		// Embedding bakes one region's DERP nodes into the address,
+		// so there has to be a specific region to bake in.
+		switch {
+		case isSet("region") && *region == "auto":
+			return usagef("genkey --embed-derp-map and --region=auto are mutually exclusive; embedding needs a region chosen now, so use --fixed-region or name a region with --region")
+		case strings.Contains(*region, "."):
+			return usagef("genkey --embed-derp-map does not take DERP hostnames in --region; naming hosts already embeds them in the address")
+		case !isSet("region"):
+			// --region defaults to "auto", which has no nodes to
+			// embed, so discover the nearest region now the way
+			// --fixed-region does.
+			*region = ""
+		}
+	}
 	if !keyIsPath(*key) {
 		*key = keyPath(*key)
 		if err := os.MkdirAll(filepath.Dir(*key), 0700); err != nil {
@@ -1803,6 +1818,9 @@ func genKey(args []string) error {
 	}
 	if *embedDERPMap {
 		reg := dm.Regions[ci.RegionID]
+		if reg == nil {
+			log.Fatalf("no DERP region %d in the DERP map; can't embed its nodes", ci.RegionID)
+		}
 		reg.Nodes = reg.Nodes[:min(2, len(reg.Nodes))]
 		for _, n := range reg.Nodes {
 			n.IPv6 = ""

@@ -474,3 +474,109 @@ func TestUnknownArgSelectsRoot(t *testing.T) {
 		t.Errorf("selected command = %q; want root", sel.Name)
 	}
 }
+
+// TestGenkeyEmbedDERPMapRejectsRegionlessModes verifies that
+// --embed-derp-map rejects the --region forms that name no region in
+// the fetched DERP map, rather than dereferencing the missing region
+// and panicking (issue #90).
+func TestGenkeyEmbedDERPMapRejectsRegionlessModes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string // expected substring of the error
+	}{
+		{
+			name: "explicit auto",
+			args: []string{"genkey", "--key=k", "--embed-derp-map", "--region=auto"},
+			want: "mutually exclusive",
+		},
+		{
+			name: "custom DERP hostname",
+			args: []string{"genkey", "--key=k", "--embed-derp-map", "--region=derp1.example.com"},
+			want: "does not take DERP hostnames",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root, err := parseCLI(t, tt.args...)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tt.args, err)
+			}
+			err = root.Run(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("run %q: err = %v; want one containing %q", tt.args, err, tt.want)
+			}
+			var ue usageError
+			if !errors.As(err, &ue) {
+				t.Errorf("run %q: err is not a usageError", tt.args)
+			}
+		})
+	}
+}
+
+// TestGenkeyEmbedDERPMap verifies that --embed-derp-map bakes the
+// region's nodes into the address instead of panicking when --region
+// is left at its "auto" default (issue #90).
+func TestGenkeyEmbedDERPMap(t *testing.T) {
+	e := newTestEnv(t)
+	for _, tt := range []struct {
+		name  string
+		extra []string
+	}{
+		{name: "default region"},
+		{name: "explicit region", extra: []string{"--region=1"}},
+		{name: "fixed region", extra: []string{"--fixed-region"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			keyFile := filepath.Join(t.TempDir(), "server.private.json")
+			args := append([]string{
+				"genkey",
+				"--key=" + keyFile,
+				"--derpmap-url=" + e.derpMapURL,
+				"--embed-derp-map",
+			}, tt.extra...)
+			out, err := e.cmd(args...).Output()
+			if err != nil {
+				t.Fatalf("genkey %q: %v", tt.extra, err)
+			}
+			ci, err := tailcat.ParseAddr(tailcat.Addr(strings.TrimSpace(string(out))))
+			if err != nil {
+				t.Fatalf("ParseAddr: %v", err)
+			}
+			if len(ci.Region) == 0 {
+				t.Fatal("address embeds no DERP region")
+			}
+			if len(ci.Region[0].Nodes) == 0 {
+				t.Error("embedded DERP region has no nodes")
+			}
+			// The embedded region replaces the region ID, so
+			// servers and clients need no DERP map to find it.
+			if ci.RegionID != 0 {
+				t.Errorf("RegionID = %d; want 0 for an embedded region", ci.RegionID)
+			}
+		})
+	}
+}
+
+// TestGenkeyEmbedDERPMapUnknownRegion verifies that naming a region
+// absent from the DERP map fails with a diagnostic rather than a nil
+// map lookup panic (issue #90).
+func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
+	e := newTestEnv(t)
+	keyFile := filepath.Join(t.TempDir(), "server.private.json")
+	out, err := e.cmd(
+		"genkey",
+		"--key="+keyFile,
+		"--derpmap-url="+e.derpMapURL,
+		"--embed-derp-map",
+		"--region=99999",
+	).CombinedOutput()
+	if err == nil {
+		t.Fatalf("genkey --region=99999 succeeded; want an error\n%s", out)
+	}
+	if bytes.Contains(out, []byte("panic:")) {
+		t.Errorf("genkey panicked:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("no DERP region 99999")) {
+		t.Errorf("output = %q; want it to name the missing region", out)
+	}
+}
