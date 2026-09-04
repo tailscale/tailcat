@@ -11,7 +11,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      # nix-quick-install-action installs a daemonless Nix whose
+      # store cache-nix-action can save and restore.
+      - uses: nixbuild/nix-quick-install-action@9f63be77f412a248c9d9a65a4c82cf066cdf8f0c # v35
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+      # Cache the Nix store so the Go 1.27.1 toolchain that flake.nix
+      # builds from source is reused across runs instead of rebuilt
+      # every time. The key includes go.sum so the vendored Go module
+      # derivation is cached too; the restore prefix lets a run with a
+      # changed key still reuse the toolchain from an older cache.
+      - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'go.sum') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 4G
       # This catches flake breakage that only Nix users would
       # otherwise see, such as go.mod requiring a newer Go than the
       # pinned nixpkgs ships.
