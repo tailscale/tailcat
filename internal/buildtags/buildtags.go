@@ -58,8 +58,10 @@ var wasmKeep = []featuretags.FeatureTag{
 // go through an HTTP proxy (HTTPS_PROXY, which tailcat's import of
 // tailscale.com/feature/useproxy enables) or a SOCKS5 ALL_PROXY, the
 // only way out of some sandboxes, such as ChatGPT Work's
-// (tailscale/tailscale#22412). Note that featuretags.Requires pulls in
-// ssh's c2n and dbus dependencies too.
+// (tailscale/tailscale#22412). They also keep qrcodes, for the
+// serve subcommand's --qr flag, which prints the server's tailcat
+// address as a terminal QR code. Note that featuretags.Requires pulls
+// in ssh's c2n and dbus dependencies too.
 var releaseKeep = []featuretags.FeatureTag{
 	"netstack",
 	"ssh",
@@ -68,6 +70,7 @@ var releaseKeep = []featuretags.FeatureTag{
 	"androidbin",
 	"nattraversal",
 	"useproxy",
+	"qrcodes",
 }
 
 // WasmTags returns the comma-joined -tags value for the wasm build,

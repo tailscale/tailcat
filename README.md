@@ -124,6 +124,19 @@ $ tailcat serve 5555:10.2.200.213:5555
 
 Then on the client, `tailcat forward tcXXXXXXXXX 5555` followed by `adb connect 127.0.0.1:5555`. Write IPv6 targets in brackets: `5555:[fd7a::1]:5555`.
 
+### Show the address as a QR code
+
+Pass `--qr` to `serve` to also print the tailcat address as a QR code,
+for copying it off a screen you can't paste from, such as a remote
+console. Scanning it with a phone camera gets you the address as text
+to copy; nothing opens automatically.
+
+```sh
+$ tailcat serve --qr 8080
+# 🐈 Server listening with new address: tcXXXXXXXXX
+[QR code]
+```
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:
