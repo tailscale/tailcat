@@ -352,10 +352,15 @@ type locoBackend struct {
 	// peer map lookup. Set before createEngine.
 	onDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool
 
+	// onPeer is [Server.OnPeer], called with each client key the
+	// first time it completes the handshake. Set before createEngine.
+	onPeer func(k key.NodePublic, allowed bool)
+
 	mu             sync.Mutex
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
 	nm             *netmap.NetworkMap
 	allowedClients map[key.NodePublic]bool // or nil map for all
+	reportedPeers  map[key.NodePublic]bool // refused client keys already passed to onPeer
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
 	closeOnce      sync.Once
 }
@@ -490,6 +495,22 @@ type Server struct {
 	// It must be set before calling Start.
 	OnUDPForward func(netip.AddrPort) (handler func(ConnPacketConn))
 
+	// OnPeer, if non-nil, is called the first time a client key
+	// completes the tunnel handshake, with allowed reporting whether
+	// AllowedClients admitted it. A key already reported is not
+	// reported again: clients resend the handshake until it is
+	// acknowledged, and a refused one never is, so reporting every
+	// handshake would repeat a refused key for as long as it retries.
+	// Because a refused key is unauthenticated, only a bounded number
+	// of distinct ones are reported.
+	//
+	// It is called from the packet receive path with no lock held,
+	// before the handshake is acknowledged, so a slow callback delays
+	// the client.
+	//
+	// It must be set before calling Start.
+	OnPeer func(k key.NodePublic, allowed bool)
+
 	// ServedTCPPorts, if non-nil, restricts which TCP ports on the
 	// server's own address the packet filter admits new inbound
 	// connections to. If nil, connections to all ports reach OnTCP,
@@ -586,6 +607,7 @@ func (s *Server) Start() error {
 	for _, k := range s.AllowedClients {
 		mak.Set(&lb.allowedClients, k, true)
 	}
+	lb.onPeer = s.OnPeer
 
 	sys := &lb.sys
 	bus := eventbus.New()
@@ -896,6 +918,42 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 	s.lb.mu.Lock()
 	defer s.lb.mu.Unlock()
 	mak.Set(&s.lb.allowedClients, k, true)
+}
+
+// PeerKeyForConn returns the node public key of the peer at the other
+// end of c, a connection or UDP flow handed to an [Server.OnTCP],
+// [Server.OnTCPForward], [Server.OnUDP], or [Server.OnUDPForward]
+// handler. The tunnel has already authenticated the peer by this key,
+// and AllowedClients, if set, gated on it.
+//
+// It reports ok=false if c's remote address is not a known peer's
+// tailcat address, which includes any connection not originating from
+// the tunnel.
+func (s *Server) PeerKeyForConn(c net.Conn) (_ key.NodePublic, ok bool) {
+	return s.peerKeyForAddr(c.RemoteAddr())
+}
+
+// peerKeyForAddr reverses a peer's tailcat address, as reported by an
+// incoming connection's RemoteAddr, back to the node key it was
+// derived from.
+func (s *Server) peerKeyForAddr(a net.Addr) (_ key.NodePublic, ok bool) {
+	if s.lb == nil {
+		return key.NodePublic{}, false // not yet started
+	}
+	var ip netip.Addr
+	switch a := a.(type) {
+	case *net.TCPAddr:
+		ip = a.AddrPort().Addr()
+	case *net.UDPAddr:
+		ip = a.AddrPort().Addr()
+	default:
+		ap, err := netip.ParseAddrPort(a.String())
+		if err != nil {
+			return key.NodePublic{}, false
+		}
+		ip = ap.Addr()
+	}
+	return s.lb.peerByIP(ip.Unmap())
 }
 
 // TailcatAddr returns the tailcat address that clients use to connect to this
@@ -1582,16 +1640,56 @@ func (lb *locoBackend) Start() error {
 // whether the client is allowed and configured, meaning a "meowed"
 // acknowledgment may be sent.
 func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
+	allowed, isNew := b.addMeowPeer(src, discoPub)
+	if b.onPeer != nil {
+		// Allowed clients are deduplicated by the peer set they join;
+		// refused ones join nothing, so they need their own set.
+		report := isNew
+		if !allowed {
+			report = b.markRefusalReported(src)
+		}
+		// Report outside addMeowPeer's lock: the callback is supplied
+		// by the caller and may call back into the server.
+		if report {
+			b.onPeer(src, allowed)
+		}
+	}
+	return allowed
+}
+
+// maxReportedRefusals bounds the set of refused keys onPeer has been
+// told about. A refused handshake is unauthenticated, so anyone who
+// knows the server's address could otherwise grow the set without
+// limit by meowing under invented keys. Past the cap, further refused
+// keys go unreported rather than unbounded.
+const maxReportedRefusals = 1024
+
+// markRefusalReported records that src was refused and handed to
+// onPeer, reporting whether this call was the first to do so.
+func (b *locoBackend) markRefusalReported(src key.NodePublic) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reportedPeers[src] || len(b.reportedPeers) >= maxReportedRefusals {
+		return false
+	}
+	mak.Set(&b.reportedPeers, src, true)
+	return true
+}
+
+// addMeowPeer adds the client with node key src and disco key
+// discoPub as a WireGuard peer. It reports whether the client is
+// allowed and configured, and whether this call is what added it.
+func (b *locoBackend) addMeowPeer(src key.NodePublic, discoPub key.DiscoPublic) (allowed, isNew bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("got meow from %v", src.String())
 	if b.allowedClients != nil && !b.allowedClients[src] {
 		b.logf("ignoring meow from %v: not in allowedClients", src.String())
-		return false
+		return false, false
 	}
 
 	if _, ok := b.clients[src]; ok {
-		return true
+		return true, false
 	}
 	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
 	derpRegion := b.derpRegionID()
@@ -1640,13 +1738,15 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	// Tell the new client our UDP endpoints so both sides can attempt
 	// a direct path. Async because advertiseEndpoints takes b.mu.
 	go b.advertiseEndpoints()
-	return true
+	return true, true
 }
 
 func (b *locoBackend) Status() *ipnstate.Status {
 	mc := b.sys.MagicSock.Get()
 	eng := b.sys.Engine.Get()
-	var sb ipnstate.StatusBuilder
+	// magicsock and the engine only fill in Status.Peer, which carries
+	// each peer's relay and direct endpoint, when peers are asked for.
+	sb := ipnstate.StatusBuilder{WantPeers: true}
 	mc.UpdateStatus(&sb)
 	eng.UpdateStatus(&sb)
 	return sb.Status()
