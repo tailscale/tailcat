@@ -47,4 +47,4 @@
         };
       });
 }
-# nix-direnv cache busting line: sha256-5fgAH39U6wp2SYhBm/OMMr8hDOO3gSRacXYL3aMx77E=
+# nix-direnv cache busting line: sha256-KBk5C52OoLe6sWisAuYaoYZF4mPuddEBqSOLaMegL4E=
