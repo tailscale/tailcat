@@ -136,15 +136,11 @@ func (s *Server) sessionHandler(sess ssh.Session) {
 
 // peerKeyForSession returns the node public key of the peer on the
 // other end of sess. The session's remote address is the peer's
-// tailcat IP (derived from its key by tcAddrForKey); peerByIP reverses
-// that back to the key the tunnel authenticated. It returns ok=false
-// if the address can't be mapped to a known peer.
+// tailcat IP, which peerKeyForAddr reverses back to the key the
+// tunnel authenticated. It returns ok=false if the address can't be
+// mapped to a known peer.
 func (s *Server) peerKeyForSession(sess ssh.Session) (key.NodePublic, bool) {
-	ta, ok := sess.RemoteAddr().(*net.TCPAddr)
-	if !ok {
-		return key.NodePublic{}, false
-	}
-	return s.lb.peerByIP(ta.AddrPort().Addr().Unmap())
+	return s.peerKeyForAddr(sess.RemoteAddr())
 }
 
 // runWithPipes runs cmd with stdin/stdout/stderr pipes (no PTY).

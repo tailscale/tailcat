@@ -56,6 +56,7 @@ var (
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
+	flagLogConnections    *bool
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
@@ -103,6 +104,7 @@ func newRootCommand() *ff.Command {
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
+	flagLogConnections = serveFS.BoolLong("log-connections", "log an access record to stderr for each client that connects and each connection it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -474,6 +476,21 @@ recursive write-only drop box:
 Serve with a saved key (see genkey) and restrict clients:
 
 	tailcat serve --key=default --allow=nodekey:... 22
+
+Keep an access log of who connects and what they reach:
+
+	tailcat serve --log-connections 22,80
+
+which writes lines like these to stderr, independent of --verbose:
+
+	[peer] allowed key=nodekey:abc...
+	[conn] open peer=nodekey:abc... port=22 service=forward via=derp:sfo
+	[conn] close peer=nodekey:abc... port=22 service=forward duration=8.104s
+
+A client is identified by its public key, the same value --allow
+matches on; its tailcat address is derived from that key and so adds
+nothing. The via field is the only place a client's real network
+address appears, and only once a direct path replaces the relay.
 
 Environment:
 
@@ -1398,6 +1415,49 @@ func server(logf logger.Logf, serveSpec string) {
 			return nil // RST
 		}
 		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+	}
+
+	if *flagLogConnections {
+		// Several services can share port 22 behind one SSH handler.
+		var sshServiceName string
+		if sshServices {
+			var names []string
+			for _, n := range []string{"ssh", "no-auth-ssh", "files"} {
+				if services.Contains(n) {
+					names = append(names, n)
+				}
+			}
+			sshServiceName = strings.Join(names, "+")
+		}
+		// serviceForPort names what OnTCP hands a connection to,
+		// mirroring the order OnTCP decides in.
+		serviceForPort := func(port uint16) string {
+			switch {
+			case port == 22 && sshHandler != nil:
+				return sshServiceName
+			case services.Contains("exit-node"):
+				return "exit-node"
+			case oneShotStdout:
+				return "stdout"
+			}
+			return "forward"
+		}
+		clog := newConnLog()
+		clog.attach(s)
+		// Wrap the dispatch callbacks, not the connections they
+		// return handlers for: a wrapped net.Conn would hide the
+		// *gonet.TCPConn that ProxyConns needs to shut a tunnel
+		// connection down without losing its FIN.
+		if next := s.OnTCP; next != nil {
+			s.OnTCP = func(port uint16) func(net.Conn) {
+				return clog.wrapTCP(fmt.Sprintf("port=%d service=%v", port, serviceForPort(port)), next(port))
+			}
+		}
+		if next := s.OnTCPForward; next != nil {
+			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
+				return clog.wrapTCP("forward="+dst.String(), next(dst))
+			}
+		}
 	}
 
 	if err := s.Start(); err != nil {
