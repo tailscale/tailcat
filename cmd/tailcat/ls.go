@@ -37,7 +37,7 @@ func lsCommand(parent *ff.FlagSet) *ff.Command {
 }
 
 const lsLongHelp = `List the files a tailcat server offers ("tailcat serve files" or a
-no-auth-ssh server), speaking SFTP directly: no ssh or sftp binary
+ssh or no-auth-ssh server), speaking SFTP directly: no ssh or sftp binary
 is involved.
 
 List the served directory, or a path under it:

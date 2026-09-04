@@ -48,6 +48,12 @@ type SSHOptions struct {
 	// Shell enables shell and exec sessions.
 	Shell bool
 
+	// AuthorizedKeys contains OpenSSH authorized_keys text. Each element may
+	// contain one or more public key lines. Clients authenticate with one of the
+	// listed keys. Authorized-key options are not supported; rejecting them
+	// avoids silently granting broader access than their author intended.
+	AuthorizedKeys []string
+
 	// Files, if non-nil, serves the SFTP subsystem rooted at
 	// Files.Dir, restricted to Files.Mode. If nil and Shell is true,
 	// SFTP is instead served with the same access the shell has: the

@@ -50,15 +50,16 @@ import (
 // The global flags, shared by all subcommands. They're set by
 // newRootCommand, which must run before any of them are dereferenced.
 var (
-	flagServe       *string
-	flagKey         *string
-	flagAllow       *string
-	flagFiles       *string
-	flagPSK         *bool
-	flagVerbose     *bool
-	flagFullAddress *bool
-	flagJSON        *bool
-	flagDERPMapURL  *string
+	flagServe             *string
+	flagKey               *string
+	flagAllow             *string
+	flagFiles             *string
+	flagSSHAuthorizedKeys *string
+	flagPSK               *bool
+	flagVerbose           *bool
+	flagFullAddress       *bool
+	flagJSON              *bool
+	flagDERPMapURL        *string
 )
 
 var serveFS *ff.FlagSet
@@ -90,7 +91,7 @@ func getLogf() logger.Logf {
 // package-level flag value pointers.
 func newRootCommand() *ff.Command {
 	rootFS := ff.NewFlagSet("tailcat")
-	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
+	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
@@ -100,6 +101,7 @@ func newRootCommand() *ff.Command {
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
+	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
@@ -292,10 +294,13 @@ Server mode, all ports:
 
 	tailcat serve all
 
-Server mode, certain ports and Tailscale SSH (auth without
-password or public key):
+Server mode, certain ports and auth-free SSH:
 
 	tailcat serve 80,no-auth-ssh
+
+Server mode, SSH requiring an authorized public key:
+
+	tailcat serve --ssh-authorized-keys=alice@github ssh
 
 Server mode, exit node (clients can reach the server's whole network):
 
@@ -413,6 +418,8 @@ to the same port on localhost. Service names are:
 
 	all          serve all ports
 	exit-node    run an exit node for all addresses
+	ssh          SSH server requiring a public key listed by
+	             --ssh-authorized-keys
 	no-auth-ssh  auth-free SSH server (the tunnel provides identity)
 	files        file server for SFTP clients like scp and sftp,
 	             rooted in the --files directory (default: the
@@ -438,6 +445,14 @@ Serve all ports:
 Serve a port and the auth-free SSH server:
 
 	tailcat serve 80,no-auth-ssh
+
+Serve SSH, trusting public keys fetched from GitHub at startup:
+
+	tailcat serve --ssh-authorized-keys=alice@github ssh
+
+Serve SSH, trusting keys from files and a literal public key:
+
+	tailcat serve --ssh-authorized-keys="$HOME/.ssh/authorized_keys,ssh-ed25519 AAAA..." ssh
 
 Run an exit node (clients can reach the server's whole network):
 
@@ -1144,6 +1159,30 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 		services.Add("files")
 	}
+	sshWithAuth := services.Contains("ssh")
+	sshWithoutAuth := services.Contains("no-auth-ssh")
+	if sshWithAuth && sshWithoutAuth {
+		log.Fatal("the 'ssh' and 'no-auth-ssh' services cannot be served together")
+	}
+	if sshWithAuth && *flagSSHAuthorizedKeys == "" {
+		log.Fatal("the 'ssh' service requires --ssh-authorized-keys")
+	}
+	if sshWithoutAuth && *flagSSHAuthorizedKeys != "" {
+		log.Fatal("--ssh-authorized-keys cannot be used with the 'no-auth-ssh' service; use 'ssh' instead")
+	}
+	if *flagSSHAuthorizedKeys != "" && !sshWithAuth {
+		log.Fatal("--ssh-authorized-keys requires the 'ssh' service")
+	}
+	var sshAuthorizedKeys []string
+	if *flagSSHAuthorizedKeys != "" {
+		if !tailCatSSHEnabled {
+			log.Fatal("--ssh-authorized-keys requires SSH support, not included in binary per build tags")
+		}
+		sshAuthorizedKeys, err = loadSSHAuthorizedKeys(context.Background(), *flagSSHAuthorizedKeys)
+		if err != nil {
+			log.Fatalf("--ssh-authorized-keys: %v", err)
+		}
+	}
 	// A server running only named services isn't the empty-port-list
 	// accept-one-connection stdout mode.
 	oneShotStdout := len(portSet) == 0 && len(services) == 0
@@ -1236,7 +1275,7 @@ func server(logf logger.Logf, serveSpec string) {
 	connStr := ci.Addr()
 
 	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
-	sshServices := services.Contains("no-auth-ssh") || services.Contains("files")
+	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
 	}
@@ -1284,7 +1323,10 @@ func server(logf logger.Logf, serveSpec string) {
 
 	var sshHandler func(net.Conn)
 	if sshServices {
-		opts := tailcat.SSHOptions{Shell: services.Contains("no-auth-ssh")}
+		opts := tailcat.SSHOptions{
+			Shell:          services.Contains("ssh") || services.Contains("no-auth-ssh"),
+			AuthorizedKeys: sshAuthorizedKeys,
+		}
 		if services.Contains("files") {
 			fsrv, modeName, err := parseFilesFlag(*flagFiles)
 			if err != nil {
@@ -1447,7 +1489,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 				ret.Add(uint16(i))
 			}
 			continue
-		case "no-auth-ssh", "files":
+		case "ssh", "no-auth-ssh", "files":
 			if !tailCatSSHEnabled {
 				return nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
 			}
@@ -1458,7 +1500,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 			continue
 		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, no-auth-ssh, files, exit-node)", r)
+			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exit-node)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {

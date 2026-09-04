@@ -197,9 +197,33 @@ $ tailcat forward --bind=0.0.0.0 tcXXXXXXXXX 18080:8080
 
 Press Ctrl-C to stop forwarding.
 
+### Public-key-authenticated SSH server
+
+Run an SSH server that accepts keys from local `authorized_keys` files,
+literal OpenSSH public key lines, or GitHub accounts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=~/.ssh/authorized_keys ssh
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Multiple sources can be comma-separated. A `user@github` source fetches
+`https://github.com/user.keys` once, before the server starts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=bradfitz@github,./contractor.pub ssh
+```
+
+Every source must exist, fetch successfully, and contain valid public key
+lines or startup fails. Authorized-key options such as `command=` and
+`from=` are rejected because the built-in server does not implement them.
+Running `tailcat serve ssh` without `--ssh-authorized-keys` also fails; use the
+explicit `no-auth-ssh` service when the tunnel identity alone is sufficient.
+
 ### Auth-free SSH server
 
-On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat serve 22` and proxy to your system SSH server)
+On Linux, macOS, and Windows, you can also explicitly run the SSH server with
+no client authentication. The encrypted tunnel provides the client identity.
 
 ```sh
 $ tailcat serve no-auth-ssh
@@ -253,8 +277,8 @@ The server confines all paths to the served directory (via Go's
 `os.Root`), so neither `..` nor symlinks escape it. The file service
 speaks SFTP, so the stock `sftp` and `scp` clients also work against
 it, given a ProxyCommand that pipes through tailcat (the same trick
-`tailcat cp` and `tailcat ssh` use). A `no-auth-ssh` server serves
-SFTP too, with the same access as the shell.
+`tailcat cp` and `tailcat ssh` use). Both `ssh` and `no-auth-ssh`
+servers serve SFTP too, with the same access as the shell.
 
 Transfers are not compressed: the SFTP protocol has no compression
 of its own, and the SSH transport here doesn't either (Go's SSH

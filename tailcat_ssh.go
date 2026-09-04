@@ -26,8 +26,10 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
+const sshInteractiveMOTD = "🐈 Connected via tailcat SSH.\r\n"
+
 // SupportsSSHServer reports whether the platform supports running the built-in
-// auth-free SSH server.
+// SSH server.
 func SupportsSSHServer() bool { return true }
 
 // HandleTailscaleSSHConn handles an incoming TCP connection as an SSH session
@@ -38,7 +40,9 @@ func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
 
 // SSHConnHandler returns a handler that serves an incoming TCP
 // connection as an SSH session with the capabilities in opts.
-// Authentication is not required — the WireGuard tunnel provides identity.
+// Authentication is controlled by opts.AuthorizedKeys. Configured public keys
+// require a client match; zero-value options rely on the WireGuard tunnel for
+// client identity.
 // The connection is served using the gliderlabs/ssh library with a single
 // ed25519 host key generated on first use under tailcat/ssh in the user's
 // config directory (os.UserConfigDir).
@@ -48,7 +52,13 @@ func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
 // Windows); otherwise an interactive login shell is started with a
 // PTY. The SFTP subsystem is served per opts.Files; see [SSHOptions].
 func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
+	publicKeyHandler, authErr := sshPublicKeyHandler(opts.AuthorizedKeys)
 	return func(c net.Conn) {
+		if authErr != nil {
+			s.lb.logf("SSH authorized keys: %v", authErr)
+			c.Close()
+			return
+		}
 		keys, err := getHostKeys()
 		if err != nil {
 			s.lb.logf("SSH host keys: %v", err)
@@ -67,11 +77,14 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 			subsystems["sftp"] = h
 		}
 		srv := &ssh.Server{
-			Handler:             handler,
-			NoClientAuthHandler: func(ctx ssh.Context) error { return nil },
-			ChannelHandlers:     map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler},
-			RequestHandlers:     map[string]ssh.RequestHandler{},
-			SubsystemHandlers:   subsystems,
+			Handler:           handler,
+			PublicKeyHandler:  publicKeyHandler,
+			ChannelHandlers:   map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler},
+			RequestHandlers:   map[string]ssh.RequestHandler{},
+			SubsystemHandlers: subsystems,
+		}
+		if publicKeyHandler == nil {
+			srv.NoClientAuthHandler = func(ctx ssh.Context) error { return nil }
 		}
 		for _, k := range keys {
 			srv.AddHostKey(k)
@@ -100,6 +113,9 @@ func sessionHandler(sess ssh.Session) {
 	}
 
 	ptyReq, winCh, isPTY := sess.Pty()
+	if isPTY && sess.RawCommand() == "" {
+		io.WriteString(sess, sshInteractiveMOTD)
+	}
 	if isPTY {
 		sess.DisablePTYEmulation()
 		runWithPTY(sess, cmd, ptyReq, winCh)

@@ -33,7 +33,7 @@ var wasmKeep = []featuretags.FeatureTag{
 
 // releaseKeep is the set of tailscale.com feature tags native builds
 // of cmd/tailcat need linked: wasmKeep plus ssh (the ssh subcommand
-// and the no-auth-ssh service are compiled out under ts_omit_ssh),
+// and the SSH services are compiled out under ts_omit_ssh),
 // gro (omitting it disables GRO/GSO in netstack on Linux, a pure
 // throughput loss), and bakedroots (embedded LetsEncrypt roots as a
 // TLS fallback, so DERP connections still verify on machines with a

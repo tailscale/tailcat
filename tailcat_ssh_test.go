@@ -8,6 +8,8 @@ package tailcat_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"net"
 	"runtime"
@@ -27,8 +29,11 @@ type testSSHEnv struct {
 	client *tailcat.Client
 }
 
-func setupSSHEnv(t *testing.T) *testSSHEnv {
+func setupSSHEnv(t *testing.T, options ...tailcat.SSHOptions) *testSSHEnv {
 	t.Helper()
+	if len(options) > 1 {
+		t.Fatal("setupSSHEnv takes at most one SSHOptions")
+	}
 
 	// Hermetic localhost DERP+STUN server.
 	derpMap := integration.RunDERPAndSTUN(t, logger.Discard, "127.0.0.1")
@@ -41,9 +46,13 @@ func setupSSHEnv(t *testing.T) *testSSHEnv {
 	srv := &tailcat.Server{Logf: logf, Region: region}
 	t.Cleanup(func() { srv.Close() })
 
+	sshHandler := srv.HandleTailscaleSSHConn
+	if len(options) == 1 {
+		sshHandler = srv.SSHConnHandler(options[0])
+	}
 	srv.OnTCP = func(port uint16) func(net.Conn) {
 		if port == 22 {
-			return srv.HandleTailscaleSSHConn
+			return sshHandler
 		}
 		return nil
 	}
@@ -62,23 +71,157 @@ func setupSSHEnv(t *testing.T) *testSSHEnv {
 // sshClient dials the server's SSH port and returns a connected gossh.Client.
 func (e *testSSHEnv) sshClient(t *testing.T) *gossh.Client {
 	t.Helper()
+	c, err := e.dialSSHClient(t, &gossh.ClientConfig{
+		User:            "test",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+func (e *testSSHEnv) dialSSHClient(t *testing.T, config *gossh.ClientConfig) (*gossh.Client, error) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	conn, err := e.client.DialTCPPort(ctx, 22)
 	if err != nil {
-		t.Fatalf("DialTCPPort(22): %v", err)
+		return nil, err
 	}
-	sshConn, chans, reqs, err := gossh.NewClientConn(conn, "server", &gossh.ClientConfig{
-		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
-	})
+	sshConn, chans, reqs, err := gossh.NewClientConn(conn, "server", config)
 	if err != nil {
 		conn.Close()
-		t.Fatalf("NewClientConn: %v", err)
+		return nil, err
 	}
-	c := gossh.NewClient(sshConn, chans, reqs)
-	t.Cleanup(func() { c.Close() })
-	return c
+	return gossh.NewClient(sshConn, chans, reqs), nil
+}
+
+func TestSSHPublicKeyAuthentication(t *testing.T) {
+	t.Parallel()
+	newSigner := func() gossh.Signer {
+		_, private, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		signer, err := gossh.NewSignerFromKey(private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signer
+	}
+	authorized := newSigner()
+	unauthorized := newSigner()
+	env := setupSSHEnv(t, tailcat.SSHOptions{
+		Shell:          true,
+		AuthorizedKeys: []string{string(gossh.MarshalAuthorizedKey(authorized.PublicKey()))},
+	})
+
+	config := func(signer gossh.Signer) *gossh.ClientConfig {
+		c := &gossh.ClientConfig{
+			User:            "test",
+			HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		}
+		if signer != nil {
+			c.Auth = []gossh.AuthMethod{gossh.PublicKeys(signer)}
+		}
+		return c
+	}
+	for _, tt := range []struct {
+		name   string
+		signer gossh.Signer
+	}{
+		{"no key", nil},
+		{"unlisted key", unauthorized},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := env.dialSSHClient(t, config(tt.signer))
+			if err == nil {
+				c.Close()
+				t.Fatal("SSH authentication succeeded; want failure")
+			}
+		})
+	}
+
+	c, err := env.dialSSHClient(t, config(authorized))
+	if err != nil {
+		t.Fatalf("authorized SSH client: %v", err)
+	}
+	defer c.Close()
+	sess, err := c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	out, err := sess.Output("echo authenticated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "authenticated" {
+		t.Errorf("output = %q; want authenticated", got)
+	}
+
+	sess, err = c.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	if err := sess.RequestPty("xterm", 24, 80, gossh.TerminalModes{gossh.ECHO: 0}); err != nil {
+		t.Fatalf("RequestPty: %v", err)
+	}
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	sess.Stdout = &stdout
+	if err := sess.Shell(); err != nil {
+		t.Fatalf("Shell: %v", err)
+	}
+	nl := "\n"
+	if runtime.GOOS == "windows" {
+		nl = "\r"
+	}
+	io.WriteString(stdin, "echo authenticated-interactive"+nl)
+	io.WriteString(stdin, "exit"+nl)
+	if err := sess.Wait(); err != nil {
+		t.Logf("Wait: %v (may be expected)", err)
+	}
+	if !strings.Contains(stdout.String(), "authenticated-interactive") {
+		t.Fatalf("authenticated interactive shell output missing marker: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "Connected via tailcat SSH.") {
+		t.Fatalf("authenticated interactive shell output missing MOTD: %q", stdout.String())
+	}
+}
+
+func TestSSHInteractiveMOTDRequiresPTY(t *testing.T) {
+	t.Parallel()
+
+	env := setupSSHEnv(t)
+	sess, err := env.sshClient(t).NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	stdin, err := sess.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	sess.Stdout = &stdout
+	if err := sess.Shell(); err != nil {
+		t.Fatalf("Shell: %v", err)
+	}
+	io.WriteString(stdin, "echo no-pty\nexit\n")
+	if err := sess.Wait(); err != nil {
+		t.Logf("Wait: %v (may be expected)", err)
+	}
+	if strings.Contains(stdout.String(), "Connected via tailcat SSH.") {
+		t.Fatalf("non-PTY shell output contains MOTD: %q", stdout.String())
+	}
 }
 
 func TestSSHSuite(t *testing.T) {

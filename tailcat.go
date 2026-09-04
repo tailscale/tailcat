@@ -16,8 +16,8 @@
 //
 // Once connected, the two sides exchange arbitrary TCP traffic over the
 // WireGuard tunnel with no Tailscale account or coordination server required.
-// Optionally, the server can run an auth-free SSH server on port 22, providing
-// remote shell access over the tunnel.
+// Optionally, the server can run an SSH server on port 22, either requiring
+// authorized public keys or relying on the tunnel for client identity.
 //
 // The name "tailcat" is a nod to the classic "netcat" tool, but with
 // Tailscale's WireGuard encryption + NAT traversal.

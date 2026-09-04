@@ -37,7 +37,7 @@ func cpCommand(parent *ff.FlagSet) *ff.Command {
 const cpLongHelp = `Remote paths are written <tc-addr>:[path], like scp's host:path.
 Paths are relative to the server's served directory ("tailcat serve
 files"), or to the remote home directory for a full SSH server
-("tailcat serve no-auth-ssh"). A DNS name with a "tailcat=" TXT
+("tailcat serve ssh" or "tailcat serve no-auth-ssh"). A DNS name with a "tailcat=" TXT
 record works in place of a tailcat address.
 
 Copy a file to a server, keeping its name, and fetch it back:

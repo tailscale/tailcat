@@ -73,7 +73,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	// Server-only flags live on the serve subcommand, not the root.
 	// (The long help prose may still mention them; only reject them
 	// as rendered flag entries.)
-	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk"} {
+	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk", "\n  --ssh-authorized-keys"} {
 		if strings.Contains(help, notWant) {
 			t.Errorf("root help lists server-only flag %q", strings.TrimSpace(notWant))
 		}
@@ -94,7 +94,7 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 		t.Fatal("no serve subcommand")
 	}
 	help := ffhelp.Command(serve).String()
-	for _, want := range []string{"--allow", "--full-address", "--key", "--psk"} {
+	for _, want := range []string{"--allow", "--full-address", "--key", "--psk", "--ssh-authorized-keys"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
 		}
@@ -186,6 +186,27 @@ func TestServeSubcommand(t *testing.T) {
 	var ue usageError
 	if !errors.As(err, &ue) {
 		t.Errorf("serve --serve=80 443: err = %v; want a usageError", err)
+	}
+}
+
+func TestServeSSHAuthorizedKeysFlag(t *testing.T) {
+	root, err := parseCLI(t, "serve", "--ssh-authorized-keys=one.pub,alice@github", "ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := *flagSSHAuthorizedKeys, "one.pub,alice@github"; got != want {
+		t.Errorf("--ssh-authorized-keys = %q; want %q", got, want)
+	}
+	args := root.GetSelected().Flags.(*ff.FlagSet).GetArgs()
+	if len(args) != 1 || args[0] != "ssh" {
+		t.Errorf("serve args = %q; want [ssh]", args)
+	}
+	_, services, err := parsePortSet("ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !services.Contains("ssh") {
+		t.Error("parsePortSet did not select the ssh service")
 	}
 }
 
