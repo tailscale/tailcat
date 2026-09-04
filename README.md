@@ -170,6 +170,21 @@ HTTP/1.1 200 OK
 ....
 ```
 
+### Show the address as a QR code
+
+Pass `--qr` to any `serve` command to also print the tailcat address as
+a scannable QR code, handy for handing the address to a phone or another
+machine without copying and pasting:
+
+```sh
+$ tailcat serve --qr 8080
+# 🐈 Server listening with new address: tcXXXXXXXXX
+[QR CODE RENDERS HERE]
+```
+
+The code encodes the same `tcXXXXXXXXX` address printed above it, so the
+scanning device gets the exact string to pass to a tailcat client.
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:

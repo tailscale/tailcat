@@ -43,6 +43,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/qrcodes"
 	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
@@ -60,6 +61,7 @@ var (
 	flagFullAddress       *bool
 	flagJSON              *bool
 	flagDERPMapURL        *string
+	flagQR                *bool
 )
 
 var serveFS *ff.FlagSet
@@ -100,6 +102,7 @@ func newRootCommand() *ff.Command {
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
+	flagQR = serveFS.BoolLong("qr", "display the tailcat address as a scannable QR code")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
@@ -470,6 +473,10 @@ recursive write-only drop box:
 	tailcat serve --files=/pub:rw files
 	tailcat serve --files=/inbox:wo files
 	tailcat serve --files=/tree-inbox:wo+ files
+
+Serve a port and also print the address as a scannable QR code:
+
+	tailcat serve --qr 8080
 
 Serve with a saved key (see genkey) and restrict clients:
 
@@ -1428,6 +1435,11 @@ func server(logf logger.Logf, serveSpec string) {
 		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with new address: %v\n", connStr)
 	} else {
 		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with saved key %q: %v\n", *flagKey, connStr)
+	}
+	if *flagQR {
+		if _, err := qrcodes.Fprintln(os.Stderr, qrcodes.FormatAuto, string(connStr)); err != nil {
+			log.Fatalf("failed to render QR code: %v", err)
+		}
 	}
 	if *flagJSON {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(connStr)})

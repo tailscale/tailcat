@@ -35,16 +35,19 @@ var wasmKeep = []featuretags.FeatureTag{
 // of cmd/tailcat need linked: wasmKeep plus ssh (the ssh subcommand
 // and the SSH services are compiled out under ts_omit_ssh),
 // gro (omitting it disables GRO/GSO in netstack on Linux, a pure
-// throughput loss), and bakedroots (embedded LetsEncrypt roots as a
+// throughput loss), bakedroots (embedded LetsEncrypt roots as a
 // TLS fallback, so DERP connections still verify on machines with a
-// missing or broken system CA store; about 4 KB). The wasm build
-// needs no roots because the browser does its own TLS. Note that
-// featuretags.Requires pulls in ssh's c2n and dbus dependencies too.
+// missing or broken system CA store; about 4 KB), and qrcodes (the
+// serve subcommand's --qr flag renders the server's tailcat address
+// as a scannable terminal QR code). The wasm build needs no roots
+// because the browser does its own TLS. Note that featuretags.Requires
+// pulls in ssh's c2n and dbus dependencies too.
 var releaseKeep = []featuretags.FeatureTag{
 	"netstack",
 	"ssh",
 	"gro",
 	"bakedroots",
+	"qrcodes",
 }
 
 // WasmTags returns the comma-joined -tags value for the wasm build,

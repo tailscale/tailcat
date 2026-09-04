@@ -45,6 +45,26 @@ func startEchoListener(t *testing.T) uint16 {
 	return uint16(ln.Addr().(*net.TCPAddr).Port)
 }
 
+// qrModuleRun matches a run of QR code module characters, which
+// qrcodes renders as either half/full block characters (the UTF-8
+// formats) or '#' (the ASCII fallback), depending on the terminal it
+// detects.
+var qrModuleRun = regexp.MustCompile(`[█▀▄#]{20,}`)
+
+func TestServeQR(t *testing.T) {
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	_, addr, serverStderr := e.startServer("serve", "--qr", strconv.Itoa(int(port)))
+
+	stderr := serverStderr.String()
+	if !strings.Contains(stderr, addr) {
+		t.Errorf("server stderr lacks the tailcat address:\n%s", stderr)
+	}
+	if !qrModuleRun.MatchString(stderr) {
+		t.Errorf("server stderr lacks a QR code:\n%s", stderr)
+	}
+}
+
 func TestServeWithoutPSK(t *testing.T) {
 	e := newTestEnv(t)
 	port := startEchoListener(t)
