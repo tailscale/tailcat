@@ -53,6 +53,7 @@ func TestParseForwardSpec(t *testing.T) {
 }
 
 func TestForwardEndToEnd(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	remotePort := startEchoListener(t)
 
@@ -113,6 +114,7 @@ func TestForwardEndToEnd(t *testing.T) {
 
 func TestForwardToExitNodeTarget(t *testing.T) {
 	skipIfNixSandbox(t) // flaked in the flake sandbox (connection reset mid-tunnel)
+	t.Parallel()
 	e := newTestEnv(t)
 	remotePort := startEchoListener(t)
 	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), remotePort)

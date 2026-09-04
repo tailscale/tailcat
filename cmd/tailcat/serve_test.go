@@ -46,6 +46,7 @@ func startEchoListener(t *testing.T) uint16 {
 }
 
 func TestServeWithoutPSK(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 	_, addr, serverStderr := e.startServer("serve", "--psk=false", strconv.Itoa(int(port)))
@@ -57,9 +58,7 @@ func TestServeWithoutPSK(t *testing.T) {
 	if !ci.PresharedKey.IsZero() {
 		t.Fatal("serve --psk=false produced an address containing a PSK")
 	}
-	if !strings.Contains(serverStderr.String(), "# ⚠️ WARNING: serving without a WireGuard PSK\n") {
-		t.Errorf("server stderr lacks PSK warning:\n%s", serverStderr.String())
-	}
+	waitForLog(t, serverStderr, "# ⚠️ WARNING: serving without a WireGuard PSK\n")
 
 	const payload = "echo without a pre-shared key"
 	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
@@ -72,6 +71,7 @@ func TestServeWithoutPSK(t *testing.T) {
 }
 
 func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 	keyFile := filepath.Join(t.TempDir(), "server.private.json")
@@ -83,7 +83,7 @@ func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
 	addrFile := filepath.Join(t.TempDir(), "addr")
 	server := e.cmd("--key="+keyFile, "--derpmap-url="+e.derpMapURL, "serve", strconv.Itoa(int(port)))
 	server.Env = append(server.Env, "TAILCAT_ADDR_FILE="+addrFile)
-	var serverStderr bytes.Buffer
+	var serverStderr lockedBuf
 	server.Stderr = &serverStderr
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
@@ -98,10 +98,7 @@ func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
 	if !ci.PresharedKey.IsZero() {
 		t.Fatal("saved PSK-free key produced an address containing a PSK")
 	}
-	wantWarning := fmt.Sprintf("# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", keyFile)
-	if !strings.Contains(serverStderr.String(), wantWarning) {
-		t.Errorf("server stderr lacks %q:\n%s", wantWarning, serverStderr.String())
-	}
+	waitForLog(t, &serverStderr, fmt.Sprintf("# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", keyFile))
 
 	const payload = "echo with saved PSK policy"
 	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), &serverStderr, payload)
@@ -120,7 +117,7 @@ func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
 // waiting out TCP retransmit backoff. On failure, the error includes
 // the client's stderr and the given server stderr (which may be nil),
 // so both sides of a wedged conversation are visible.
-func runClient(t *testing.T, client *exec.Cmd, serverStderr *bytes.Buffer, payload string) (string, error) {
+func runClient(t *testing.T, client *exec.Cmd, serverStderr *lockedBuf, payload string) (string, error) {
 	t.Helper()
 	client.Stdin = strings.NewReader(payload)
 	var stdout, stderr bytes.Buffer
@@ -156,6 +153,7 @@ func runClient(t *testing.T, client *exec.Cmd, serverStderr *bytes.Buffer, paylo
 // port to the same local port, and refuses connections to ports
 // outside the list.
 func TestServePorts(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 
@@ -178,9 +176,30 @@ func TestServePorts(t *testing.T) {
 		t.Errorf("served port echoed %q; want %q", got, payload)
 	}
 
-	got, err = runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(unservedPort)), serverStderr, payload)
-	if err == nil {
-		t.Errorf("client to unserved port %v succeeded with output %q; want connection failure", unservedPort, got)
+	// The packet filter silently drops SYNs to unserved ports (no
+	// RST; see Server.ServedTCPPorts), so instead of waiting out the
+	// client's whole dial timeout, watch the verbose server's filter
+	// log for the drop and then check the client never got the echo.
+	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(unservedPort))
+	client.Stdin = strings.NewReader(payload)
+	var clientOut bytes.Buffer
+	client.Stdout = &clientOut
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	dropRx := regexp.MustCompile(fmt.Sprintf(`Drop: TCP\{.*\]:%d\}`, unservedPort))
+	deadline := time.Now().Add(30 * time.Second)
+	for !dropRx.MatchString(serverStderr.String()) {
+		if time.Now().After(deadline) {
+			client.Process.Kill()
+			t.Fatalf("server never logged dropping the SYN to unserved port %v; server stderr:\n%s", unservedPort, serverStderr.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	client.Process.Kill()
+	client.Wait()
+	if clientOut.Len() > 0 {
+		t.Errorf("client to unserved port %v got output %q; want none", unservedPort, clientOut.String())
 	}
 }
 
@@ -189,6 +208,7 @@ func TestServePorts(t *testing.T) {
 // client given an IP:port argument and through the SOCKS5 proxy that
 // "tailcat socks" runs.
 func TestServeExitNode(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)

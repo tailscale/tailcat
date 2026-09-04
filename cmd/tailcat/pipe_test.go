@@ -23,6 +23,7 @@ import (
 // (plus TAILCAT_ADDR_FILE) to test the bottles without network
 // access, so it must not regress.
 func TestLocalDERPMode(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 
 	const derpMapURL = "none"
@@ -32,7 +33,8 @@ func TestLocalDERPMode(t *testing.T) {
 	server.Env = append(append(os.Environ(), cacheEnv(t)...),
 		"TS_DEBUG_TAILCAT_LOCAL_DERP=1",
 		"TAILCAT_ADDR_FILE="+addrFile)
-	var serverOut, serverErr bytes.Buffer
+	var serverOut bytes.Buffer
+	var serverErr lockedBuf
 	server.Stdout = &serverOut
 	server.Stderr = &serverErr
 	if err := server.Start(); err != nil {
@@ -76,6 +78,7 @@ func TestLocalDERPMode(t *testing.T) {
 // server must not exit before its FIN is delivered, which once made
 // clients hang forever).
 func TestPipeMode(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 
 	server, addrFile := e.serverCmd()
@@ -83,7 +86,7 @@ func TestPipeMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var serverErr bytes.Buffer
+	var serverErr lockedBuf
 	server.Stderr = &serverErr
 	if err := server.Start(); err != nil {
 		t.Fatal(err)

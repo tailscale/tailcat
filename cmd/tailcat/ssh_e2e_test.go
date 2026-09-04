@@ -28,6 +28,7 @@ import (
 // dir, and the client runs with StrictHostKeyChecking off and a null
 // known hosts file.
 func TestServeNoAuthSSH(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skipf("no ssh client in $PATH: %v", err)
 	}
@@ -56,6 +57,7 @@ func TestServeNoAuthSSH(t *testing.T) {
 }
 
 func TestServeSSHRequiresAuthorizedKeys(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 	out, err := exec.Command(bin, "serve", "ssh").CombinedOutput()
 	if err == nil {
@@ -67,6 +69,7 @@ func TestServeSSHRequiresAuthorizedKeys(t *testing.T) {
 }
 
 func TestServeSSHInteractive(t *testing.T) {
+	t.Parallel()
 	sshExe, err := exec.LookPath("ssh")
 	if err != nil {
 		t.Skipf("no ssh in $PATH: %v", err)

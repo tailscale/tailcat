@@ -53,6 +53,7 @@ func runSFTPBatch(t *testing.T, e *testEnv, addr, batch string) ([]byte, error) 
 // TestLS lists a read-only file server with the native ls
 // subcommand, which needs no OpenSSH binaries.
 func TestLS(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 
 	serveDir := t.TempDir()
@@ -90,6 +91,7 @@ func TestLS(t *testing.T) {
 // checks that the stock OpenSSH sftp client can fetch a file from it
 // but not write one to it.
 func TestServeFiles(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sftp"); err != nil {
 		t.Skipf("no sftp client in $PATH: %v", err)
 	}

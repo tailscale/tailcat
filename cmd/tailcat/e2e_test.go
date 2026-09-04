@@ -101,6 +101,7 @@ func buildTailcatBinary(dir string) error {
 // nixpkgs' versionCheckHook runs "tailcat --version" and depends on
 // its exit status and output.
 func TestVersionFlag(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 	out, err := exec.Command(bin, "--version").CombinedOutput()
 	if err != nil {
@@ -137,11 +138,31 @@ func cacheEnv(t *testing.T) []string {
 	}
 }
 
+// lockedBuf is a bytes.Buffer safe for concurrent use, so tests can
+// read a child process's output while the process is still writing
+// it.
+type lockedBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // waitAddr polls addrFile every 100ms for up to 30 seconds and
 // returns the trimmed tailcat address a tailcat server wrote there via
 // TAILCAT_ADDR_FILE. On timeout it fails the test, including the
 // server's stderr.
-func waitAddr(t *testing.T, addrFile string, stderr *bytes.Buffer) string {
+func waitAddr(t *testing.T, addrFile string, stderr *lockedBuf) string {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -166,6 +187,22 @@ func skipIfNixSandbox(t *testing.T) {
 	t.Helper()
 	if os.Getenv("NIX_BUILD_TOP") != "" {
 		t.Skip("skipping known-flaky test in the Nix build sandbox")
+	}
+}
+
+// waitForLog polls buf every 10ms until it contains want, failing t
+// after 30 seconds. A child process's output reaches buf through a
+// pipe copied by a goroutine, so it can trail other readiness signals
+// (like the addr file); tests must poll rather than assert on buf's
+// contents at a point in time.
+func waitForLog(t *testing.T, buf *lockedBuf, want string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !strings.Contains(buf.String(), want) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for log output %q; got:\n%s", want, buf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -228,10 +265,10 @@ func (e *testEnv) serverCmd(extraFlags ...string) (*exec.Cmd, string) {
 // arranges for it to be killed when the test ends, waits for its
 // tailcat address, and returns the running command, the addr, and the
 // server's captured stderr.
-func (e *testEnv) startServer(extraFlags ...string) (*exec.Cmd, string, *bytes.Buffer) {
+func (e *testEnv) startServer(extraFlags ...string) (*exec.Cmd, string, *lockedBuf) {
 	e.t.Helper()
 	server, addrFile := e.serverCmd(extraFlags...)
-	var stderr bytes.Buffer
+	var stderr lockedBuf
 	server.Stderr = &stderr
 	if err := server.Start(); err != nil {
 		e.t.Fatal(err)

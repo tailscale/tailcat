@@ -71,6 +71,7 @@ func TestCPRejectsInvalidAddr(t *testing.T) {
 // checks that it lands, that a second copy of another name works,
 // and that reading anything back is refused (write-only drop box).
 func TestRecvDropBox(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("scp"); err != nil {
 		t.Skipf("no scp in $PATH: %v", err)
 	}
@@ -114,6 +115,7 @@ func TestRecvDropBox(t *testing.T) {
 // TestCPRoundTrip copies a file to a read-write file server with
 // "tailcat cp" (which runs the system scp) and fetches it back.
 func TestCPRoundTrip(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("scp"); err != nil {
 		t.Skipf("no scp in $PATH: %v", err)
 	}

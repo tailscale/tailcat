@@ -13,6 +13,7 @@ import (
 
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
@@ -22,6 +23,14 @@ import (
 // nil error) if the netcheck report contained no usable region
 // latencies.
 func PickBestRegion(ctx context.Context, dm *tailcfg.DERPMap) (regionID tailcfg.DERPRegionID, err error) {
+	// Disable netns before netcheck binds its STUN sockets, not just
+	// at engine creation as createEngine does, which runs after this.
+	// tailcat has no TUN device whose routes netns would need to
+	// avoid, and netns's unprivileged fallback (SO_BINDTODEVICE to
+	// the default interface) blackholes loopback UDP, making every
+	// netcheck against a loopback DERP map burn the full 3-second
+	// STUN timeout before falling back to HTTPS probes.
+	netns.SetEnabled(false)
 	nc := &netcheck.Client{
 		NetMon:  netmon.NewStatic(),
 		Verbose: Verbose,

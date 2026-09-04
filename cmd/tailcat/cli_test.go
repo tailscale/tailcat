@@ -16,6 +16,7 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"tailscale.com/tstest"
 )
 
 func TestClassifyTailcatAddrArg(t *testing.T) {
@@ -57,6 +58,7 @@ func TestClassifyTailcatAddrArg(t *testing.T) {
 // mentions every subcommand and the global flags, the declarative
 // help dump that motivated the ff port.
 func TestHelpListsCommandTree(t *testing.T) {
+	tstest.AssertNotParallel(t) // newRootCommand rebinds global flag variables
 	help := ffhelp.Command(newRootCommand()).String()
 	for _, want := range []string{
 		"serve", "recv", "ping", "socks", "ssh", "cp", "parse", "resolve",
@@ -83,6 +85,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 // TestServeHelpListsServerFlags verifies that the server-only flags
 // moved off the root command render in the serve subcommand's help.
 func TestServeHelpListsServerFlags(t *testing.T) {
+	tstest.AssertNotParallel(t) // newRootCommand rebinds global flag variables
 	root := newRootCommand()
 	var serve *ff.Command
 	for _, sub := range root.Subcommands {
@@ -150,9 +153,12 @@ func TestParseFilesFlagWriteOnlyModes(t *testing.T) {
 }
 
 // parseCLI parses args against a fresh command tree and returns the
-// root command. It doesn't run anything.
+// root command. It doesn't run anything. The command tree parses into
+// package-level flag variables, so tests that parse must not run in
+// parallel with anything.
 func parseCLI(t *testing.T, args ...string) (root *ff.Command, err error) {
 	t.Helper()
+	tstest.AssertNotParallel(t)
 	root = newRootCommand()
 	return root, root.Parse(args)
 }
@@ -301,6 +307,7 @@ func TestHelpRequests(t *testing.T) {
 // written to stdout, so it can be piped into a pager, while
 // usage-error help stays on stderr, off a pipeline's stdout.
 func TestHelpGoesToStdout(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 	run := func(args ...string) (stdout, stderr string, err error) {
 		var outBuf, errBuf bytes.Buffer
@@ -385,6 +392,7 @@ func TestGenkeyRequiresKeyName(t *testing.T) {
 }
 
 func TestGenkeyPSK(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 	for _, tt := range []struct {
 		name    string
@@ -517,6 +525,7 @@ func TestGenkeyEmbedDERPMapRejectsRegionlessModes(t *testing.T) {
 // region's nodes into the address instead of panicking when --region
 // is left at its "auto" default (issue #90).
 func TestGenkeyEmbedDERPMap(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	for _, tt := range []struct {
 		name  string
@@ -561,6 +570,7 @@ func TestGenkeyEmbedDERPMap(t *testing.T) {
 // absent from the DERP map fails with a diagnostic rather than a nil
 // map lookup panic (issue #90).
 func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	keyFile := filepath.Join(t.TempDir(), "server.private.json")
 	out, err := e.cmd(

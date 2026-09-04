@@ -77,6 +77,7 @@ import (
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
@@ -773,7 +774,13 @@ func (s *Server) buildFilter() *filter.Filter {
 		})
 	}
 	local, _ := localNets.IPSet()
-	return filter.New(matches, nil, local, nil, nil, lb.logf)
+	// The logIPs set lets the filter log the packets it drops (the
+	// engine's tstun wrapper asks for drop logging by default), so a
+	// verbose server reports filtered connection attempts instead of
+	// silently eating them. Both endpoints of a flow must be in the
+	// set for it to be logged, so it spans the whole ULA range that
+	// tcAddrForKey assigns from, not just our own address.
+	return filter.New(matches, nil, local, tailcatULASet(), nil, lb.logf)
 }
 
 // Addr returns the server's IPv6 address derived from its public key.
@@ -1652,6 +1659,19 @@ func (b *locoBackend) Status() *ipnstate.Status {
 	return sb.Status()
 }
 
+// tailcatULASet returns the IP set of Tailscale's ULA range that
+// tcAddrForKey assigns tailcat addresses from, for use as a packet
+// filter's logIPs set.
+var tailcatULASet = sync.OnceValue(func() *netipx.IPSet {
+	var b netipx.IPSetBuilder
+	b.AddPrefix(tsaddr.TailscaleULARange())
+	s, err := b.IPSet()
+	if err != nil {
+		panic(err)
+	}
+	return s
+})
+
 func tcAddrForKey(k key.NodePublic) netip.Addr {
 	var a [16]byte
 	r := k.Raw32()
@@ -1867,7 +1887,7 @@ func (c *Client) initLocked() error {
 	localNets := new(netipx.IPSetBuilder)
 	localNets.AddPrefix(lb.addrPrefix)
 	local, _ := localNets.IPSet()
-	e.SetFilter(filter.New(nil, nil, local, nil, nil, logf))
+	e.SetFilter(filter.New(nil, nil, local, tailcatULASet(), nil, logf))
 	dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		_, ok := lb.peerByIP(ip)
 		return ok

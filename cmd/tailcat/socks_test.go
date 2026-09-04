@@ -152,6 +152,7 @@ func TestClassifySOCKSAddr(t *testing.T) {
 // test existed, socks mode ignored --key and could never reach a
 // server locked down with --allow (issue #24).
 func TestSOCKSClientKey(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 
 	clientKey := filepath.Join(t.TempDir(), "c.private.json")
