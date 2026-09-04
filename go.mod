@@ -12,6 +12,7 @@ require (
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pkg/sftp v1.13.6
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
+	github.com/tailscale/wireguard-go v0.0.0-20260904023712-e855235c55a2
 	github.com/u-root/u-root v0.14.0
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb
@@ -19,7 +20,7 @@ require (
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
 	golang.org/x/sys v0.47.0
 	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
-	tailscale.com v1.103.0-pre.0.20260903171501-92ec102673bf
+	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
 )
 
 require (
@@ -91,7 +92,6 @@ require (
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260821191448-23d18d66172c // indirect
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect

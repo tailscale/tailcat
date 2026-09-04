@@ -22,6 +22,7 @@ import (
 var wireFieldNames = map[string]string{
 	"p": "ServerPublic",
 	"k": "ServerDiscoPublic",
+	"q": "PresharedKey",
 	"r": "Region",
 	"i": "RegionID",
 	"c": "RegionCode",

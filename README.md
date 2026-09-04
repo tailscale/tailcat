@@ -341,8 +341,8 @@ A server can print the long self-contained form directly with the
 
 ## Key Management
 
-A server's tailcat address is derived from its WireGuard key, so
-the key you use determines who can reach you:
+A server's tailcat address contains its WireGuard public key and an independent
+WireGuard pre-shared key, so the saved key material determines who can reach you:
 
 * **Ephemeral keys (the default):** each server run generates a fresh key in
   memory and prints an address nobody has ever seen. When the process exits,
@@ -358,6 +358,11 @@ the key you use determines who can reach you:
 The CLI says at startup which kind it's using, so you know whether you're
 starting a fresh single-use server or re-listening on an address you may
 have shared in the past.
+
+WireGuard pre-shared keys are enabled by default and strongly recommended. For
+compatibility with tailcat clients v0.5.0 and earlier, `--psk=false` on `serve`
+or `genkey` produces shorter addresses, but removes post-quantum protection and
+protection from public DERP operators that observe the peers' public keys.
 
 ```sh
 $ tailcat genkey --key=default --region=nyc
@@ -566,12 +571,19 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 
 - The server's WireGuard public key (Curve25519, 32 bytes)
 - A separate path-discovery public key (Curve25519, 32 bytes)
+- By default, an independent WireGuard pre-shared key (256 random bits),
+  which prevents a DERP operator that observes the peers' public keys from
+  joining the tunnel and provides post-quantum protection against recorded
+  traffic
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
   2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
 
-A typical tailcat address with just an integer region ID is around 95 bytes. With
-embedded DERP node details it's longer but self-contained.
+A typical tailcat address with just an integer region ID is around 140 bytes.
+With embedded DERP node details it's longer but self-contained.
+
+The default address is a secret bearer capability because it contains the
+pre-shared key. Share it only with clients that should be able to connect.
 
 ### Network stack
 
@@ -593,15 +605,17 @@ without the control plane.
 
 ### Connection flow
 
-1. **Server starts.** It generates (or loads) a WireGuard keypair,
-   connects to a DERP relay, and prints its tailcat address to stderr.
-   It then waits for clients.
+1. **Server starts.** It generates (or loads) a WireGuard keypair and, by
+   default, a pre-shared key, connects to a DERP relay, and prints its tailcat
+   address to stderr. It then waits for clients.
 
-2. **Client parses the tailcat address** to learn the server's public key and
-   path-discovery key, plus its DERP region. It generates its own ephemeral
-   keypair and connects to the same DERP relay. The separate path-discovery
-   key can appear in cleartext direct-path disco frames without revealing the
-   WireGuard public key that acts as the unlisted connection capability.
+2. **Client parses the tailcat address** to learn the server's public key,
+   path-discovery key, optional pre-shared key, and DERP region. It generates
+   its own ephemeral keypair and connects to the same DERP relay. The separate
+   path-discovery key can appear in cleartext direct-path disco frames without
+   revealing the WireGuard public key. The pre-shared key remains the secret
+   connection capability even when a relay operator observes both peers'
+   public keys.
 
 3. **Discovery handshake.** The client sends a "**Meow**" ping message
   to the server through the
@@ -610,10 +624,10 @@ without the control plane.
    network map, reconfigures the WireGuard engine, and replies with a
    "**Meowed**" acknowledgment.
 
-4. **WireGuard tunnel.** With both sides configured as WireGuard
-   peers, the standard WireGuard handshake proceeds (routed through
-   DERP initially). Once complete, the tunnel is up and encrypted
-   traffic can flow.
+4. **WireGuard tunnel.** With both sides configured as WireGuard peers using
+   the address's pre-shared key when present, the WireGuard handshake proceeds
+   (routed through DERP initially). Once complete, the tunnel is up and
+   encrypted traffic can flow.
 
 5. **NAT traversal.** In parallel, each side advertises its UDP
    endpoints (public IP:port learned via STUN, plus local interface

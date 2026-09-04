@@ -26,6 +26,7 @@ import (
 type wireConnInfo struct {
 	ServerPublic      NodePublic    `cbor:"p" json:"ServerPublic"`
 	ServerDiscoPublic *DiscoPublic  `cbor:"k,omitempty" json:"ServerDiscoPublic,omitempty"`
+	PresharedKey      *PresharedKey `cbor:"q,omitempty" json:"PresharedKey,omitempty"`
 	Region            []*wireRegion `cbor:"r,omitempty" json:"Region,omitempty"`
 	RegionID          int64         `cbor:"i,omitempty" json:"RegionID,omitempty"`
 }

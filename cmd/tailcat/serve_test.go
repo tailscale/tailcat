@@ -11,11 +11,14 @@ import (
 	"net"
 	"net/netip"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tailscale/tailcat"
 )
 
 // startEchoListener starts a TCP echo server on a 127.0.0.1 ephemeral
@@ -40,6 +43,74 @@ func startEchoListener(t *testing.T) uint16 {
 		}
 	}()
 	return uint16(ln.Addr().(*net.TCPAddr).Port)
+}
+
+func TestServeWithoutPSK(t *testing.T) {
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	_, addr, serverStderr := e.startServer("serve", "--psk=false", strconv.Itoa(int(port)))
+
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.PresharedKey.IsZero() {
+		t.Fatal("serve --psk=false produced an address containing a PSK")
+	}
+	if !strings.Contains(serverStderr.String(), "# ⚠️ WARNING: serving without a WireGuard PSK\n") {
+		t.Errorf("server stderr lacks PSK warning:\n%s", serverStderr.String())
+	}
+
+	const payload = "echo without a pre-shared key"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to server without PSK: %v", err)
+	}
+	if got != payload {
+		t.Errorf("server echoed %q; want %q", got, payload)
+	}
+}
+
+func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	keyFile := filepath.Join(t.TempDir(), "server.private.json")
+	genkey := e.cmd("genkey", "--key="+keyFile, "--region=1", "--psk=false")
+	if out, err := genkey.CombinedOutput(); err != nil {
+		t.Fatalf("genkey: %v\n%s", err, out)
+	}
+
+	addrFile := filepath.Join(t.TempDir(), "addr")
+	server := e.cmd("--key="+keyFile, "--derpmap-url="+e.derpMapURL, "serve", strconv.Itoa(int(port)))
+	server.Env = append(server.Env, "TAILCAT_ADDR_FILE="+addrFile)
+	var serverStderr bytes.Buffer
+	server.Stderr = &serverStderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Process.Kill() })
+	addr := waitAddr(t, addrFile, &serverStderr)
+
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.PresharedKey.IsZero() {
+		t.Fatal("saved PSK-free key produced an address containing a PSK")
+	}
+	wantWarning := fmt.Sprintf("# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", keyFile)
+	if !strings.Contains(serverStderr.String(), wantWarning) {
+		t.Errorf("server stderr lacks %q:\n%s", wantWarning, serverStderr.String())
+	}
+
+	const payload = "echo with saved PSK policy"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), &serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to saved server without PSK: %v", err)
+	}
+	if got != payload {
+		t.Errorf("server echoed %q; want %q", got, payload)
+	}
 }
 
 // runClient runs an unstarted tailcat client command with payload on

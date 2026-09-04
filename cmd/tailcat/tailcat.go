@@ -54,11 +54,14 @@ var (
 	flagKey         *string
 	flagAllow       *string
 	flagFiles       *string
+	flagPSK         *bool
 	flagVerbose     *bool
 	flagFullAddress *bool
 	flagJSON        *bool
 	flagDERPMapURL  *string
 )
+
+var serveFS *ff.FlagSet
 
 // The genkey subcommand's flags, likewise set by newRootCommand.
 var (
@@ -71,6 +74,7 @@ var (
 	genkeyRegion       *string
 	genkeyFixedRegion  *bool
 	genkeyEmbedDERPMap *bool
+	genkeyPSK          *bool
 )
 
 // getLogf returns the logger implied by the --verbose flag.
@@ -92,10 +96,11 @@ func newRootCommand() *ff.Command {
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
 
-	serveFS := ff.NewFlagSet("serve").SetParent(rootFS)
+	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
+	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -120,6 +125,7 @@ func newRootCommand() *ff.Command {
 	genkeyRegion = genkeyFS.StringLong("region", "auto", "region ID, code, or substring to use. Or a hostname(s) comma-separated to use a custom DERP server(s). If 'auto', one is picked based on latency at each server startup. If 'list', list all regions.")
 	genkeyFixedRegion = genkeyFS.BoolLong("fixed-region", "discover the nearest DERP region once, now, and bake it into the key and tailcat address, so future server startups (and clients) use it without re-probing")
 	genkeyEmbedDERPMap = genkeyFS.BoolLong("embed-derp-map", "embed the DERP map nodes in the tailcat address")
+	genkeyPSK = genkeyFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the generated server key and tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	return &ff.Command{
 		Name:      "tailcat",
@@ -1151,6 +1157,11 @@ func server(logf logger.Logf, serveSpec string) {
 
 	var priv key.NodePrivate
 	var ci *tailcat.ConnInfo
+	pskFlag, ok := serveFS.GetFlag("psk")
+	if !ok {
+		panic("serve flag set has no psk flag")
+	}
+	usePSK := *flagPSK
 
 	if *flagKey == "" {
 		if _, err := os.Stat(keyPath("default")); err == nil {
@@ -1162,8 +1173,10 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 	}
 	if *flagKey == "new" {
-		priv = key.NewNode()
-		ci = &tailcat.ConnInfo{RegionID: -1} // auto-detect
+		conf := tailcat.NewPrivateKey()
+		priv = conf.Private
+		ci = &conf.Public
+		ci.RegionID = -1 // auto-detect
 	} else {
 		path := keyPath(*flagKey)
 		j, err := os.ReadFile(path)
@@ -1176,7 +1189,19 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 		priv = conf.Private
 		ci = &conf.Public
+		if ci.PresharedKey.IsZero() && !pskFlag.IsSet() {
+			// Saved keys remember whether they use a PSK, so a key made with
+			// genkey --psk=false needs no corresponding serve flag.
+			usePSK = false
+		}
+		if usePSK && ci.PresharedKey.IsZero() {
+			log.Fatalf("key file %v has no WireGuard pre-shared key", path)
+		}
 	}
+	if !usePSK {
+		ci.PresharedKey = tailcat.PresharedKey{}
+	}
+	psk := ci.PresharedKey
 	if reg == nil {
 		// A key created with custom DERP hostnames (genkey --region=<host>)
 		// has pre-populated regions with no DERP map ID to reference, so its
@@ -1191,7 +1216,7 @@ func server(logf logger.Logf, serveSpec string) {
 		clearUnnecessaryRegionFields(reg)
 		fmt.Fprintf(os.Stderr, "# Selected bootstrap relay region %v, %v\n", reg.RegionID, reg.RegionName)
 
-		ci = new(tailcat.ConnInfo)
+		ci = &tailcat.ConnInfo{PresharedKey: psk}
 		if embed {
 			ci.Region = []*tailcfg.DERPRegion{reg}
 		} else {
@@ -1202,6 +1227,7 @@ func server(logf logger.Logf, serveSpec string) {
 		// to reference, so the address must embed it.
 		ci = &tailcat.ConnInfo{
 			ServerPublic: tailcat.NodePublic{NodePublic: priv.Public()},
+			PresharedKey: psk,
 			Region:       []*tailcfg.DERPRegion{reg},
 		}
 	}
@@ -1209,7 +1235,7 @@ func server(logf logger.Logf, serveSpec string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, Logf: logf, Region: reg}
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
 	sshServices := services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
@@ -1311,6 +1337,13 @@ func server(logf logger.Logf, serveSpec string) {
 
 	if err := s.Start(); err != nil {
 		log.Fatalf("Server.Start: %v", err)
+	}
+	if psk.IsZero() {
+		if *flagKey == "new" {
+			fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: serving without a WireGuard PSK")
+		} else {
+			fmt.Fprintf(os.Stderr, "# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", *flagKey)
+		}
 	}
 	if devDERP != nil {
 		// Wait until we're connected to our own dev DERP before
@@ -1559,6 +1592,7 @@ func genKey(args []string) error {
 		region       = genkeyRegion
 		fixedRegion  = genkeyFixedRegion
 		embedDERPMap = genkeyEmbedDERPMap
+		psk          = genkeyPSK
 	)
 	// isSet reports whether the named genkey flag was set explicitly,
 	// as opposed to holding its default value.
@@ -1599,6 +1633,9 @@ func genKey(args []string) error {
 				return usagef("genkey --client does not take --%s; client keys have no DERP region", name)
 			}
 		}
+		if isSet("psk") {
+			return usagef("genkey --client does not take --psk; pre-shared keys belong to server addresses")
+		}
 		if *key == "default" {
 			return usagef("genkey --client with --key=default is probably a mistake: \"default\" is the name server mode loads automatically, and client modes load \"client-default\", so you likely want --key=client-default")
 		}
@@ -1625,6 +1662,9 @@ func genKey(args []string) error {
 	}
 
 	priv := tailcat.NewPrivateKey()
+	if !*psk {
+		priv.Public.PresharedKey = tailcat.PresharedKey{}
+	}
 
 	if *client {
 		privj, err := json.MarshalIndent(priv, "", "\t")

@@ -6,6 +6,7 @@ package tailcat
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -263,13 +265,33 @@ func TestTailcat(t *testing.T) {
 	}
 	t.Logf("server: %v", s.TailcatAddr())
 
+	// Even an explicitly allowed client that knows the server's public keys
+	// cannot establish a tunnel without the PSK from the real address.
+	badInfo, err := ParseAddr(s.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for badInfo.PresharedKey.Equal(s.lb.presharedKey) {
+		badInfo.PresharedKey = NewPresharedKey()
+	}
+	bad := &Client{Server: badInfo.Addr(), Logf: mkLogger(t, "wrong-psk-client")}
+	s.AddAllowedClient(bad.PublicKey())
+	PingForTest(t, s, bad) // the pre-WireGuard discovery handshake still works
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if conn, err := bad.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("client with wrong pre-shared key established a tunnel")
+	}
+	cancel()
+	bad.Close()
+
 	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
 	t.Cleanup(func() { c.Close() })
 
 	t.Logf("Client is %v", c.PublicKey())
 
 	WaitForDERPForTest(t, s, c)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 	if _, err := c.Ping(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Ping from disallowed client = %v; want context deadline exceeded", err)
 	}
@@ -642,6 +664,45 @@ func TestAddrSeparateDiscoKey(t *testing.T) {
 	}
 }
 
+func TestAddrPresharedKey(t *testing.T) {
+	psk := NewPresharedKey()
+	if psk.IsZero() {
+		t.Fatal("NewPresharedKey returned zero")
+	}
+	priv := NewPrivateKey()
+	priv.Public.PresharedKey = psk
+	priv.Public.RegionID = 10
+
+	got, err := ParseAddr(priv.Public.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PresharedKey.Equal(psk) {
+		t.Fatalf("pre-shared key changed in address round trip: got %x, want %x", got.PresharedKey, psk)
+	}
+
+	j, err := json.Marshal(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back PrivateKey
+	if err := json.Unmarshal(j, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Public.PresharedKey.Equal(psk) {
+		t.Fatalf("pre-shared key changed in JSON round trip: got %x, want %x", back.Public.PresharedKey, psk)
+	}
+	if !strings.Contains(string(j), `"PresharedKey":"psk:`) {
+		t.Fatalf("JSON pre-shared key is not in typed text form: %s", j)
+	}
+
+	withoutPSK := priv.Public
+	withoutPSK.PresharedKey = PresharedKey{}
+	if got, want := len(withoutPSK.Addr()), len(priv.Public.Addr()); got >= want {
+		t.Errorf("address without PSK length = %d; want less than %d", got, want)
+	}
+}
+
 func TestClientRejectsLegacyAddr(t *testing.T) {
 	legacy := (&ConnInfo{
 		ServerPublic: NodePublic{key.NewNode().Public()},
@@ -651,6 +712,26 @@ func TestClientRejectsLegacyAddr(t *testing.T) {
 	_, err := c.Ping(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "legacy tailcat address") {
 		t.Fatalf("Ping error = %v; want legacy address rejection", err)
+	}
+}
+
+func TestClientAcceptsAddrWithoutPresharedKey(t *testing.T) {
+	priv := key.NewNode()
+	addr := (&ConnInfo{
+		ServerPublic:      NodePublic{priv.Public()},
+		ServerDiscoPublic: DiscoPublicForNode(priv),
+		RegionID:          10,
+	}).Addr()
+	c := NewClient(addr)
+	c.startMu.Lock()
+	err := c.initLocked()
+	c.startMu.Unlock()
+	if err != nil {
+		t.Fatalf("initLocked: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if !c.lb.presharedKey.IsZero() {
+		t.Fatal("client configured a PSK for an address without one")
 	}
 }
 
@@ -706,6 +787,40 @@ func TestParseAddrMalformedDiscoPublicKey(t *testing.T) {
 				t.Fatal("ParseAddr unexpectedly accepted malformed disco public key")
 			}
 		})
+	}
+}
+
+func TestParseAddrMalformedPresharedKey(t *testing.T) {
+	for name, keyBytes := range map[string][]byte{
+		"short": make([]byte, presharedKeyLen-1),
+		"long":  make([]byte, presharedKeyLen+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := cbor.Marshal(map[string][]byte{
+				"p": key.NewNode().Public().AppendTo(nil),
+				"q": keyBytes,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := Addr("tc" + base64.RawURLEncoding.EncodeToString(raw))
+			if _, err := ParseAddr(addr); err == nil {
+				t.Fatal("ParseAddr unexpectedly accepted malformed pre-shared key")
+			}
+		})
+	}
+}
+
+func TestPeerConfigIncludesPresharedKey(t *testing.T) {
+	server := key.NewNode().Public()
+	psk := NewPresharedKey()
+	b := &locoBackend{serverPub: server, presharedKey: psk}
+	conf, ok := b.peerConfig(server)
+	if !ok {
+		t.Fatal("peerConfig did not find server peer")
+	}
+	if conf.PresharedKey != device.NoisePresharedKey(psk) {
+		t.Fatalf("peerConfig pre-shared key = %x, want %x", conf.PresharedKey, psk)
 	}
 }
 

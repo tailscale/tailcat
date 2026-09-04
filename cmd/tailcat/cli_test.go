@@ -5,8 +5,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -70,7 +73,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	// Server-only flags live on the serve subcommand, not the root.
 	// (The long help prose may still mention them; only reject them
 	// as rendered flag entries.)
-	for _, notWant := range []string{"\n  --allow", "\n  --full-address"} {
+	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk"} {
 		if strings.Contains(help, notWant) {
 			t.Errorf("root help lists server-only flag %q", strings.TrimSpace(notWant))
 		}
@@ -91,10 +94,38 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 		t.Fatal("no serve subcommand")
 	}
 	help := ffhelp.Command(serve).String()
-	for _, want := range []string{"--allow", "--full-address", "--key"} {
+	for _, want := range []string{"--allow", "--full-address", "--key", "--psk"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
 		}
+	}
+}
+
+func TestPSKFlagDefaults(t *testing.T) {
+	if _, err := parseCLI(t, "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if !*flagPSK {
+		t.Error("serve --psk defaulted to false; want true")
+	}
+	if _, err := parseCLI(t, "serve", "--psk=false"); err != nil {
+		t.Fatal(err)
+	}
+	if *flagPSK {
+		t.Error("serve --psk=false parsed as true")
+	}
+
+	if _, err := parseCLI(t, "genkey", "--key=k", "--region=1"); err != nil {
+		t.Fatal(err)
+	}
+	if !*genkeyPSK {
+		t.Error("genkey --psk defaulted to false; want true")
+	}
+	if _, err := parseCLI(t, "genkey", "--key=k", "--region=1", "--psk=false"); err != nil {
+		t.Fatal(err)
+	}
+	if *genkeyPSK {
+		t.Error("genkey --psk=false parsed as true")
 	}
 }
 
@@ -329,6 +360,51 @@ func TestGenkeyRequiresKeyName(t *testing.T) {
 	err = root.Run(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "--key=client-default") {
 		t.Errorf("genkey --client --key=default: err = %v; want one suggesting --key=client-default", err)
+	}
+}
+
+func TestGenkeyPSK(t *testing.T) {
+	bin := buildTailcat(t)
+	for _, tt := range []struct {
+		name    string
+		pskArg  string
+		wantPSK bool
+	}{
+		{name: "default", wantPSK: true},
+		{name: "disabled", pskArg: "--psk=false", wantPSK: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			keyFile := filepath.Join(t.TempDir(), "server.private.json")
+			args := []string{"genkey", "--key=" + keyFile, "--region=1"}
+			if tt.pskArg != "" {
+				args = append(args, tt.pskArg)
+			}
+			cmd := exec.Command(bin, args...)
+			cmd.Env = append(os.Environ(), cacheEnv(t)...)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("genkey: %v", err)
+			}
+			ci, err := tailcat.ParseAddr(tailcat.Addr(strings.TrimSpace(string(out))))
+			if err != nil {
+				t.Fatalf("ParseAddr: %v", err)
+			}
+			if got := !ci.PresharedKey.IsZero(); got != tt.wantPSK {
+				t.Errorf("address has PSK = %v; want %v", got, tt.wantPSK)
+			}
+
+			j, err := os.ReadFile(keyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var key tailcat.PrivateKey
+			if err := json.Unmarshal(j, &key); err != nil {
+				t.Fatal(err)
+			}
+			if got := !key.Public.PresharedKey.IsZero(); got != tt.wantPSK {
+				t.Errorf("saved key has PSK = %v; want %v", got, tt.wantPSK)
+			}
+		})
 	}
 }
 

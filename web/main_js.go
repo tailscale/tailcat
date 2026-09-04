@@ -77,6 +77,11 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			pk = tailcat.NewPrivateKey()
 			pk.Public.RegionID = -1 // auto-select
 		}
+		if pk.Public.PresharedKey.IsZero() {
+			// Migrate private keys saved by versions predating WireGuard PSKs.
+			// The returned privateKeyJSON persists the new address capability.
+			pk.Public.PresharedKey = tailcat.NewPresharedKey()
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -96,7 +101,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			return nil, err
 		}
 
-		srv := &tailcat.Server{Key: pk.Private, Logf: logf, Region: reg}
+		srv := &tailcat.Server{Key: pk.Private, PresharedKey: pk.Public.PresharedKey, Logf: logf, Region: reg}
 		srv.OnTCP = func(port uint16) (handler func(net.Conn)) {
 			// Like the CLI's default mode, accept a connection on
 			// any port and hand it to the page.
