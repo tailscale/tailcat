@@ -158,6 +158,17 @@ func waitAddr(t *testing.T, addrFile string, stderr *bytes.Buffer) string {
 	}
 }
 
+// skipIfNixSandbox skips tests that have been observed to flake in
+// the no-network Nix build sandbox, so that rare flakes don't block
+// nix flake and nixpkgs builds. The tests still run everywhere else,
+// including GitHub CI.
+func skipIfNixSandbox(t *testing.T) {
+	t.Helper()
+	if os.Getenv("NIX_BUILD_TOP") != "" {
+		t.Skip("skipping known-flaky test in the Nix build sandbox")
+	}
+}
+
 // testEnv is a hermetic environment for CLI end-to-end tests: a
 // localhost DERP+STUN server, an httptest server serving its DERP map
 // JSON, and environment variables pointing the binary's caches at

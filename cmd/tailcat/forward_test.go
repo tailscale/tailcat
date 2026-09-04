@@ -112,6 +112,7 @@ func TestForwardEndToEnd(t *testing.T) {
 }
 
 func TestForwardToExitNodeTarget(t *testing.T) {
+	skipIfNixSandbox(t) // flaked in the flake sandbox (connection reset mid-tunnel)
 	e := newTestEnv(t)
 	remotePort := startEchoListener(t)
 	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), remotePort)
