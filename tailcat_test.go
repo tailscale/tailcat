@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -31,12 +32,42 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"tailscale.com/envknob"
+	"tailscale.com/net/netcheck"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 )
+
+// TestMain keeps the tests hermetic: engines under test must not
+// touch the real network. The test binary links tailscale.com
+// features that the tailcat library and the released binary omit
+// (build-tags.txt strips them via ts_omit_portmapper and
+// ts_omit_captiveportal), and untagged builds of those features probe
+// the real world during every full netcheck:
+//
+//   - The portmapper sends UPnP/NAT-PMP/PCP queries to the machine's
+//     default gateway, and netcheck blocks its report on the probe
+//     finishing. Home routers can take over a second to answer, which
+//     delayed the engine's DERP connection and made every
+//     engine-starting test that much slower. IN_TS_TEST is
+//     magicsock's own knob for skipping it (netcheck's
+//     SkipExternalNetwork).
+//
+//   - Captive portal detection makes HTTP requests to detection
+//     endpoints across the machine's interfaces, and netcheck also
+//     blocks its report on it. The hook stub reports "done, no
+//     captive portal" immediately.
+func TestMain(m *testing.M) {
+	envknob.Setenv("IN_TS_TEST", "true")
+	netcheck.HookStartCaptivePortalDetection.SetForTest(func(ctx context.Context, c *netcheck.Client, dm *tailcfg.DERPMap, preferredDERP tailcfg.DERPRegionID, setCaptivePortal func(bool)) (done <-chan struct{}, stop func()) {
+		return syncs.ClosedChan(), func() {}
+	})
+	os.Exit(m.Run())
+}
 
 const testNICID = 1
 
