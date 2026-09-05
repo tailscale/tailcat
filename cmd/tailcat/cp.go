@@ -79,7 +79,7 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 	if addr == "" {
 		return usagef("no remote <tc-addr>:path argument; nothing to copy through tailcat")
 	}
-	addr, err = validatedAddr(addr)
+	addr, _, err = validatedAddr(addr)
 	if err != nil {
 		return err
 	}

@@ -11,15 +11,21 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
+	"os/user"
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/tailscale/tailcat"
+	gossh "golang.org/x/crypto/ssh"
+	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 )
 
 const tailCatSSHEnabled = true
@@ -41,6 +47,14 @@ remote command to run.
 A DNS name whose "tailcat=" TXT record holds a tailcat address works
 as the destination too.
 
+A DNS TXT record is public, so a DNS-named destination is first
+probed the way a stranger would connect: with a freshly generated
+client key and no SSH credentials. If the server lets that stranger
+log in, tailcat refuses to connect, because anyone on the internet
+who reads the TXT record could do the same. The
+--skip-dns-safety-check flag skips the probe, either to connect
+anyway or to save the probe's round trips.
+
 The -p flag is the server port to connect to (default 22), or, if
 the server is an exit node (--serve=exit-node), an ip:port on the
 server's network to reach through it; a bare IP means its port 22.`
@@ -50,6 +64,7 @@ server's network to reach through it; a bare IP means its port 22.`
 func sshCommand(parent *ff.FlagSet) *ff.Command {
 	fs := ff.NewFlagSet("ssh").SetParent(parent)
 	port := fs.StringShort('p', "22", "port number, or ip:port to reach via the server's exit node; a bare IP means port 22 on it")
+	skipDNSCheck := fs.BoolLong("skip-dns-safety-check", "don't probe a DNS-named destination for whether its server gives SSH access to strangers (anyone who reads its public TXT record); skipping also saves the probe's round trips")
 	return &ff.Command{
 		Name:      "ssh",
 		Usage:     "tailcat ssh [-p <port|ip:port>] [user@]<tc-addr> [<command> [args...]]",
@@ -57,12 +72,12 @@ func sshCommand(parent *ff.FlagSet) *ff.Command {
 		LongHelp:  sshLongHelp,
 		Flags:     fs,
 		Exec: func(ctx context.Context, args []string) error {
-			return clientSSHMode(*port, args)
+			return clientSSHMode(*port, *skipDNSCheck, args)
 		},
 	}
 }
 
-func clientSSHMode(portOrIPPort string, args []string) error {
+func clientSSHMode(portOrIPPort string, skipDNSCheck bool, args []string) error {
 	if len(args) == 0 {
 		return usagef("ssh requires a [user@]<tc-addr> destination argument")
 	}
@@ -78,9 +93,13 @@ func clientSSHMode(portOrIPPort string, args []string) error {
 		addrStr = sshUser
 		sshUser = ""
 	}
-	addrStr, err = validatedAddr(addrStr)
+	dnsName := addrStr
+	addrStr, viaDNS, err := validatedAddr(addrStr)
 	if err != nil {
 		return err
+	}
+	if viaDNS && !skipDNSCheck {
+		refuseWideOpenDNS(dnsName, addrStr, portOrIPPort, sshUser)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -131,15 +150,105 @@ func validatedSSHPort(v string) (string, error) {
 
 // validatedAddr resolves arg if it is a DNS name and verifies that the
 // result is a valid tailcat address before it is handed to ssh or scp.
-func validatedAddr(arg string) (string, error) {
-	addr := tailcat.Addr(arg)
+// viaDNS reports whether the address came from a public DNS TXT record
+// rather than being supplied directly.
+func validatedAddr(arg string) (addr string, viaDNS bool, err error) {
+	a := tailcat.Addr(arg)
 	if strings.Contains(arg, ".") {
-		addr = tailcatAddrArg(arg)
+		a = tailcatAddrArg(arg)
+		viaDNS = true
 	}
-	if _, err := tailcat.ParseAddr(addr); err != nil {
-		return "", fmt.Errorf("invalid tailcat address %q: %w", arg, err)
+	if _, err := tailcat.ParseAddr(a); err != nil {
+		return "", false, fmt.Errorf("invalid tailcat address %q: %w", arg, err)
 	}
-	return string(addr), nil
+	return string(a), viaDNS, nil
+}
+
+// refuseWideOpenDNS probes the server whose tailcat address addr came
+// from the public DNS TXT record of dnsName, and exits the process
+// with a warning if the server gives SSH access to strangers. Probe
+// failures are not fatal: a server protected by --allow ignores
+// strangers entirely, so the probe times out, and any other failure
+// recurs in the real connection that follows, with a better error.
+func refuseWideOpenDNS(dnsName, addr, portOrIPPort, sshUser string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	open, err := probeStrangerSSH(ctx, getLogf(), *flagDERPMapURL, addr, portOrIPPort, sshUser)
+	if err != nil {
+		if *flagVerbose {
+			log.Printf("stranger probe of %s did not connect: %v", dnsName, err)
+		}
+		return
+	}
+	if !open {
+		return
+	}
+	log.Fatalf(`⚠️ WARNING: refusing to connect to %s: its SSH server is wide open.
+
+The tailcat address in its DNS TXT record is public, and the server
+accepted an SSH login from a freshly generated client key offering
+no SSH credentials at all. Anyone on the internet who reads that DNS
+record can get a shell.
+
+If that's your server, stop running it now, and restart it only once
+it requires client authentication:
+
+  tailcat serve --allow=<client-nodekey> ...        (tunnel layer)
+  tailcat serve --ssh-authorized-keys=<keys> ssh    (SSH layer)
+
+Or, to connect anyway, re-run with --skip-dns-safety-check.`, dnsName)
+}
+
+// probeStrangerSSH reports whether the tailcat server at addr grants
+// SSH access to a stranger. It connects with a freshly generated node
+// key and attempts an SSH handshake as sshUser (the local username if
+// empty, matching the ssh client's default) offering no credentials,
+// only the "none" auth method, which the no-auth-ssh service accepts
+// before public key auth would even come up. It makes no command or
+// PTY request and disconnects. Open false with a nil error means the
+// server rejected the stranger's handshake.
+func probeStrangerSSH(ctx context.Context, logf logger.Logf, derpMapURL, addr, portOrIPPort, sshUser string) (open bool, err error) {
+	cl := &tailcat.Client{
+		Server:       tailcat.Addr(addr),
+		Key:          key.NewNode(),
+		Logf:         logf,
+		DERPMapURL:   derpMapURL,
+		DERPMapCache: derpMapCache{},
+	}
+	var conn net.Conn
+	if ipPort, err2 := netip.ParseAddrPort(portOrIPPort); err2 == nil {
+		conn, err = cl.DialTCP(ctx, ipPort)
+	} else {
+		port, err2 := strconv.ParseUint(portOrIPPort, 10, 16)
+		if err2 != nil {
+			return false, fmt.Errorf("invalid port %q", portOrIPPort)
+		}
+		conn, err = cl.DialTCPPort(ctx, uint16(port))
+	}
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+
+	if sshUser == "" {
+		u, err := user.Current()
+		if err != nil {
+			return false, err
+		}
+		sshUser = u.Username
+	}
+	sc, chans, reqs, err := gossh.NewClientConn(conn, addr, &gossh.ClientConfig{
+		User:            sshUser,
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+	})
+	if err != nil {
+		return false, nil
+	}
+	gossh.NewClient(sc, chans, reqs).Close()
+	return true, nil
 }
 
 // sshProxyCommand returns the command passed to OpenSSH to connect the SSH

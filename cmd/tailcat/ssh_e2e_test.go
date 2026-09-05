@@ -10,12 +10,18 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	gossh "golang.org/x/crypto/ssh"
+	"tailscale.com/types/key"
 )
 
 // TestServeNoAuthSSH runs a --serve=no-auth-ssh server and connects
@@ -53,6 +59,59 @@ func TestServeNoAuthSSH(t *testing.T) {
 	// TrimSpace: PowerShell on Windows emits "hi\r\n".
 	if got, want := strings.TrimSpace(string(out)), "hi"; got != want {
 		t.Errorf("tailcat ssh output = %q; want %q", got, want)
+	}
+}
+
+// TestProbeStrangerSSH exercises the wide-open-DNS probe against the
+// three kinds of SSH servers: a no-auth-ssh server grants a stranger
+// access via the "none" auth method, an authorized-keys server
+// rejects the credential-less stranger, and a --allow server ignores
+// the stranger's tunnel handshake entirely, so the probe times out
+// with an error. Not
+// parallel: the probe runs in-process, and t.Setenv points its DERP
+// map cache at a temp dir instead of the real user cache.
+func TestProbeStrangerSSH(t *testing.T) {
+	e := newTestEnv(t)
+	for _, kv := range cacheEnv(t) {
+		k, v, _ := strings.Cut(kv, "=")
+		t.Setenv(k, v)
+	}
+
+	probe := func(addr string, timeout time.Duration) (bool, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		return probeStrangerSSH(ctx, t.Logf, e.derpMapURL, addr, "22", "stranger")
+	}
+
+	_, addr, _ := e.startServer("--serve=no-auth-ssh")
+	if open, err := probe(addr, 30*time.Second); err != nil {
+		t.Fatalf("probe of no-auth-ssh server: %v", err)
+	} else if !open {
+		t.Errorf("probe of no-auth-ssh server = not wide open; want wide open")
+	}
+
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshPub, err := gossh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authKeys := filepath.Join(t.TempDir(), "authorized_keys")
+	if err := os.WriteFile(authKeys, gossh.MarshalAuthorizedKey(sshPub), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, addr, _ = e.startServer("serve", "--ssh-authorized-keys="+authKeys, "ssh")
+	if open, err := probe(addr, 30*time.Second); err != nil {
+		t.Fatalf("probe of authorized-keys server: %v", err)
+	} else if open {
+		t.Errorf("probe of authorized-keys server = wide open; want rejected")
+	}
+
+	_, addr, _ = e.startServer("serve", "--allow="+key.NewNode().Public().String(), "no-auth-ssh")
+	if open, err := probe(addr, 5*time.Second); err == nil {
+		t.Errorf("probe of --allow server = %v, nil; want a timeout error", open)
 	}
 }
 

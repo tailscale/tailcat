@@ -237,6 +237,14 @@ $ tailcat serve no-auth-ssh
 # 🐈 Server listening with new address: tcXXXXXXXXX
 ```
 
+> [!WARNING]
+> With `no-auth-ssh`, the address **is** the credential: anyone who
+> learns it gets a shell as the user running the server. Share it only
+> over private channels, and never publish it, in a DNS TXT record or
+> anywhere else public. If you want an SSH server reachable by DNS
+> name, it must require client authentication: `--allow` at the tunnel
+> layer, `--ssh-authorized-keys` at the SSH layer, or both.
+
 And on the client side:
 
 ```sh
@@ -425,6 +433,20 @@ $ tailcat ssh example.com
 $ tailcat ping example.com
 ```
 
+> [!WARNING]
+> A tailcat address is normally a secret: knowing it is what lets a
+> client connect. A DNS TXT record is **not** secret. It is public,
+> world-readable, and actively scanned. Publishing an address in DNS
+> hands it to everyone on the internet, so the server behind it must
+> authenticate clients by something other than knowledge of the
+> address: restrict the tunnel to known client keys with `tailcat
+> serve --allow=...`, or, for SSH, require public keys with `tailcat
+> serve --ssh-authorized-keys=... ssh`. Never publish the address of a
+> `no-auth-ssh` server (or any other server that trusts whoever
+> connects): that is a shell on your machine, published in a TXT
+> record. See [Protected SSH server over
+> DNS](#protected-ssh-server-over-dns) for the safe setup.
+
 ## Examples
 
 ### Protected SSH server over DNS
@@ -433,6 +455,14 @@ Who needs port forwarding or port knocking? This runs an SSH server
 reachable from anywhere by name, with no open inbound ports on the
 server, where WireGuard authenticates the client before the SSH
 server ever sees a packet.
+
+> [!WARNING]
+> The `--allow` flag below is not optional decoration. The DNS TXT
+> record makes the tailcat address public, so possession of the
+> address no longer proves anything: the server must authenticate
+> clients itself, here by allowing only one client node key. Without
+> `--allow` (or SSH-level `--ssh-authorized-keys`), anyone on the
+> internet who reads the TXT record can connect.
 
 On the client machine, generate a client identity keypair. It prints
 the public key, which is all the server needs to know:
@@ -471,6 +501,16 @@ Client modes automatically use the saved `client-default` key when it
 exists, so no extra flags are needed to present the allowed identity.
 Anyone else's handshake is silently ignored: they can't reach the SSH
 server, or even learn that one is running.
+
+As a safety net, `tailcat ssh` probes a DNS-named destination before
+connecting: it attempts an SSH login as a stranger would, with a
+freshly generated client key and no SSH credentials. If the server
+accepts that login, anyone who reads the TXT record could do the
+same, so tailcat refuses to connect and says why. The probe
+catches the misconfiguration the first time you test your own server;
+the `--skip-dns-safety-check` flag skips it, whether because you
+really do want a public server or just to shave off the probe's
+round trips.
 
 Why `--fixed-region`: it discovers the nearest DERP region once, at
 genkey time, and bakes its ID into both the printed tailcat address and the
@@ -646,6 +686,10 @@ With embedded DERP node details it's longer but self-contained.
 
 The default address is a secret bearer capability because it contains the
 pre-shared key. Share it only with clients that should be able to connect.
+Publishing it, in a public DNS TXT record or anywhere else, gives that
+capability to the whole internet, which is only safe when the server also
+authenticates clients: `serve --allow` restricts the tunnel to listed
+client node keys, and the `ssh` service requires `--ssh-authorized-keys`.
 
 ### Network stack
 
