@@ -752,3 +752,12 @@ Go module client of the tailscale.com repo instead of a fork of it.
 
 It was open sourced August 2026 at the
 [TailscaleUp conference](https://tailscale.com/tailscaleup).
+
+## Swift / C bindings
+
+[`libtailcat/`](./libtailcat/) exports a small C API over the Go library,
+built as static archives for macOS, iOS and the iOS simulator and packaged
+as `CTailcat.xcframework`, and [`swift/`](./swift/) wraps it as the
+`TailcatKit` Swift package (Swift 6, async/await servers, clients and
+connections) with a demo tool and tests. See their READMEs to build and
+use them.
