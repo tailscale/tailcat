@@ -1,5 +1,14 @@
 # tailcat changelog
 
+## Unreleased
+
+- `exec` service: `tailcat serve exec -- <command>` runs the command
+  for each incoming connection with the connection as its stdin and
+  stdout, like inetd. With the `ssh` or `no-auth-ssh` service, the
+  command after `--` instead replaces the shell for every session,
+  like OpenSSH's `ForceCommand`, with no shell, client-chosen command,
+  or SFTP offered.
+
 ## v0.6.0 (2026-09-04)
 
 - Application-layer UDP support: servers can serve and forward UDP

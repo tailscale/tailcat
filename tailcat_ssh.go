@@ -52,8 +52,14 @@ func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
 // sends a command, it is run by the user's shell (PowerShell on
 // Windows); otherwise an interactive login shell is started with a
 // PTY. The SFTP subsystem is served per opts.Files; see [SSHOptions].
+// With opts.Exec, every session instead runs that one command, and
+// nothing else is offered.
 func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 	publicKeyHandler, authErr := sshPublicKeyHandler(opts.AuthorizedKeys)
+	if len(opts.Exec) > 0 {
+		opts.Shell = false
+		opts.Files = nil
+	}
 	return func(c net.Conn) {
 		if authErr != nil {
 			s.lb.logf("SSH authorized keys: %v", authErr)
@@ -67,7 +73,10 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 			return
 		}
 		handler := s.sessionHandler
-		if !opts.Shell {
+		switch {
+		case len(opts.Exec) > 0:
+			handler = s.execSessionHandler(opts.Exec)
+		case !opts.Shell:
 			handler = func(sess ssh.Session) {
 				fmt.Fprintf(sess.Stderr(), "this tailcat server only offers file transfer (SFTP); shell and exec sessions are disabled\r\n")
 				sess.Exit(1)
@@ -130,6 +139,31 @@ func (s *Server) sessionHandler(sess ssh.Session) {
 		sess.DisablePTYEmulation()
 		runWithPTY(sess, cmd, ptyReq, winCh)
 	} else {
+		runWithPipes(sess, cmd)
+	}
+}
+
+// execSessionHandler returns a session handler that runs argv for
+// every session, ignoring the client's requested command (see
+// [SSHOptions.Exec]). The command gets a PTY if the client asked for
+// one, and pipes otherwise.
+func (s *Server) execSessionHandler(argv []string) ssh.Handler {
+	return func(sess ssh.Session) {
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = append(os.Environ(), s.PeerEnv(sess.LocalAddr(), sess.RemoteAddr())...)
+		for _, env := range sess.Environ() {
+			if acceptEnvPair(env) {
+				cmd.Env = append(cmd.Env, env)
+			}
+		}
+		if raw := sess.RawCommand(); raw != "" {
+			cmd.Env = append(cmd.Env, "SSH_ORIGINAL_COMMAND="+raw)
+		}
+		if ptyReq, winCh, isPTY := sess.Pty(); isPTY {
+			sess.DisablePTYEmulation()
+			runWithPTY(sess, cmd, ptyReq, winCh)
+			return
+		}
 		runWithPipes(sess, cmd)
 	}
 }

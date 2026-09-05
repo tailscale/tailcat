@@ -252,6 +252,36 @@ $ tailcat ssh tcXXXXXXXXX
 $ tailcat ssh tcXXXXXXXXX ls -la
 ```
 
+### Run a command per connection
+
+Like inetd, the `exec` service runs a command for each incoming
+connection, with the connection as the command's stdin and stdout.
+The command comes after `--`:
+
+```sh
+$ tailcat serve exec -- /usr/bin/fortune
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat tcXXXXXXXXX 80 < /dev/null
+```
+
+The command's stderr goes to the server's. It gets the peer's node
+key in `$TAILCAT_PEER_KEY` (in `--allow`'s format) and the peer's
+tailcat IP:port in `$TAILCAT_REMOTE_ADDR`.
+
+Given with the `ssh` or `no-auth-ssh` service, the command instead
+replaces the shell, like OpenSSH's `ForceCommand`: every SSH session
+runs only that command (on a PTY if the client asks for one), and the
+server offers no shell, no client-chosen command, and no SFTP. The
+client's requested command, if any, arrives in `$SSH_ORIGINAL_COMMAND`.
+
+```sh
+$ tailcat serve --ssh-authorized-keys=alice@github ssh -- ./deploy.sh
+$ tailcat serve no-auth-ssh -- git-upload-pack /srv/repo.git
+```
+
 ### Send and receive files
 
 To receive files, run a drop box and share the printed tailcat address:

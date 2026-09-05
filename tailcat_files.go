@@ -48,6 +48,17 @@ type SSHOptions struct {
 	// Shell enables shell and exec sessions.
 	Shell bool
 
+	// Exec, if non-empty, is a command (program and arguments) that
+	// every session runs instead of a shell or the client's requested
+	// command, with the session as its standard input, output, and
+	// error (through a PTY if the client requests one), like OpenSSH's
+	// ForceCommand. It excludes everything else: there is no login
+	// shell, no client-chosen command, and no SFTP subsystem, so Shell
+	// and Files are ignored. The client's requested command, if any,
+	// is passed in SSH_ORIGINAL_COMMAND, and the peer is described by
+	// the variables of [Server.PeerEnv].
+	Exec []string
+
 	// AuthorizedKeys contains OpenSSH authorized_keys text. Each element may
 	// contain one or more public key lines. Clients authenticate with one of the
 	// listed keys. Authorized-key options are not supported; rejecting them
