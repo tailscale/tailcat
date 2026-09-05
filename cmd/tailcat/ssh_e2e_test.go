@@ -40,7 +40,8 @@ func TestServeNoAuthSSH(t *testing.T) {
 	}
 	e := newTestEnv(t)
 
-	_, addr, _ := e.startServer("--serve=no-auth-ssh")
+	_, addr, stderr := e.startServer("--serve=no-auth-ssh")
+	waitForLog(t, stderr, "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow\n")
 
 	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ssh", addr, "echo", "hi")
 	done := make(chan struct{})

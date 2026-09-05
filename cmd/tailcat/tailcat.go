@@ -324,6 +324,12 @@ Anywhere a <tc-addr> argument is accepted, a DNS name whose
 
 	tailcat ssh example.com
 
+But beware: a tailcat address is normally a secret, and a DNS TXT
+record is public, so a server named in DNS must authenticate its
+clients some other way: --allow at the tunnel layer, or the ssh
+service's --ssh-authorized-keys. Never publish a no-auth-ssh server's
+address; that gives a shell to anyone who reads the TXT record.
+
 Client mode, ping. Each pong reports whether it arrived via a DERP
 relay or a direct path. --until-direct keeps pinging (bounded by
 --timeout, default 10s) until a direct path works:
@@ -1409,6 +1415,9 @@ func server(logf logger.Logf, serveSpec string) {
 		} else {
 			fmt.Fprintf(os.Stderr, "# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", *flagKey)
 		}
+	}
+	if sshWithoutAuth && *flagAllow == "" {
+		fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow")
 	}
 	if devDERP != nil {
 		// Wait until we're connected to our own dev DERP before
