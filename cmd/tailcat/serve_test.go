@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -200,6 +202,85 @@ func TestServePorts(t *testing.T) {
 	client.Wait()
 	if clientOut.Len() > 0 {
 		t.Errorf("client to unserved port %v got output %q; want none", unservedPort, clientOut.String())
+	}
+}
+
+func TestServeUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix-domain sockets are unavailable")
+	}
+	_, err := parseCLI(t, "serve", "--unix-socket=/tmp/tailcat.sock")
+	if err != nil {
+		t.Fatalf("parse --unix-socket: %v", err)
+	}
+	if got := *flagUnixSocket; got != "/tmp/tailcat.sock" {
+		t.Fatalf("--unix-socket = %q", got)
+	}
+	e := newTestEnv(t)
+	socket := filepath.Join(t.TempDir(), "backend.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	if err := os.Chmod(socket, 0600); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	_, addr, serverStderr := e.startServer("serve", "--unix-socket="+socket)
+	type client struct {
+		payload string
+		cmd     *exec.Cmd
+		stdout  bytes.Buffer
+		stderr  bytes.Buffer
+	}
+	clients := []*client{
+		{payload: "first Unix socket client"},
+		{payload: "second Unix socket client"},
+	}
+	for _, client := range clients {
+		client.cmd = e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr)
+		client.cmd.Stdin = strings.NewReader(client.payload)
+		client.cmd.Stdout = &client.stdout
+		client.cmd.Stderr = &client.stderr
+		if err := client.cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for range clients {
+		select {
+		case c := <-accepted:
+			go func() {
+				io.Copy(c, c)
+				c.Close()
+			}()
+		case <-time.After(30 * time.Second):
+			t.Fatalf("Unix socket did not receive both clients\nserver stderr:\n%s", serverStderr.String())
+		}
+	}
+	for _, client := range clients {
+		if err := client.cmd.Wait(); err != nil {
+			t.Fatalf("client: %v\nstderr:\n%s\nserver stderr:\n%s", err, client.stderr.String(), serverStderr.String())
+		}
+		if got := client.stdout.String(); got != client.payload {
+			t.Errorf("client received %q; want %q", got, client.payload)
+		}
+	}
+	if fi, err := os.Stat(socket); err != nil {
+		t.Fatal(err)
+	} else if got := fi.Mode().Perm(); got != 0600 {
+		t.Errorf("socket mode = %o; want 0600", got)
 	}
 }
 

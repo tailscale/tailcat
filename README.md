@@ -170,6 +170,24 @@ HTTP/1.1 200 OK
 ....
 ```
 
+### Expose a local Unix-domain socket
+
+To proxy every connection to a local Unix-domain stream socket, pass its
+pathname to `serve`. Tailcat does not create or change the socket, so its
+filesystem permissions remain under the local service's control. The service
+uses port 1, which is what `tailcat` dials when no destination port is given:
+
+```sh
+$ tailcat serve --unix-socket=/run/git-annex/socket
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Each client connection gets its own connection to the socket:
+
+```sh
+$ tailcat tcXXXXXXXXX
+```
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:
