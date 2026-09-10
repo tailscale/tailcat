@@ -1419,9 +1419,28 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
+	udpForwardTo := func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+		return func(c tailcat.ConnPacketConn) {
+			localConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				logf("error proxying to %v: %v", dst, err)
+				c.Close()
+				return
+			}
+			tailcat.ProxyPacketConns(c, localConn)
+		}
+	}
+
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
 			return tcpForwardTo(dst.String())
+		}
+		// Exit-node clients send UDP through the tunnel the same way they
+		// send TCP (DNS, QUIC, ...). Without this, those flows are dropped:
+		// the tunnel is up and TCP works, but every UDP flow silently goes
+		// nowhere. See OnUDPForward and ProxyPacketConns in the README.
+		s.OnUDPForward = func(dst netip.AddrPort) (handler func(tailcat.ConnPacketConn)) {
+			return udpForwardTo(dst)
 		}
 	}
 

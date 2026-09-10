@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -43,6 +44,27 @@ func startEchoListener(t *testing.T) uint16 {
 		}
 	}()
 	return uint16(ln.Addr().(*net.TCPAddr).Port)
+}
+
+// startUDPEcho starts a UDP echo server on 127.0.0.1 and returns its port.
+func startUDPEcho(t *testing.T) uint16 {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+	return uint16(pc.LocalAddr().(*net.UDPAddr).Port)
 }
 
 func TestServeWithoutPSK(t *testing.T) {
@@ -274,6 +296,50 @@ func TestServeExitNode(t *testing.T) {
 // CONNECT to the IPv4 destination dst, returning the proxied
 // connection. It hand-rolls the tiny client side of RFC 1928 rather
 // than adding a dependency on golang.org/x/net/proxy.
+
+// TestServeExitNodeUDP verifies that a --serve=exit-node server forwards
+// UDP flows to arbitrary IP:port destinations. Exit-node clients send UDP
+// through the tunnel the same way they send TCP (DNS, QUIC, ...), so a
+// server that only registers OnTCPForward leaves those flows black-holed:
+// the tunnel is up and TCP works, but UDP never comes back.
+func TestServeExitNodeUDP(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startUDPEcho(t)
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	_, addr, serverStderr := e.startServer("--verbose", "--serve=exit-node")
+
+	cl := &tailcat.Client{
+		Server:     tailcat.Addr(addr),
+		DERPMapURL: e.derpMapURL,
+		Logf:       testLogger(t, "client"),
+	}
+	t.Cleanup(func() { cl.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := cl.DialUDP(ctx, dst)
+	if err != nil {
+		t.Fatalf("DialUDP %v: %v", dst, err)
+	}
+	defer conn.Close()
+
+	const payload = "echo through the exit node over udp"
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatalf("udp write: %v", err)
+	}
+	buf := make([]byte, 64<<10)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("udp read (no reply through the exit node): %v\nserver log:\n%s", err, serverStderr.String())
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Errorf("exit node echoed %q over udp; want %q", got, payload)
+	}
+}
+
 func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn {
 	t.Helper()
 	c, err := net.Dial("tcp", proxyAddr)
