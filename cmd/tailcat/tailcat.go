@@ -54,6 +54,7 @@ var (
 	flagKey               *string
 	flagAllow             *string
 	flagFiles             *string
+	flagUnixSocket        *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
 	flagVerbose           *bool
@@ -101,6 +102,7 @@ func newRootCommand() *ff.Command {
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
+	flagUnixSocket = serveFS.StringLong("unix-socket", "", "pathname of a Unix-domain stream socket to proxy connections to. It is served on port 1, the default port used by a tailcat client without a destination.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
@@ -1288,7 +1290,8 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	// A server running only named services isn't the empty-port-list
 	// accept-one-connection stdout mode.
-	oneShotStdout := len(portSet) == 0 && len(services) == 0
+	unixSocket := *flagUnixSocket
+	oneShotStdout := len(portSet) == 0 && len(services) == 0 && unixSocket == ""
 
 	var reg *tailcfg.DERPRegion
 	var devDERP *derpserver.Server
@@ -1388,6 +1391,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	// OnTCP gate.
 	if !oneShotStdout && !services.Contains("exit-node") && !services.Contains("exec") {
 		ports := slices.Sorted(maps.Keys(portSet))
+		if unixSocket != "" && !portSet.Contains(1) {
+			ports = append([]uint16{1}, ports...)
+		}
 		if sshServices && !portSet.Contains(22) {
 			ports = append([]uint16{22}, ports...)
 		}
@@ -1407,11 +1413,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
-	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
+	forwardTo := func(network, address string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := net.Dial("tcp", ipPortStr)
+			localConn, err := net.Dial(network, address)
 			if err != nil {
-				logf("error proxying to %v: %v", ipPortStr, err)
+				logf("error proxying to %v: %v", address, err)
 				c.Close()
 				return
 			}
@@ -1421,7 +1427,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
-			return tcpForwardTo(dst.String())
+			return forwardTo("tcp", dst.String())
 		}
 	}
 
@@ -1456,8 +1462,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if port == 22 && sshHandler != nil {
 			return sshHandler
 		}
+		if port == 1 && unixSocket != "" {
+			return forwardTo("unix", unixSocket)
+		}
 		if portSet.Contains(port) {
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return forwardTo("tcp", fmt.Sprintf("localhost:%v", port))
 		}
 		if execHandler != nil {
 			return execHandler
@@ -1465,7 +1474,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return forwardTo("tcp", fmt.Sprintf("localhost:%v", port))
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1494,7 +1503,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if !portSet.Contains(port) {
 			return nil // RST
 		}
-		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+		return forwardTo("tcp", fmt.Sprintf("localhost:%v", port))
 	}
 
 	if err := s.Start(); err != nil {
