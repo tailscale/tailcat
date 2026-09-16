@@ -15,6 +15,11 @@
   there, like a default `go build` does.
   ([#108](https://github.com/tailscale/tailcat/issues/108), reported
   by [@Sammy-T](https://github.com/Sammy-T))
+- Go library: `Server.Status()` now includes a `Peer` entry per
+  connected client, with `CurAddr` and `Relay` to tell a direct path
+  from a DERP-relayed one.
+  ([#116](https://github.com/tailscale/tailcat/issues/116), reported
+  by [@Mo3he](https://github.com/Mo3he))
 - Go library: the new `Server.Listen(ctx, network, address)` serves
   TCP and UDP ports in the standard `net.Listener` shape, as an
   alternative to the `OnTCP` and `OnUDP` hooks; for UDP, each Accept

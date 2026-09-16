@@ -353,6 +353,48 @@ func TestTailcat(t *testing.T) {
 
 }
 
+// TestStatusReportsPeers checks that Server.Status reports connected clients.
+func TestStatusReportsPeers(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	s.AddAllowedClient(c.PublicKey())
+
+	// A successful ping means the server has fully added us as a peer.
+	PingForTest(t, s, c)
+
+	st := s.Status()
+	ps, ok := st.Peer[c.PublicKey()]
+	if !ok {
+		t.Fatalf("Status().Peer has no entry for client %v; got %d peer(s)", c.PublicKey(), len(st.Peer))
+	}
+	// The path may still be settling, so wait for CurAddr or Relay to show up.
+	deadline := time.Now().Add(10 * time.Second)
+	for ps.CurAddr == "" && ps.Relay == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("peer status has neither CurAddr nor Relay: %v", logger.AsJSON(ps))
+		}
+		time.Sleep(10 * time.Millisecond)
+		if ps, ok = s.Status().Peer[c.PublicKey()]; !ok {
+			t.Fatalf("client %v disappeared from Status().Peer", c.PublicKey())
+		}
+	}
+	t.Logf("peer %v: CurAddr=%q Relay=%q", c.PublicKey(), ps.CurAddr, ps.Relay)
+}
+
 func TestUDP(t *testing.T) {
 	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
 	reg := dm.Regions[1]

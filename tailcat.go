@@ -1732,7 +1732,8 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 func (b *locoBackend) Status() *ipnstate.Status {
 	mc := b.sys.MagicSock.Get()
 	eng := b.sys.Engine.Get()
-	var sb ipnstate.StatusBuilder
+	// Without WantPeers, magicsock and wgengine skip their peer loops and Peer is empty.
+	sb := ipnstate.StatusBuilder{WantPeers: true}
 	mc.UpdateStatus(&sb)
 	eng.UpdateStatus(&sb)
 	return sb.Status()
@@ -2493,7 +2494,8 @@ func (c *idlePacketConn) Close() error {
 	return c.ConnPacketConn.Close()
 }
 
-// Status returns the current WireGuard and DERP connection status.
+// Status returns the current WireGuard and DERP connection status. Each connected
+// client has a Peer entry; its CurAddr and Relay show a direct or DERP-relayed path.
 func (s *Server) Status() *ipnstate.Status {
 	return s.lb.Status()
 }
