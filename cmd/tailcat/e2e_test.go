@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -54,19 +53,7 @@ func buildTailcat(t *testing.T) string {
 	if dir == builtBinDir {
 		return builtBin.Path
 	}
-	// Hold ForkLock for reading across CopyTo so that no concurrently
-	// forked child of a parallel test inherits CopyTo's transient
-	// write FD on the new copy. A forked child holds inherited FDs
-	// (even O_CLOEXEC ones) until its exec, and execve fails with
-	// ETXTBSY while any process holds a write FD on the binary; see
-	// golang.org/issue/22315. CopyTo opens a write FD whenever it
-	// actually copies: always on non-Linux Unix, and on Linux once
-	// the building test's TempDir has been cleaned up, because its
-	// hardlink fast path cannot link an inode with no remaining
-	// links, even via the still-open read FD.
-	syscall.ForkLock.RLock()
 	bi, err := builtBin.CopyTo(dir)
-	syscall.ForkLock.RUnlock()
 	if err != nil {
 		t.Fatal(err)
 	}

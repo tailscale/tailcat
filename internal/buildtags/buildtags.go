@@ -38,16 +38,22 @@ var wasmKeep = []featuretags.FeatureTag{
 // of cmd/tailcat need linked: wasmKeep plus ssh (the ssh subcommand
 // and the SSH services are compiled out under ts_omit_ssh),
 // gro (omitting it disables GRO/GSO in netstack on Linux, a pure
-// throughput loss), and bakedroots (embedded LetsEncrypt roots as a
+// throughput loss), bakedroots (embedded LetsEncrypt roots as a
 // TLS fallback, so DERP connections still verify on machines with a
-// missing or broken system CA store; about 4 KB). The wasm build
-// needs no roots because the browser does its own TLS. Note that
+// missing or broken system CA store; about 4 KB), and androidbin
+// (which pulls in androiddns), so the static linux binaries work
+// when run as raw executables on Android under Termux, adb, or a
+// rooted shell, where a plain Go binary has no working DNS, no CA
+// roots, and no interface enumeration; those packages detect Android
+// at runtime and are inert elsewhere. The wasm build needs no roots
+// because the browser does its own TLS. Note that
 // featuretags.Requires pulls in ssh's c2n and dbus dependencies too.
 var releaseKeep = []featuretags.FeatureTag{
 	"netstack",
 	"ssh",
 	"gro",
 	"bakedroots",
+	"androidbin",
 }
 
 // WasmTags returns the comma-joined -tags value for the wasm build,

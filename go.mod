@@ -12,17 +12,17 @@ require (
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pkg/sftp v1.13.6
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
-	github.com/tailscale/wireguard-go v0.0.0-20260904023712-e855235c55a2
+	github.com/tailscale/wireguard-go v0.0.0-20260911194433-e3222a3340cd
 	github.com/toqueteos/webbrowser v1.2.1
 	github.com/u-root/u-root v0.14.0
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f
-	golang.org/x/net v0.58.0
-	golang.org/x/sys v0.47.0
-	gvisor.dev/gvisor v0.0.0-20260224225140-573d5e7127a8
-	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
+	golang.org/x/net v0.59.0
+	golang.org/x/sys v0.48.0
+	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
+	tailscale.com v1.103.0-pre.0.20260916030321-a2263542f260
 )
 
 require (
@@ -99,12 +99,12 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260209203927-2842357ff358 // indirect
-	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/term v0.45.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
-	golang.org/x/tools v0.48.0 // indirect
+	golang.org/x/tools v0.50.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 	honnef.co/go/tools v0.8.0-rc.1 // indirect

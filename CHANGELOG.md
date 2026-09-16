@@ -41,6 +41,30 @@
 - Fixed argument parsing under Termux on Android, whose loader inserts
   the executable's path as an extra argument.
   ([#92](https://github.com/tailscale/tailcat/pull/92), [@shaunlee](https://github.com/shaunlee))
+- The linux binaries now work when run directly on Android, under
+  Termux, `adb shell`, or a rooted shell. Android has no
+  `/etc/resolv.conf`, so a plain Go binary there could not resolve any
+  name and failed at startup fetching the DERP map; it also found no
+  CA roots and could not enumerate network interfaces. tailcat now
+  links tailscale.com's `androiddns` and `androidbin` features, which
+  detect Android at runtime, resolve names through Android's DNS
+  resolver daemon, use the system certificate store, and fall back to
+  a synthetic single interface. On regular Linux they do nothing.
+  ([#117](https://github.com/tailscale/tailcat/issues/117), reported
+  by [@risharde](https://github.com/risharde))
+- Updated the tailscale.com dependency to its 2026-09-16 main branch,
+  which brings data path performance work from wireguard-go and
+  gVisor. wireguard-go now moves each batch of packets through one
+  buffer of about 128 KiB instead of a separate buffer per packet,
+  which in upstream's iperf3 benchmarks between two Linux machines
+  raised throughput by 7% to 35% depending on the workload and cut
+  peak memory for TCP transfers by half to three quarters. Small
+  outbound packets such as keepalives and handshakes now use 2 KiB
+  buffers, so packets waiting on a peer with no active session hold
+  at least 97% less memory than before. gVisor's TCP stack, which
+  carries every tailcat connection, now uses CUBIC congestion control
+  and RACK loss detection; both had been switched off because of
+  gVisor bugs that have since been fixed upstream.
 
 ## v0.6.0 (2026-09-04)
 
