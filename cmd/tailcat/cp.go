@@ -108,14 +108,17 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 	if err != nil {
 		return err
 	}
-	argv := []string{
-		scpExe,
+	argv := []string{scpExe}
+	if scpSupportsSFTPFlag(scpExe) {
+		argv = append(argv, "-s")
+	}
+	argv = append(argv,
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking no",
-		"-o", "UserKnownHostsFile " + os.DevNull,
+		"-o", "UserKnownHostsFile "+os.DevNull,
 		"-o", "LogLevel ERROR",
-		"-o", "ProxyCommand=" + proxyCommand,
-	}
+		"-o", "ProxyCommand="+proxyCommand,
+	)
 	if recursive {
 		argv = append(argv, "-r")
 	}
@@ -127,6 +130,17 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 	err = execSSH(scpExe, argv)
 	log.Fatalf("failed to run scp: %v", err)
 	return nil
+}
+
+// scpSupportsSFTPFlag reports whether scp accepts OpenSSH -s.
+// OpenSSH 8.7 added the flag; older clients can still use legacy SCP
+// against a full SSH server, so do not force -s when the client rejects it.
+func scpSupportsSFTPFlag(scpExe string) bool {
+	out, _ := exec.Command(scpExe, "-s", "--").CombinedOutput()
+	msg := strings.ToLower(string(out))
+	return !strings.Contains(msg, "unknown option -- s") &&
+		!strings.Contains(msg, "illegal option -- s") &&
+		!strings.Contains(msg, "invalid option -- s")
 }
 
 // splitRemoteArg splits an scp-style remote argument "host:path",
