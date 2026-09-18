@@ -355,6 +355,7 @@ type locoBackend struct {
 
 	mu             sync.Mutex
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
+	nextClientID   tailcfg.NodeID                   // for the server; never reused after a removal
 	nm             *netmap.NetworkMap
 	allowedClients map[key.NodePublic]bool // or nil map for all
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
@@ -445,8 +446,8 @@ type Server struct {
 
 	// AllowedClients, if non-empty, restricts which client node keys
 	// may connect; all others are silently ignored. If empty, all
-	// clients are allowed. See [Server.AddAllowedClient] to add more
-	// at runtime.
+	// clients are allowed. See [Server.AddAllowedClient] and
+	// [Server.RemoveAllowedClient] to change the set at runtime.
 	AllowedClients []key.NodePublic
 
 	lb *locoBackend // non-nil once Start has been called
@@ -982,6 +983,34 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 	s.lb.mu.Lock()
 	defer s.lb.mu.Unlock()
 	mak.Set(&s.lb.allowedClients, k, true)
+}
+
+// RemoveAllowedClient revokes k: further meows from k are ignored and,
+// if k is connected, it is dropped from the network map so its tunnel
+// is torn down.
+//
+// Removing the last allowed key leaves the server closed to everyone;
+// it does not fall back to allowing all clients. On a server without
+// an allowlist (all clients allowed) this only disconnects k, which may
+// reconnect; use an allowlist to make revocation stick.
+func (s *Server) RemoveAllowedClient(k key.NodePublic) {
+	if s.lb == nil {
+		// Not yet started; applied at Start.
+		if len(s.AllowedClients) == 0 {
+			return
+		}
+		s.AllowedClients = slices.DeleteFunc(s.AllowedClients, func(x key.NodePublic) bool { return x == k })
+		if len(s.AllowedClients) == 0 {
+			// An empty list means "allow all". Keep the server closed
+			// with the zero key, as `--allow=none` does.
+			s.AllowedClients = []key.NodePublic{{}}
+		}
+		return
+	}
+	s.lb.mu.Lock()
+	defer s.lb.mu.Unlock()
+	delete(s.lb.allowedClients, k) // no-op on a nil (allow-all) map
+	s.lb.removeClientLocked(k)
 }
 
 // TailcatAddr returns the tailcat address that clients use to connect to this
@@ -1679,10 +1708,15 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	if _, ok := b.clients[src]; ok {
 		return true
 	}
-	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
-	derpRegion := b.derpRegionID()
+	// Server is ID 1, clients are IDs 2, 3, ... IDs are never reused:
+	// after a removal, len(b.clients)+2 could collide with a live peer.
+	if b.nextClientID < 2 {
+		b.nextClientID = 2
+	}
+	id := b.nextClientID
+	b.nextClientID++
 	mak.Set(&b.clients, src, &tailcfg.Node{
-		ID:         tailcfg.NodeID(id),
+		ID:         id,
 		StableID:   tailcfg.StableNodeID(fmt.Sprint(id)),
 		Name:       fmt.Sprintf("client%d.tailcat.", id),
 		User:       100,
@@ -1690,9 +1724,24 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 		DiscoKey:   discoPub,
 		Addresses:  []netip.Prefix{pfxOf(tcAddrForKey(src))},
 		AllowedIPs: []netip.Prefix{pfxOf(tcAddrForKey(src))},
-		HomeDERP:   derpRegion,
+		HomeDERP:   b.derpRegionID(),
 	})
+	b.setNetworkMapLocked()
 
+	// No engine reconfig needed: the WireGuard device learns about the
+	// new peer lazily via the config source installed with
+	// SetPeerConfigFunc when the client's handshake arrives.
+
+	// Tell the new client our UDP endpoints so both sides can attempt
+	// a direct path. Async because advertiseEndpoints takes b.mu.
+	go b.advertiseEndpoints()
+	return true
+}
+
+// setNetworkMapLocked rebuilds the server's network map from b.clients
+// and pushes it to magicsock and netstack. b.mu must be held.
+func (b *locoBackend) setNetworkMapLocked() {
+	derpRegion := b.derpRegionID()
 	nm := &netmap.NetworkMap{
 		NodeKey: b.pub,
 		SelfNode: (&tailcfg.Node{
@@ -1715,17 +1764,19 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	})
 	b.nm = nm
 
-	mc := b.sys.MagicSock.Get()
-	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
+	b.sys.MagicSock.Get().SetNetworkMap(nm.SelfNode, nm.Peers)
 	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
+}
 
-	// No engine reconfig needed: the WireGuard device learns about the
-	// new peer lazily via the config source installed with
-	// SetPeerConfigFunc when the client's handshake arrives.
-
-	// Tell the new client our UDP endpoints so both sides can attempt
-	// a direct path. Async because advertiseEndpoints takes b.mu.
-	go b.advertiseEndpoints()
+// removeClientLocked forgets the connected client k, if any, dropping it
+// from the network map so its WireGuard session is torn down. b.mu must
+// be held. It reports whether k was connected.
+func (b *locoBackend) removeClientLocked(k key.NodePublic) bool {
+	if _, ok := b.clients[k]; !ok {
+		return false
+	}
+	delete(b.clients, k)
+	b.setNetworkMapLocked()
 	return true
 }
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Go library: the new `Server.RemoveAllowedClient` revokes a client key
+  at runtime, the counterpart of `AddAllowedClient`. Later meows from
+  the key are ignored and, if it is connected, its peer is dropped from
+  the network map, so a server no longer has to restart (and disconnect
+  everyone else) to remove one client.
+  ([#124](https://github.com/tailscale/tailcat/issues/124))
 - `--serve=exit-node` servers now forward UDP flows; previously only
   TCP was forwarded, so DNS, QUIC, and other UDP traffic through an
   exit node went nowhere.
