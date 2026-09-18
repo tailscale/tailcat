@@ -395,6 +395,81 @@ func TestStatusReportsPeers(t *testing.T) {
 	t.Logf("peer %v: CurAddr=%q Relay=%q", c.PublicKey(), ps.CurAddr, ps.Relay)
 }
 
+// TestRemoveAllowedClient checks that revoking a connected client drops
+// it from the server, refuses its later meows, and leaves other clients
+// untouched.
+func TestRemoveAllowedClient(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		if port != 80 {
+			return nil
+		}
+		return func(c net.Conn) {
+			io.WriteString(c, "hello\n")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	revokedKey := key.NewNode()
+	revoked := &Client{Server: s.TailcatAddr(), Key: revokedKey, Logf: mkLogger(t, "revoked")}
+	t.Cleanup(func() { revoked.Close() })
+	kept := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "kept")}
+	t.Cleanup(func() { kept.Close() })
+	s.AddAllowedClient(revoked.PublicKey())
+	s.AddAllowedClient(kept.PublicKey())
+
+	PingForTest(t, s, revoked)
+	PingForTest(t, s, kept)
+	if _, ok := s.Status().Peer[revoked.PublicKey()]; !ok {
+		t.Fatal("revoked client not a peer before removal")
+	}
+
+	s.RemoveAllowedClient(revoked.PublicKey())
+
+	if _, ok := s.Status().Peer[revoked.PublicKey()]; ok {
+		t.Fatal("revoked client still reported as a peer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if conn, err := revoked.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("revoked client dialed the server after removal")
+	}
+	cancel()
+
+	// A fresh client presenting the revoked key is ignored at the meow.
+	again := &Client{Server: s.TailcatAddr(), Key: revokedKey, Logf: mkLogger(t, "again")}
+	t.Cleanup(func() { again.Close() })
+	WaitForDERPForTest(t, s, again)
+	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if _, err := again.Ping(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Ping with revoked key = %v; want context deadline exceeded", err)
+	}
+	cancel()
+
+	// The other client is unaffected.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := kept.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatalf("kept client DialTCPPort = %v", err)
+	}
+	if got, _ := io.ReadAll(conn); string(got) != "hello\n" {
+		t.Fatalf("kept client read %q; want %q", got, "hello\n")
+	}
+}
+
 func TestUDP(t *testing.T) {
 	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
 	reg := dm.Regions[1]
