@@ -353,6 +353,9 @@ type locoBackend struct {
 	// peer map lookup. Set before createEngine.
 	onDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool
 
+	// allowClient is the server's Server.AllowClient hook, or nil.
+	allowClient func(key.NodePublic) bool
+
 	mu             sync.Mutex
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
 	nm             *netmap.NetworkMap
@@ -446,8 +449,25 @@ type Server struct {
 	// AllowedClients, if non-empty, restricts which client node keys
 	// may connect; all others are silently ignored. If empty, all
 	// clients are allowed. See [Server.AddAllowedClient] to add more
-	// at runtime.
+	// at runtime, and AllowClient to decide per client instead of
+	// from a fixed list.
 	AllowedClients []key.NodePublic
+
+	// AllowClient, if non-nil, reports whether the client with node
+	// key k may connect. It is consulted when a client that is not
+	// already connected and not in AllowedClients announces itself;
+	// a client it rejects is silently ignored, like an unlisted one,
+	// and is asked about again if it retries. If AllowClient is nil
+	// and AllowedClients is empty, all clients are allowed.
+	//
+	// It is called with the server's internal lock held, so it must
+	// return quickly and must not block on I/O: a slow call stalls
+	// every connected client's traffic. A program gating clients on
+	// another service should decide ahead of time and have AllowClient
+	// look the decision up.
+	//
+	// It must be set before calling Start.
+	AllowClient func(k key.NodePublic) bool
 
 	lb *locoBackend // non-nil once Start has been called
 
@@ -620,6 +640,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 	for _, k := range s.AllowedClients {
 		mak.Set(&lb.allowedClients, k, true)
 	}
+	lb.allowClient = s.AllowClient
 
 	sys := &lb.sys
 	bus := eventbus.New()
@@ -1663,6 +1684,27 @@ func (lb *locoBackend) Start() error {
 	return nil
 }
 
+// clientAllowedLocked reports whether the not yet connected client
+// with node key src may connect, per the server's AllowedClients list
+// and AllowClient hook. b.mu must be held.
+func (b *locoBackend) clientAllowedLocked(src key.NodePublic) bool {
+	if b.allowedClients == nil && b.allowClient == nil {
+		return true // open to all clients
+	}
+	if b.allowedClients[src] {
+		return true
+	}
+	if b.allowClient != nil {
+		if b.allowClient(src) {
+			return true
+		}
+		b.logf("ignoring meow from %v: rejected by AllowClient", src.String())
+		return false
+	}
+	b.logf("ignoring meow from %v: not in allowedClients", src.String())
+	return false
+}
+
 // onMeow handles a MeowPing from the client with node key src and
 // disco key discoPub, adding it as a WireGuard peer. It reports
 // whether the client is allowed and configured, meaning a "meowed"
@@ -1671,13 +1713,11 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("got meow from %v", src.String())
-	if b.allowedClients != nil && !b.allowedClients[src] {
-		b.logf("ignoring meow from %v: not in allowedClients", src.String())
-		return false
-	}
-
 	if _, ok := b.clients[src]; ok {
 		return true
+	}
+	if !b.clientAllowedLocked(src) {
+		return false
 	}
 	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
 	derpRegion := b.derpRegionID()

@@ -991,6 +991,119 @@ func TestServerCloseClosesActiveConnections(t *testing.T) {
 	}
 }
 
+// pingRejectedForTest checks that the server never acknowledges c's
+// meow: a disallowed client gets no reply, so Ping must ride out its
+// context deadline rather than fail fast.
+func pingRejectedForTest(t testing.TB, s *Server, c *Client) {
+	t.Helper()
+	WaitForDERPForTest(t, s, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := c.Ping(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Ping from disallowed client = %v; want context deadline exceeded", err)
+	}
+}
+
+func TestAllowClient(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	listed := key.NewNode()
+	approved := key.NewNode()
+	rejected := key.NewNode()
+
+	var calls syncs.Map[key.NodePublic, int]
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		AllowedClients: []key.NodePublic{listed.Public()},
+		AllowClient: func(k key.NodePublic) bool {
+			n, _ := calls.Load(k)
+			calls.Store(k, n+1)
+			return k == approved.Public()
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	newClient := func(name string, k key.NodePrivate) *Client {
+		c := &Client{Server: s.TailcatAddr(), Key: k, Logf: mkLogger(t, name)}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+
+	// A listed key is admitted from AllowedClients alone.
+	PingForTest(t, s, newClient("listed", listed))
+
+	// A key the hook approves is admitted, and once connected the
+	// client's later pings are acknowledged without asking again.
+	approvedClient := newClient("approved", approved)
+	PingForTest(t, s, approvedClient)
+	PingForTest(t, s, approvedClient)
+
+	// A key that is neither listed nor approved gets no reply.
+	pingRejectedForTest(t, s, newClient("rejected", rejected))
+
+	if n, _ := calls.Load(listed.Public()); n != 0 {
+		t.Errorf("AllowClient called %d times for a listed key; want 0", n)
+	}
+	if n, _ := calls.Load(approved.Public()); n != 1 {
+		t.Errorf("AllowClient called %d times for the approved key; want 1", n)
+	}
+	// The rejected client's meow reached the hook and was turned
+	// down there. DERP delivery is asynchronous, so give it a moment.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for n, _ := calls.Load(rejected.Public()); n < 1; n, _ = calls.Load(rejected.Public()) {
+		select {
+		case <-ctx.Done():
+			t.Fatal("AllowClient never called for the rejected key")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// TestAllowClientOnly checks that AllowClient alone, with no
+// AllowedClients, closes the server to clients the hook rejects: an
+// empty list must not keep meaning "all clients" once a hook is set.
+func TestAllowClientOnly(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	approved := key.NewNode()
+	s := &Server{
+		Logf:   mkLogger(t, "server"),
+		Region: reg,
+		AllowClient: func(k key.NodePublic) bool {
+			return k == approved.Public()
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	rejected := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "rejected")}
+	t.Cleanup(func() { rejected.Close() })
+	pingRejectedForTest(t, s, rejected)
+
+	c := &Client{Server: s.TailcatAddr(), Key: approved, Logf: mkLogger(t, "approved")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+}
+
 func TestAddr(t *testing.T) {
 	akey := func(a [32]byte) NodePublic {
 		return NodePublic{key.NodePublicFromRaw32(mem.B(a[:]))}

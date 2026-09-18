@@ -26,6 +26,15 @@
   returns one client flow as a `net.Conn`. Listeners claim their
   specific ports ahead of the wildcard hooks, and Listen starts the
   server if it isn't running yet.
+- Go library: the new `Server.AllowClient` hook decides per client
+  node key whether a client may connect, for programs that can't list
+  every key in `AllowedClients` up front. A listed key is admitted
+  without consulting the hook; any other key is admitted if the hook
+  approves it. The hook runs under the server's lock and must not
+  block, so a program gating clients on another service should decide
+  ahead of time and have the hook look the decision up.
+  ([#120](https://github.com/tailscale/tailcat/pull/120),
+  [@jormenjanssen](https://github.com/jormenjanssen))
 - `tailcat forward` takes an `--open-browser` flag that opens a web
   browser to the forwarded local port; `tailcat browse <tc-addr>` is
   an alias for `tailcat forward --open-browser <tc-addr> 0:80`.
