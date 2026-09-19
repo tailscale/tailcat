@@ -857,6 +857,14 @@ func (s *Server) buildFilterLocked() *filter.Filter {
 // [Server.Start] or [Server.Listen].
 func (s *Server) Addr() netip.Addr { return s.lb.addr }
 
+// ClientForAddr returns the key of the connected client with tailcat address addr.
+func (s *Server) ClientForAddr(addr netip.Addr) (_ key.NodePublic, ok bool) {
+	if s.lb == nil {
+		return key.NodePublic{}, false
+	}
+	return s.lb.peerByIP(addr)
+}
+
 // Close shuts down the server, closing any listeners created by
 // [Server.Listen] along with the WireGuard engine and DERP connections.
 func (s *Server) Close() error {

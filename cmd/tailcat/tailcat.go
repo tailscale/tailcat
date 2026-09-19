@@ -54,6 +54,7 @@ var (
 	flagServe             *string
 	flagKey               *string
 	flagAllow             *string
+	flagLogClients        *bool
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
@@ -100,6 +101,7 @@ func newRootCommand() *ff.Command {
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
+	flagLogClients = serveFS.BoolLong("log-clients", "log each incoming connection to stderr: the client's public key, what it connected to, and whether its path is direct or relayed through DERP")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
@@ -1438,16 +1440,52 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
+	// logClient logs an accepted connection for --log-clients.
+	logClient := func(c net.Conn, what string) {
+		src := "unknown client"
+		path := "path unknown"
+		if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err == nil {
+			if k, ok := s.ClientForAddr(ap.Addr().Unmap()); ok {
+				src = k.String()
+				if ps, ok := s.Status().Peer[k]; ok {
+					switch {
+					case ps.CurAddr != "":
+						path = "direct " + ps.CurAddr
+					case ps.Relay != "":
+						path = "relayed via DERP " + ps.Relay
+					}
+				}
+			}
+		}
+		log.Printf("client %v connected to %v (%v)", src, what, path)
+	}
+	logTCP := func(what string, h func(net.Conn)) func(net.Conn) {
+		if h == nil || !*flagLogClients {
+			return h
+		}
+		return func(c net.Conn) {
+			logClient(c, what)
+			h(c)
+		}
+	}
+
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
-			return tcpForwardTo(dst.String())
+			return logTCP("tcp "+dst.String(), tcpForwardTo(dst.String()))
 		}
 		// Exit-node clients send UDP through the tunnel the same way they
 		// send TCP (DNS, QUIC, ...). Without this, those flows are dropped:
 		// the tunnel is up and TCP works, but every UDP flow silently goes
 		// nowhere. See OnUDPForward and ProxyPacketConns in the README.
 		s.OnUDPForward = func(dst netip.AddrPort) (handler func(tailcat.ConnPacketConn)) {
-			return udpForwardTo(dst)
+			h := udpForwardTo(dst)
+			if !*flagLogClients {
+				return h
+			}
+			return func(c tailcat.ConnPacketConn) {
+				logClient(c, "udp "+dst.String())
+				h(c)
+			}
 		}
 	}
 
@@ -1478,7 +1516,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		fmt.Fprintf(os.Stderr, "# Running %v for each connection\n", strings.Join(execArgs, " "))
 	}
 
-	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+	onTCP := func(port uint16) (handler func(net.Conn)) {
 		if port == 22 && sshHandler != nil {
 			return sshHandler
 		}
@@ -1521,6 +1559,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 			return nil // RST
 		}
 		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+	}
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return logTCP(fmt.Sprintf("tcp port %v", port), onTCP(port))
 	}
 
 	if err := s.Start(); err != nil {
