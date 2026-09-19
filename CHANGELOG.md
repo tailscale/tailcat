@@ -11,6 +11,11 @@
   shared DERP relay mostly measures its rate limit; `--via-derp`
   allows relayed tests through your own relay, never through
   Tailscale's shared ones.
+- `tailcat serve --log-clients` logs each incoming connection to
+  stderr: the client's public key, the port or destination it
+  connected to, and whether its path is direct or relayed through
+  DERP.
+  ([#39](https://github.com/tailscale/tailcat/issues/39))
 
 ## v0.7.0 (2026-09-19)
 
