@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `tailcat serve --log-clients` logs each incoming connection to
+  stderr: the client's public key, the port or destination it
+  connected to, and whether its path is direct or relayed through
+  DERP. Go library: the new `Server.ClientForAddr` maps a served
+  conn's remote address back to the client's public key.
+  ([#39](https://github.com/tailscale/tailcat/issues/39))
 - `--serve=exit-node` servers now forward UDP flows; previously only
   TCP was forwarded, so DNS, QUIC, and other UDP traffic through an
   exit node went nowhere.
