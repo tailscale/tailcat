@@ -11,3 +11,8 @@
 # Go test artifacts.
 *.test
 *.out
+
+# libtailcat / TailcatKit build outputs.
+/libtailcat/build/
+/swift/CTailcat.xcframework
+/swift/.build
