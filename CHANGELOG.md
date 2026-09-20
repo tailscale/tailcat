@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `tailcat serve` takes port mappings like `5555:10.2.200.213:5555`
+  to proxy a served port to a host on the server's network, or
+  `8080:80` to a different port on localhost, instead of always the
+  same port on localhost. This exposes one LAN service without the
+  whole network that `exit-node` would.
 - `--serve=exit-node` servers now forward UDP flows; previously only
   TCP was forwarded, so DNS, QUIC, and other UDP traffic through an
   exit node went nowhere.

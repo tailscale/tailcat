@@ -387,3 +387,34 @@ func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn 
 	c.SetDeadline(time.Time{})
 	return c
 }
+
+// TestServePortMapping serves a port mapped to a different port on
+// 127.0.0.1 (standing in for another host on the server's network)
+// and checks that a client connecting to the served port reaches the
+// mapping's target rather than the same port on localhost.
+func TestServePortMapping(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	echoPort := startEchoListener(t)
+	// Serve a port that nothing listens on locally, so only the
+	// mapping can make the connection work.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	servedPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	mapping := fmt.Sprintf("%d:127.0.0.1:%d", servedPort, echoPort)
+	_, addr, serverStderr := e.startServer("serve", mapping)
+	waitForLog(t, serverStderr, fmt.Sprintf("# Proxying port %d to 127.0.0.1:%d\n", servedPort, echoPort))
+
+	const payload = "echo through a port mapping"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(servedPort)), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to mapped port: %v", err)
+	}
+	if got != payload {
+		t.Errorf("mapped port echoed %q; want %q", got, payload)
+	}
+}

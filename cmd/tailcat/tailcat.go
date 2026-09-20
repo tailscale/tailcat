@@ -425,9 +425,13 @@ const serveLongHelp = `Run a tailcat server, printing its tailcat address for cl
 connect to. Running tailcat with no arguments is the same as running
 "tailcat serve" with no arguments.
 
-The arguments are port numbers, port ranges, and service names,
-either as separate arguments or comma-separated. Ports are proxied
-to the same port on localhost. Service names are:
+The arguments are port numbers, port ranges, port mappings, and
+service names, either as separate arguments or comma-separated.
+Ports are proxied to the same port on localhost. A port mapping
+"port:target" proxies a port elsewhere instead: to a different port
+on localhost ("8080:80") or to a host:port on the server's network
+("5555:10.2.200.213:5555", or "5555:[fd7a::1]:5555" for IPv6).
+Service names are:
 
 	all          serve all ports
 	exit-node    run an exit node for all addresses
@@ -471,6 +475,11 @@ Serve some ports:
 Serve all ports:
 
 	tailcat serve all
+
+Serve port 5555, proxied to port 5555 on another machine on the
+server's network:
+
+	tailcat serve 5555:10.2.200.213:5555
 
 Serve a port and the auth-free SSH server:
 
@@ -1229,7 +1238,7 @@ func splitExecArgs(args []string) (positional, execArgs []string) {
 // server runs a tailcat server. execArgs is the command given after
 // "--", or nil.
 func server(logf logger.Logf, serveSpec string, execArgs []string) {
-	portSet, services, err := parsePortSet(serveSpec)
+	portSet, services, targets, err := parsePortSet(serveSpec)
 	if err != nil {
 		log.Fatalf("invalid port or service to serve: %v", err)
 	}
@@ -1414,6 +1423,16 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	// for why the OS resolver can't be trusted to (issue #108).
 	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
 
+	// tcpTarget returns the host:port a served TCP port is proxied
+	// to: its mapping's target if the serve spec gave one, else the
+	// same port on localhost.
+	tcpTarget := func(port uint16) string {
+		if t, ok := targets[port]; ok {
+			return t
+		}
+		return fmt.Sprintf("localhost:%v", port)
+	}
+
 	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
 		return func(c net.Conn) {
 			localConn, err := localDialer.Dial("tcp", ipPortStr)
@@ -1477,13 +1496,16 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		execHandler = s.ExecConnHandler(execArgs)
 		fmt.Fprintf(os.Stderr, "# Running %v for each connection\n", strings.Join(execArgs, " "))
 	}
+	for _, port := range slices.Sorted(maps.Keys(targets)) {
+		fmt.Fprintf(os.Stderr, "# Proxying port %d to %v\n", port, targets[port])
+	}
 
 	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
 		if port == 22 && sshHandler != nil {
 			return sshHandler
 		}
 		if portSet.Contains(port) {
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return tcpForwardTo(tcpTarget(port))
 		}
 		if execHandler != nil {
 			return execHandler
@@ -1626,12 +1648,19 @@ var (
 	numRx       = regexp.MustCompile(`^\d+$`)
 )
 
-func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ error) {
+// parsePortSet parses a serve spec: a comma-separated list of ports,
+// port ranges, service names, and port mappings of the form
+// "port:target", where target is a port on localhost or a host:port
+// elsewhere. It returns the set of served ports, the named services,
+// and the targets of the mapped ports; ports without a target are
+// proxied to the same port on localhost.
+func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], targets map[uint16]string, _ error) {
 	services = set.Set[string]{}
 	if s == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	ret := set.Set[uint16]{}
+	targets = map[uint16]string{}
 	s = strings.TrimSpace(s)
 
 	for _, r := range strings.Split(s, ",") {
@@ -1644,7 +1673,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 			continue
 		case "ssh", "no-auth-ssh", "files":
 			if !tailCatSSHEnabled {
-				return nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
+				return nil, nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
 			}
 			services.Add(r)
 			continue
@@ -1652,8 +1681,20 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 			services.Add(r)
 			continue
 		}
+		if portStr, targetStr, ok := strings.Cut(r, ":"); ok {
+			port, target, err := parsePortTarget(portStr, targetStr)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if prev, ok := targets[port]; ok && prev != target {
+				return nil, nil, nil, fmt.Errorf("port %d is mapped to both %v and %v", port, prev, target)
+			}
+			ret.Add(port)
+			targets[port] = target
+			continue
+		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node)", r)
+			return nil, nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {
@@ -1662,13 +1703,13 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 
 		lo, err := strconv.ParseUint(a, 10, 16)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%q is not a valid port", a)
+			return nil, nil, nil, fmt.Errorf("%q is not a valid port", a)
 		}
 		hi := lo
 		if b != "" {
 			hi, err = strconv.ParseUint(b, 10, 16)
 			if err != nil {
-				return nil, nil, fmt.Errorf("%q is not a valid port number", b)
+				return nil, nil, nil, fmt.Errorf("%q is not a valid port number", b)
 			}
 		}
 		if hi < lo {
@@ -1678,7 +1719,29 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 			ret.Add(uint16(i))
 		}
 	}
-	return ret, services, nil
+	return ret, services, targets, nil
+}
+
+// parsePortTarget parses the two halves of a "port:target" serve
+// mapping. The target is either a bare port, meaning that port on
+// localhost, or a host:port (with an IPv6 host in brackets). It
+// returns the served port and the target as a dialable host:port.
+func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
+		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", portStr, portStr+":"+targetStr)
+	}
+	if numRx.MatchString(targetStr) {
+		return uint16(port), net.JoinHostPort("localhost", targetStr), nil
+	}
+	host, targetPort, err := net.SplitHostPort(targetStr)
+	if err != nil || host == "" {
+		return 0, "", fmt.Errorf("target %q in mapping %q is not a port or host:port", targetStr, portStr+":"+targetStr)
+	}
+	if p, err := strconv.ParseUint(targetPort, 10, 16); err != nil || p == 0 {
+		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetPort, portStr+":"+targetStr)
+	}
+	return uint16(port), net.JoinHostPort(host, targetPort), nil
 }
 
 // portRanges coalesces the ascending-sorted ports into contiguous

@@ -108,6 +108,16 @@ HTTP/1.1 200 OK
 ....
 ```
 
+A port mapping proxies a port somewhere other than the same port on localhost: to a different local port, or to a host and port elsewhere on the server's network. This serves port 5555 by proxying it to an Android device's adb port on the LAN, without exposing the rest of the network the way `exit-node` would:
+
+```sh
+$ tailcat serve 5555:10.2.200.213:5555
+# Proxying port 5555 to 10.2.200.213:5555
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Then on the client, `tailcat forward tcXXXXXXXXX 5555` followed by `adb connect 127.0.0.1:5555`. Write IPv6 targets in brackets: `5555:[fd7a::1]:5555`.
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:
