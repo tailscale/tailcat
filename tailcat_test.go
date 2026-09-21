@@ -1413,3 +1413,80 @@ func TestParseAddrRawKeepsNulls(t *testing.T) {
 		t.Errorf("Region = %v; want a single nil element", w.Region)
 	}
 }
+
+func TestPeerKey(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	type peerKey struct {
+		key key.NodePublic
+		ok  bool
+	}
+	tcpKey := make(chan peerKey, 1)
+	udpKey := make(chan peerKey, 1)
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		return func(c net.Conn) {
+			defer c.Close()
+			k, ok := s.PeerKey(c.RemoteAddr())
+			tcpKey <- peerKey{k, ok}
+		}
+	}
+	s.OnUDP = func(port uint16) func(ConnPacketConn) {
+		return func(c ConnPacketConn) {
+			defer c.Close()
+			k, ok := s.PeerKey(c.RemoteAddr())
+			udpKey <- peerKey{k, ok}
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	want := c.PublicKey()
+
+	conn, err := c.DialTCPPort(t.Context(), 80)
+	if err != nil {
+		t.Fatalf("DialTCPPort: %v", err)
+	}
+	io.Copy(io.Discard, conn)
+	conn.Close()
+
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.Write([]byte("hello")); err != nil {
+		t.Fatalf("UDP Write: %v", err)
+	}
+
+	for _, tt := range []struct {
+		proto string
+		ch    chan peerKey
+	}{
+		{"TCP", tcpKey},
+		{"UDP", udpKey},
+	} {
+		select {
+		case got := <-tt.ch:
+			if !got.ok {
+				t.Errorf("PeerKey on %s: ok=false; want the client's key", tt.proto)
+				continue
+			}
+			if got.key != want {
+				t.Errorf("PeerKey on %s = %v; want %v", tt.proto, got.key, want)
+			}
+		case <-time.After(30 * time.Second):
+			t.Errorf("timeout waiting for the %s handler", tt.proto)
+		}
+	}
+}

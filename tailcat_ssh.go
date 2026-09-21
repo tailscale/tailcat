@@ -24,7 +24,6 @@ import (
 
 	ssh "github.com/tailscale/gliderssh"
 	gossh "golang.org/x/crypto/ssh"
-	"tailscale.com/types/key"
 )
 
 const sshInteractiveMOTD = "🐈 Connected via tailcat SSH.\r\n"
@@ -127,7 +126,7 @@ func (s *Server) sessionHandler(sess ssh.Session) {
 	// authenticated the peer by this key (and --allow, if set, gated on
 	// it), so a shell wrapper can tell which allowed peer it's talking
 	// to. The value matches --allow's format ("nodekey:...").
-	if k, ok := s.peerKeyForSession(sess); ok {
+	if k, ok := s.PeerKey(sess.RemoteAddr()); ok {
 		cmd.Env = append(cmd.Env, "TAILCAT_PEER_KEY="+k.String())
 	}
 
@@ -166,19 +165,6 @@ func (s *Server) execSessionHandler(argv []string) ssh.Handler {
 		}
 		runWithPipes(sess, cmd)
 	}
-}
-
-// peerKeyForSession returns the node public key of the peer on the
-// other end of sess. The session's remote address is the peer's
-// tailcat IP (derived from its key by tcAddrForKey); peerByIP reverses
-// that back to the key the tunnel authenticated. It returns ok=false
-// if the address can't be mapped to a known peer.
-func (s *Server) peerKeyForSession(sess ssh.Session) (key.NodePublic, bool) {
-	ta, ok := sess.RemoteAddr().(*net.TCPAddr)
-	if !ok {
-		return key.NodePublic{}, false
-	}
-	return s.lb.peerByIP(ta.AddrPort().Addr().Unmap())
 }
 
 // runWithPipes runs cmd with stdin/stdout/stderr pipes (no PTY).

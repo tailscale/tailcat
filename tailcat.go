@@ -1445,6 +1445,32 @@ func (b *locoBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool)
 	return withPSK(n.AllowedIPs), true
 }
 
+// PeerKey returns the node public key of the peer at remote, the
+// remote address of a connection or flow accepted by this server: the
+// net.Conn passed to [Server.OnTCP] or [Server.OnTCPForward], the
+// [ConnPacketConn] passed to [Server.OnUDP] or [Server.OnUDPForward],
+// or a connection from a [Server.Listen] listener.
+//
+// The tunnel has already authenticated the peer by this key, so a
+// caller can tell which peer it is serving, and can match it against
+// [Server.AllowedClients]. It reports ok=false if remote is not a
+// known peer's address.
+//
+// [Server.PeerEnv] reports the same key to served subprocesses as
+// TAILCAT_PEER_KEY.
+func (s *Server) PeerKey(remote net.Addr) (_ key.NodePublic, ok bool) {
+	var ap netip.AddrPort
+	switch a := remote.(type) {
+	case *net.TCPAddr:
+		ap = a.AddrPort()
+	case *net.UDPAddr:
+		ap = a.AddrPort()
+	default:
+		return key.NodePublic{}, false
+	}
+	return s.lb.peerByIP(ap.Addr().Unmap())
+}
+
 // peerByIP returns the public key of the peer that outbound packets
 // addressed to dst should be sent to (see
 // [wgengine.Engine.SetPeerByIPPacketFunc]).

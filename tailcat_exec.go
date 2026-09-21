@@ -49,10 +49,8 @@ func (s *Server) PeerEnv(local, remote net.Addr) []string {
 		"TAILCAT_REMOTE_ADDR=" + remote.String(),
 		"TAILCAT_LOCAL_ADDR=" + local.String(),
 	}
-	if ta, ok := remote.(*net.TCPAddr); ok {
-		if k, ok := s.lb.peerByIP(ta.AddrPort().Addr().Unmap()); ok {
-			env = append(env, "TAILCAT_PEER_KEY="+k.String())
-		}
+	if k, ok := s.PeerKey(remote); ok {
+		env = append(env, "TAILCAT_PEER_KEY="+k.String())
 	}
 	return env
 }
