@@ -1999,6 +1999,19 @@ func (c *Client) PublicKey() key.NodePublic {
 	return c.nodeKeyLocked().Public()
 }
 
+// DERPRegion returns the DERP region the client uses to reach the
+// server, once the client has started (see [Client.Dial] for what
+// starts it). Before then, or if the client failed to start, it
+// returns nil.
+func (c *Client) DERPRegion() *tailcfg.DERPRegion {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	if !c.started || len(c.ci.Region) == 0 {
+		return nil
+	}
+	return c.ci.Region[0]
+}
+
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
 func (c *Client) Close() error {
 	c.startMu.Lock()

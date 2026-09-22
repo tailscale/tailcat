@@ -63,7 +63,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	tstest.AssertNotParallel(t) // newRootCommand rebinds global flag variables
 	help := ffhelp.Command(newRootCommand()).String()
 	for _, want := range []string{
-		"serve", "recv", "ping", "socks", "ssh", "cp", "parse", "resolve",
+		"serve", "recv", "ping", "perf", "socks", "ssh", "cp", "parse", "resolve",
 		"forward", "genkey", "printpub", "version", "readme",
 		"--serve", "--key", "--derpmap-url",
 	} {

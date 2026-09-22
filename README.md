@@ -298,6 +298,40 @@ stack omits it; transport compression has a history of security
 problems, and TLS dropped it too). Compress files before sending
 if it matters.
 
+### Measure throughput and latency
+
+Run an iperf-like test between two machines. The server accepts tests
+with the `perf` service and the client sends to it for 10 seconds by
+default, printing progress each second and both sides' totals at the
+end. `--reverse` sends the other way, `--bidir` both ways at once,
+`--udp` tests UDP (paced to `--bitrate`, default 1 Mbit/s) and reports
+loss, reordering, and jitter, and `--parallel` runs several streams.
+Round trips over the test's control connection measure latency while
+the tunnel is loaded:
+
+```sh
+$ tailcat serve perf
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat perf tcXXXXXXXXX
+# path: direct via 203.0.113.7:41641, rtt 1.2ms
+TCP, client -> server, 1 stream, 10s
+[   1.0s]  sent    118 MB    943 Mbit/s  rtt 2.1ms
+...
+sent        1.18 GB in   10.0s    943 Mbit/s
+received    1.18 GB in   10.0s    942 Mbit/s
+rtt under load  min 1.9ms  avg 2.3ms  max 4.1ms  (50 samples)
+```
+
+The test first waits for a direct path (up to `--timeout`) and refuses
+to run through a DERP relay otherwise, since a throughput test through
+a shared relay mostly measures its rate limit while crowding out
+everyone else. `--via-derp` allows a relayed test through [a relay you
+run yourself](#bring-your-own-derp-relay); Tailscale's shared relays
+are always refused. `tailcat --json perf` prints the results as JSON.
+
 ### Misc commands 
 
 Ping to test connectivity; each pong reports whether it arrived via a

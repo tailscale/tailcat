@@ -1,5 +1,17 @@
 # tailcat changelog
 
+## Unreleased
+
+- New `tailcat perf` command and `perf` service run an iperf-like
+  throughput and latency test between a client and a server, over
+  TCP or UDP, in either or both directions, with one or more parallel
+  streams. UDP tests report loss, reordering, and jitter; all tests
+  report round-trip latency under load. By default the test refuses
+  to run until the path is direct, since a throughput test through a
+  shared DERP relay mostly measures its rate limit; `--via-derp`
+  allows relayed tests through your own relay, never through
+  Tailscale's shared ones.
+
 ## v0.7.0 (2026-09-19)
 
 - `tailcat serve` takes port mappings like `5555:10.2.200.213:5555`

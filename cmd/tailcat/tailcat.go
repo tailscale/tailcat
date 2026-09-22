@@ -34,6 +34,7 @@ import (
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
 	"github.com/tailscale/tailcat/internal/localhostdns"
+	"github.com/tailscale/tailcat/internal/perf"
 	"go4.org/mem"
 	xmaps "golang.org/x/exp/maps"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -92,10 +93,10 @@ func getLogf() logger.Logf {
 // package-level flag value pointers.
 func newRootCommand() *ff.Command {
 	rootFS := ff.NewFlagSet("tailcat")
-	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
+	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio), 'perf' (accept throughput tests from 'tailcat perf'). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
-	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
+	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout; with perf, write the results as JSON")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
@@ -166,6 +167,7 @@ func newRootCommand() *ff.Command {
 					return clientPingMode(getLogf(), *pingUntilDirect, *pingTimeout, args)
 				},
 			},
+			perfCommand(rootFS),
 			{
 				Name:      "socks",
 				Usage:     "tailcat socks [--listen=<addr:port>] [<tc-addr>] [<cmd> [args...]]",
@@ -447,6 +449,8 @@ Service names are:
 	             connection to any port not otherwise served, with
 	             the connection as the command's stdin and stdout
 	             (like inetd); its stderr is the server's
+	perf         accept throughput and latency tests from
+	             "tailcat perf", on TCP and UDP port 5201
 
 With no arguments, the server accepts a single connection on any
 port, writes it to stdout, and exits.
@@ -1269,6 +1273,10 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 		services.Add("files")
 	}
+	servePerf := services.Contains("perf")
+	if servePerf && portSet.Contains(perf.Port) {
+		log.Fatalf("port %d is used by the 'perf' service and cannot also be proxied", perf.Port)
+	}
 	sshWithAuth := services.Contains("ssh")
 	sshWithoutAuth := services.Contains("no-auth-ssh")
 	if sshWithAuth && sshWithoutAuth {
@@ -1401,7 +1409,14 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if sshServices && !portSet.Contains(22) {
 			ports = append([]uint16{22}, ports...)
 		}
+		if servePerf {
+			ports = append(ports, perf.Port)
+			slices.Sort(ports)
+		}
 		s.ServedTCPPorts = portRanges(ports)
+	}
+	if servePerf {
+		s.ServedUDPPorts = []filter.PortRange{{First: perf.Port, Last: perf.Port}}
 	}
 	if *flagAllow != "" {
 		for _, ks := range strings.Split(*flagAllow, ",") {
@@ -1491,6 +1506,23 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		sshHandler = s.SSHConnHandler(opts)
 	}
 
+	var perfSrv *perf.Server
+	if servePerf {
+		perfSrv = &perf.Server{
+			Logf: logf,
+			OnResult: func(remote net.Addr, res *perf.Result) {
+				fmt.Fprintf(os.Stderr, "# perf test from %v: %v\n", remote, perfSummary(res))
+			},
+		}
+		s.OnUDP = func(port uint16) (handler func(tailcat.ConnPacketConn)) {
+			if port != perf.Port {
+				return nil
+			}
+			return func(c tailcat.ConnPacketConn) { perfSrv.HandleUDP(c) }
+		}
+		fmt.Fprintf(os.Stderr, "# Accepting perf tests on TCP and UDP port %d\n", perf.Port)
+	}
+
 	var execHandler func(net.Conn)
 	if services.Contains("exec") {
 		execHandler = s.ExecConnHandler(execArgs)
@@ -1503,6 +1535,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
 		if port == 22 && sshHandler != nil {
 			return sshHandler
+		}
+		if port == perf.Port && perfSrv != nil {
+			return perfSrv.HandleTCP
 		}
 		if portSet.Contains(port) {
 			return tcpForwardTo(tcpTarget(port))
@@ -1677,7 +1712,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 			}
 			services.Add(r)
 			continue
-		case "exit-node", "exec":
+		case "exit-node", "exec", "perf":
 			services.Add(r)
 			continue
 		}
@@ -1694,7 +1729,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 			continue
 		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node)", r)
+			return nil, nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node, perf)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {
