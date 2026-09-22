@@ -25,6 +25,12 @@ jobs:
       # long timeout. actions/setup-go's caches keep warm runs fast.
       - run: go test -count=1 -timeout 600s ./...
       - run: go vet ./...
+      - name: build libtailcat and run its C smoke test
+        if: runner.os != 'Windows'
+        run: |
+          CGO_ENABLED=1 go build -buildmode=c-shared -o /tmp/libtailcat.so ./cmd/libtailcat
+          cc -Wall -Wextra -Werror -o /tmp/smoke cmd/libtailcat/testdata/smoke.c -Icmd/libtailcat /tmp/libtailcat.so
+          LD_LIBRARY_PATH=/tmp DYLD_LIBRARY_PATH=/tmp /tmp/smoke
   tidy:
     runs-on: ubuntu-latest
     steps:

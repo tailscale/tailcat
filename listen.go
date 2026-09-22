@@ -151,11 +151,28 @@ func (ln *listener) handle(c net.Conn) {
 // Accept waits for and returns the next connection. For UDP listeners, the
 // returned [net.Conn] is one client flow and also implements [ConnPacketConn].
 func (ln *listener) Accept() (net.Conn, error) {
+	return ln.AcceptContext(context.Background())
+}
+
+// ContextListener is a listener whose pending accepts can be cancelled without
+// closing the listener. Listeners returned by Server.Listen implement it.
+type ContextListener interface {
+	net.Listener
+	AcceptContext(context.Context) (net.Conn, error)
+}
+
+// AcceptContext waits for a connection, listener closure, or cancellation.
+func (ln *listener) AcceptContext(ctx context.Context) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case c := <-ln.conns:
 		return c, nil
 	case <-ln.closedc:
 		return nil, net.ErrClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
