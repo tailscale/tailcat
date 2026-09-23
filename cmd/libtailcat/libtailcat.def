@@ -1,0 +1,36 @@
+; Copyright (c) Tailscale Inc & contributors
+; SPDX-License-Identifier: BSD-3-Clause
+;
+; Module definition for libtailcat.dll: every function exported from
+; main.go, for building an MSVC import library without MinGW tools:
+;
+;   lib /def:libtailcat.def /machine:x64 /out:libtailcat.lib
+;
+; internal/capi/exports_test.go keeps this list in sync with main.go
+; and tailcat.h.
+LIBRARY libtailcat.dll
+EXPORTS
+tc_abi_version
+tc_address_parse
+tc_address_resolve
+tc_build_info
+tc_client_dial
+tc_client_disco_ping
+tc_client_new
+tc_client_ping
+tc_close
+tc_conn_close_write
+tc_conn_read
+tc_conn_readable
+tc_conn_write
+tc_drain
+tc_free
+tc_info
+tc_key_generate
+tc_listener_accept
+tc_server_allow_client
+tc_server_listen
+tc_server_new
+tc_server_start
+tc_token_cancel
+tc_token_new

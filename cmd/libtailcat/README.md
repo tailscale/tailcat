@@ -11,6 +11,35 @@ specified by `go.mod` are required. Production builds should use the tags in
 `build-tags.txt`. `tailcat.h` is the public ABI definition; the generated
 `libtailcat.h` is a build artifact. ABI version 1 is returned by `tc_abi_version`.
 
+## Windows
+
+cgo requires a GCC-compatible compiler, so the DLL is built with MinGW-w64 `gcc`
+(WinLibs, MSYS2, or Chocolatey's `mingw` package), which is also Go's default
+`CC` on Windows. MSVC cannot build the DLL but can consume it:
+
+```powershell
+$env:CGO_ENABLED = "1"
+go build -buildmode=c-shared -o build\libtailcat.dll .\cmd\libtailcat
+```
+
+The resulting DLL depends only on `kernel32` and the C runtime the toolchain
+targets (UCRT for current MinGW-w64 builds). Callers must be able to find it:
+place it next to the executable or on `PATH`. Loading it with `LoadLibrary`
+or an FFI layer such as ctypes or P/Invoke needs nothing else. MinGW links
+against the DLL directly (`gcc smoke.c build\libtailcat.dll`). MSVC needs an
+import library, built from the checked-in export list without any MinGW tools:
+
+```bat
+lib /def:cmd\libtailcat\libtailcat.def /machine:x64 /out:build\libtailcat.lib
+cl /W4 /Icmd\libtailcat smoke.c /link build\libtailcat.lib
+```
+
+`libtailcat.def` must list every function in `main.go`; `internal/capi` has a
+test that keeps it, `tailcat.h`, and the `//export` directives in sync. Memory
+returned by the library is allocated by the DLL's own C runtime, which is why
+it must be released with `tc_free` and never with the caller's `free`.
+CI builds the DLL with MinGW and links the smoke test with both toolchains.
+
 ## Ownership and errors
 
 All handles are opaque 64-bit integers. Zero is invalid as a resource handle;
