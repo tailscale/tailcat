@@ -1432,12 +1432,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}
 	}
 
-	// localDialer dials the local services that incoming connections
-	// are proxied to. Its resolver answers "localhost" itself with
-	// both loopback addresses; see the localhostdns package comment
-	// for why the OS resolver can't be trusted to (issue #108).
-	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
-
 	// tcpTarget returns the host:port a served TCP port is proxied
 	// to: its mapping's target if the serve spec gave one, else the
 	// same port on localhost.
@@ -1450,7 +1444,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 
 	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := localDialer.Dial("tcp", ipPortStr)
+			localConn, err := targetDialer(ipPortStr).Dial("tcp", ipPortStr)
 			if err != nil {
 				logf("error proxying to %v: %v", ipPortStr, err)
 				c.Close()
@@ -1643,6 +1637,23 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}()
 	}
 	select {}
+}
+
+// localDialer dials the local services that incoming connections are
+// proxied to. Its resolver answers "localhost" itself with both
+// loopback addresses; see the localhostdns package comment for why
+// the OS resolver can't be trusted to (issue #108).
+var localDialer = &net.Dialer{Resolver: localhostdns.Resolver}
+
+// targetDialer returns the dialer for proxying to target, a host:port.
+// Localhost names go through localDialer. Any other host, such as a
+// port mapping's "android.lan", needs the system resolver:
+// localhostdns.Resolver answers every name but localhost with NXDOMAIN.
+func targetDialer(target string) *net.Dialer {
+	if host, _, err := net.SplitHostPort(target); err == nil && localhostdns.IsLocalhost(host) {
+		return localDialer
+	}
+	return new(net.Dialer)
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
