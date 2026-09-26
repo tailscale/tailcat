@@ -112,11 +112,11 @@ func runServer(args []string) error {
 		return fmt.Errorf("resolving DERP region: %w", err)
 	}
 	s := &tailcat.Server{
-		Key:            conf.Private,
-		PresharedKey:   conf.Public.PresharedKey,
-		Region:         ci.Region[0],
-		AllowedClients: []key.NodePublic{clientKey},
-		Logf:           logger.WithPrefix(log.Printf, "[tailcat] "),
+		Key:          conf.Private,
+		PresharedKey: conf.Public.PresharedKey,
+		Region:       ci.Region[0],
+		AllowClient:  func(k key.NodePublic) bool { return k == clientKey },
+		Logf:         logger.WithPrefix(log.Printf, "[tailcat] "),
 	}
 	defer s.Close()
 	ln, err := s.Listen(ctx, "tcp", fmt.Sprintf(":%d", echoPort))
