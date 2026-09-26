@@ -565,9 +565,15 @@ const DefaultUDPIdleTimeout = 2 * time.Minute
 // It returns an error if the server was already started, including
 // implicitly by [Server.Listen].
 func (s *Server) Start() error {
+	return s.StartContext(context.Background())
+}
+
+// StartContext is Start with a context bounding relay discovery and startup.
+// Cancelling ctx after startup does not stop the server; use Close instead.
+func (s *Server) StartContext(ctx context.Context) error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
-	return s.startLocked(context.Background())
+	return s.startLocked(ctx)
 }
 
 // startLocked implements Start, with ctx bounding the startup network
