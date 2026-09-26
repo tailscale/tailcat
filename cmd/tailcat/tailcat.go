@@ -1419,17 +1419,18 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		s.ServedUDPPorts = []filter.PortRange{{First: perf.Port, Last: perf.Port}}
 	}
 	if *flagAllow != "" {
+		var allow tailcat.KeySet
 		for _, ks := range strings.Split(*flagAllow, ",") {
 			if ks == "none" {
-				s.AddAllowedClient(key.NodePublic{})
-				continue
+				continue // an empty set allows no clients
 			}
 			var k key.NodePublic
 			if err := k.UnmarshalText([]byte(ks)); err != nil {
 				log.Fatalf("invalid key %q in --allow: %v", ks, err)
 			}
-			s.AddAllowedClient(k)
+			allow.Add(k)
 		}
+		s.AllowClient = allow.Contains
 	}
 
 	// localDialer dials the local services that incoming connections

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Breaking Go API change:** `Server.AllowedClients` and
+  `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
+  hook, a `func(key.NodePublic) bool` asked about each client as it
+  connects, so a program embedding tailcat can decide at runtime, for
+  example from a database, instead of listing every key up front. A
+  nil hook allows all clients. The hook runs without any server lock
+  held, so it may block and may call other `Server` methods. For a
+  list of keys, the new `KeySet` type's `Contains` method is a
+  ready-made hook: `s.AllowClient = allow.Contains`. The new
+  `Server.DisconnectClient` drops a connected client; it does not
+  reset the client's connections, which stall instead. The `--allow`
+  flag is unchanged.
+  ([#119](https://github.com/tailscale/tailcat/issues/119) and
+  [#120](https://github.com/tailscale/tailcat/pull/120) by
+  [@jormenjanssen](https://github.com/jormenjanssen);
+  [#124](https://github.com/tailscale/tailcat/issues/124) and
+  [#125](https://github.com/tailscale/tailcat/pull/125) by
+  [@ybaelli](https://github.com/ybaelli))
 - New `tailcat perf` command and `perf` service run an iperf-like
   throughput and latency test between a client and a server, over
   TCP or UDP, in either or both directions, with one or more parallel
