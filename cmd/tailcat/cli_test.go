@@ -18,6 +18,7 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/internal/localhostdns"
 	"tailscale.com/tstest"
 )
 
@@ -653,6 +654,29 @@ func TestParsePortSetTargets(t *testing.T) {
 		}
 		if !maps.Equal(targets, tt.wantTargets) {
 			t.Errorf("parsePortSet(%q) targets = %v; want %v", tt.spec, targets, tt.wantTargets)
+		}
+	}
+}
+
+// TestTargetDialer checks that only localhost targets are dialed
+// through localhostdns.Resolver. It answers every other name with
+// NXDOMAIN, so a mapping to a LAN hostname like "5555:android.lan:5555"
+// could never connect through it.
+func TestTargetDialer(t *testing.T) {
+	for _, tt := range []struct {
+		target    string
+		wantLocal bool
+	}{
+		{"localhost:80", true},
+		{"LocalHost.:80", true},
+		{"app.localhost:80", true},
+		{"android.lan:5555", false},
+		{"db.example.com:5432", false},
+		{"notlocalhost:80", false},
+	} {
+		d := targetDialer(tt.target)
+		if gotLocal := d.Resolver == localhostdns.Resolver; gotLocal != tt.wantLocal {
+			t.Errorf("targetDialer(%q) uses localhostdns.Resolver = %v; want %v", tt.target, gotLocal, tt.wantLocal)
 		}
 	}
 }
