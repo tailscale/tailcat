@@ -1628,6 +1628,14 @@ func (lb *locoBackend) Start() error {
 	mc := lb.sys.MagicSock.Get()
 	lb.logf("disco pub key: %v", mc.DiscoPublicKey())
 
+	// Mark the network up before SetPrivateKey and SetDERPMap, which
+	// start endpoint updates in the background. With no non-loopback
+	// interface (as in the Nix build sandbox) magicsock starts with
+	// the network down, and an endpoint update that runs while it is
+	// still down skips netcheck and never picks a home DERP. A server
+	// then isn't reachable through DERP until the periodic re-STUN
+	// 20-26s later, long after clients give up.
+	mc.SetNetworkUp(true)
 	mc.SetPrivateKey(lb.priv)
 	mc.SetDERPMap(lb.dm)
 
@@ -1683,7 +1691,6 @@ func (lb *locoBackend) Start() error {
 	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
 	e.SetSelfNode(nm.SelfNode)
 	lb.sys.Netstack.Get().UpdateNetstackIPs(nm)
-	mc.SetNetworkUp(true)
 	lb.logf("NetworkMap: %v", logger.AsJSON(nm))
 
 	// Install the live per-peer config sources. WireGuard peers are
