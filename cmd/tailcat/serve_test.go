@@ -225,6 +225,34 @@ func TestServePorts(t *testing.T) {
 	}
 }
 
+// TestServeLogClients checks that --log-clients logs each connection, and only with the flag.
+func TestServeLogClients(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+
+	logRx := regexp.MustCompile(fmt.Sprintf(`client nodekey:[0-9a-f]{64} connected to tcp port %d \((direct \S+|relayed via DERP \S+|path unknown)\)`, port))
+	for _, logClients := range []bool{true, false} {
+		flags := []string{"serve", strconv.Itoa(int(port))}
+		if logClients {
+			flags = []string{"serve", "--log-clients", strconv.Itoa(int(port))}
+		}
+		_, addr, serverStderr := e.startServer(flags...)
+
+		const payload = "log me"
+		got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+		if err != nil {
+			t.Fatalf("client: %v", err)
+		}
+		if got != payload {
+			t.Errorf("echoed %q; want %q", got, payload)
+		}
+		if logged := logRx.MatchString(serverStderr.String()); logged != logClients {
+			t.Errorf("--log-clients=%v: logged connection = %v; server stderr:\n%s", logClients, logged, serverStderr.String())
+		}
+	}
+}
+
 // TestServeExitNode verifies that a --serve=exit-node server forwards
 // connections to arbitrary IP:port destinations, both for a plain
 // client given an IP:port argument and through the SOCKS5 proxy that
