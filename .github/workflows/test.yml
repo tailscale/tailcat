@@ -25,6 +25,28 @@ jobs:
       # long timeout. actions/setup-go's caches keep warm runs fast.
       - run: go test -count=1 -timeout 600s ./...
       - run: go vet ./...
+      - name: build libtailcat and run smoke test
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   lib=libtailcat.so    exe= ;;
+            macOS)   lib=libtailcat.dylib exe= ;;
+            Windows) lib=libtailcat.dll   exe=.exe ;;
+          esac
+          mkdir -p build
+          CGO_ENABLED=1 go build -buildmode=c-shared -o "build/$lib" ./cmd/libtailcat
+          gcc -Wall -Wextra -Werror -o "build/smoke$exe" cmd/libtailcat/testdata/smoke.c -Icmd/libtailcat "build/$lib"
+          LD_LIBRARY_PATH=build DYLD_LIBRARY_PATH=build "build/smoke$exe"
+      # MSVC cannot build the DLL itself, but it can link with it
+      - name: build and run MSVC libtailcat smoke test
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          lib /nologo /def:cmd\libtailcat\libtailcat.def /machine:x64 /out:build\libtailcat.lib || exit /b 1
+          cl /nologo /W4 /WX /Icmd\libtailcat /Fobuild\ /Febuild\smoke-msvc.exe cmd\libtailcat\testdata\smoke.c /link build\libtailcat.lib || exit /b 1
+          build\smoke-msvc.exe
   tidy:
     runs-on: ubuntu-latest
     steps:

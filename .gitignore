@@ -11,3 +11,6 @@
 # Go test artifacts.
 *.test
 *.out
+
+# libtailcat build output (see cmd/libtailcat/README.md).
+/build
