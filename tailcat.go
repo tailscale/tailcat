@@ -430,6 +430,11 @@ type Server struct {
 	// If nil, log.Printf is used.
 	Logf logger.Logf
 
+	// LogConnections reports accepted TCP connections and UDP flows, including
+	// their remote address, authenticated peer key, and destination. It is
+	// disabled by default; logs can reveal client and service addresses.
+	LogConnections bool
+
 	// Region, if non-nil, is the DERP region to use as the bootstrap
 	// relay, without fetching any DERP map.
 	Region *tailcfg.DERPRegion
@@ -697,15 +702,35 @@ func (s *Server) startLocked(ctx context.Context) error {
 	}
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
+	logIncoming := func(network string, c net.Conn) {
+		if !s.LogConnections {
+			return
+		}
+		peer, ok := s.PeerKey(c.RemoteAddr())
+		if !ok {
+			logf("incoming %s from %v (unknown peer key) to %v (server key %v)", network, c.RemoteAddr(), c.LocalAddr(), priv.Public())
+			return
+		}
+		logf("incoming %s from %v (peer key %v) to %v (server key %v)", network, c.RemoteAddr(), peer, c.LocalAddr(), priv.Public())
+	}
+	wrapTCP := func(h func(net.Conn)) func(net.Conn) {
+		if h == nil || !s.LogConnections {
+			return h
+		}
+		return func(c net.Conn) {
+			logIncoming("TCP", c)
+			h(c)
+		}
+	}
 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 		if dst.Addr() == lb.addr {
 			if ln := s.listenerForPort("tcp", dst.Port()); ln != nil {
-				return ln.handle, true
+				return wrapTCP(ln.handle), true
 			}
 			if s.OnTCP == nil {
 				return nil, true // send RST
 			}
-			return s.OnTCP(dst.Port()), true
+			return wrapTCP(s.OnTCP(dst.Port())), true
 		}
 		if s.OnTCPForward == nil {
 			return nil, true // send RST
@@ -716,7 +741,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 			copy(a4[:], d6[12:16])
 			dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
 		}
-		return s.OnTCPForward(dst), true
+		return wrapTCP(s.OnTCPForward(dst)), true
 	}
 	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
 		var h func(ConnPacketConn)
@@ -738,7 +763,11 @@ func (s *Server) startLocked(ctx context.Context) error {
 		if h == nil {
 			return nil, true
 		}
-		return func(c nettype.ConnPacketConn) { h(newIdlePacketConn(c, s.udpIdleTimeout())) }, true
+		return func(c nettype.ConnPacketConn) {
+			flow := newIdlePacketConn(c, s.udpIdleTimeout())
+			logIncoming("UDP", flow)
+			h(flow)
+		}, true
 	}
 	lb.ns = ns
 	sys.Set(ns)

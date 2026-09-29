@@ -21,7 +21,7 @@ import (
 func TestPerf(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t)
-	_, addr, serverStderr := e.startServer("serve", "perf")
+	_, addr, serverStderr := e.startServer("--verbose", "serve", "perf")
 	waitForLog(t, serverStderr, "Accepting perf tests")
 
 	perfCmd := func(t *testing.T, args ...string) []byte {
@@ -50,6 +50,7 @@ func TestPerf(t *testing.T) {
 			}
 		}
 		waitForLog(t, serverStderr, "# perf test from ")
+		waitForLog(t, serverStderr, "incoming TCP from ")
 		if !strings.Contains(serverStderr.String(), "TCP client -> server ") {
 			t.Errorf("server log missing test summary:\n%s", serverStderr.String())
 		}
@@ -95,6 +96,9 @@ func TestPerf(t *testing.T) {
 		}
 		if got.RTT == nil || got.RTT.Count == 0 {
 			t.Errorf("no RTT samples in %+v", got.Result)
+		}
+		if logs := serverStderr.String(); !strings.Contains(logs, "incoming UDP from ") || !strings.Contains(logs, "(peer key ") {
+			t.Errorf("verbose server did not log the UDP flow and peer key: %s", logs)
 		}
 	})
 }
