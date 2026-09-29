@@ -22,7 +22,7 @@ require (
 	golang.org/x/net v0.59.0
 	golang.org/x/sys v0.48.0
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
-	tailscale.com v1.103.0-pre.0.20260925230348-6b3a45f14ef6
+	tailscale.com v1.103.0-pre.0.20260929142145-a0e471a35b8f
 )
 
 require (

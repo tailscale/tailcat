@@ -42,14 +42,14 @@ func TestTags(t *testing.T) {
 			t.Errorf("ReleaseTags contains %q; see the comment in buildtags.go", notWant)
 		}
 	}
-	for _, notWant := range []string{"ts_omit_netstack", "ts_omit_ssh", "ts_omit_gro", "ts_omit_c2n", "ts_omit_dbus"} {
+	for _, notWant := range []string{"ts_omit_netstack", "ts_omit_ssh", "ts_omit_gro", "ts_omit_c2n", "ts_omit_dbus", "ts_omit_udptransport", "ts_omit_nattraversal"} {
 		if release[notWant] {
 			t.Errorf("ReleaseTags contains %q; that feature must stay linked in release builds", notWant)
 		}
 	}
 
 	wasm := tagSet(t, WasmTags())
-	for _, want := range []string{"ts_omit_ssh", "ts_omit_gro"} {
+	for _, want := range []string{"ts_omit_ssh", "ts_omit_gro", "ts_omit_udptransport", "ts_omit_nattraversal"} {
 		if !wasm[want] {
 			t.Errorf("WasmTags missing %q", want)
 		}
