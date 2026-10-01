@@ -51,6 +51,7 @@ func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
 // sends a command, it is run by the user's shell (PowerShell on
 // Windows); otherwise an interactive login shell is started with a
 // PTY. The SFTP subsystem is served per opts.Files; see [SSHOptions].
+// Local TCP forwarding is also allowed to the server's loopback IP addresses.
 // With opts.Exec, every session instead runs that one command, and
 // nothing else is offered.
 func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
@@ -86,11 +87,21 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 			subsystems["sftp"] = h
 		}
 		srv := &ssh.Server{
-			Handler:           handler,
-			PublicKeyHandler:  publicKeyHandler,
-			ChannelHandlers:   map[string]ssh.ChannelHandler{"session": ssh.DefaultSessionHandler},
+			Handler:          handler,
+			PublicKeyHandler: publicKeyHandler,
+			ChannelHandlers: map[string]ssh.ChannelHandler{
+				"session":      ssh.DefaultSessionHandler,
+				"direct-tcpip": ssh.DirectTCPIPHandler,
+			},
 			RequestHandlers:   map[string]ssh.RequestHandler{},
 			SubsystemHandlers: subsystems,
+			LocalPortForwardingCallback: func(ctx ssh.Context, host string, port uint32) bool {
+				// File-only and forced-command services must not grant access
+				// to other local services. Shell users already have that access.
+				// Require IP literals so forwarding never depends on DNS resolution.
+				return opts.Shell && port > 0 && port <= 65535 &&
+					net.ParseIP(host).IsLoopback()
+			},
 		}
 		if publicKeyHandler == nil {
 			srv.NoClientAuthHandler = func(ctx ssh.Context) error { return nil }
