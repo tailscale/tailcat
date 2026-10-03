@@ -1420,7 +1420,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	if *flagAllow != "" {
 		var allow tailcat.KeySet
-		for _, ks := range strings.Split(*flagAllow, ",") {
+		for ks := range strings.SplitSeq(*flagAllow, ",") {
 			if ks == "none" {
 				continue // an empty set allows no clients
 			}
@@ -1699,7 +1699,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 	targets = map[uint16]string{}
 	s = strings.TrimSpace(s)
 
-	for _, r := range strings.Split(s, ",") {
+	for r := range strings.SplitSeq(s, ",") {
 		r = strings.TrimSpace(r)
 		switch r {
 		case "all":
