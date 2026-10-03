@@ -191,6 +191,7 @@ func probePath(ctx context.Context, cl *tailcat.Client) (pathInfo, error) {
 // discovery along.
 func waitForDirectPath(ctx context.Context, cl *tailcat.Client, timeout time.Duration) (pathInfo, error) {
 	deadline := time.Now().Add(timeout)
+	var last *pathInfo
 	for {
 		t0 := time.Now()
 		pingCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -198,6 +199,9 @@ func waitForDirectPath(ctx context.Context, cl *tailcat.Client, timeout time.Dur
 		cancel()
 		if err != nil {
 			if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				if last != nil {
+					return *last, nil
+				}
 				return pathInfo{}, fmt.Errorf("no reply to pings after %v", timeout)
 			}
 			return pathInfo{}, err
@@ -205,6 +209,7 @@ func waitForDirectPath(ctx context.Context, cl *tailcat.Client, timeout time.Dur
 		if p.Direct || time.Until(deadline) < time.Second/2 {
 			return p, nil
 		}
+		last = &p
 		select {
 		case <-ctx.Done():
 			return pathInfo{}, ctx.Err()
