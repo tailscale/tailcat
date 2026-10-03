@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,33 @@ func TestPerf(t *testing.T) {
 		}
 		if got.RTT == nil || got.RTT.Count == 0 {
 			t.Errorf("no RTT samples in %+v", got.Result)
+		}
+	})
+
+	// A path that stays relayed must still come back from the wait for
+	// a direct path, whatever --timeout is. Whole seconds used to fail:
+	// the last once-a-second ping saw about 1s left, slept past the
+	// deadline, and reported "no reply to pings".
+	t.Run("relayed", func(t *testing.T) {
+		relayedPerf := func(args ...string) ([]byte, error) {
+			all := append([]string{"--key=new", "--derpmap-url=" + e.derpMapURL, "perf", "--timeout=2s", "--time=1s", "--interval=0"}, args...)
+			all = append(all, addr)
+			cmd := e.cmd(all...)
+			cmd.Env = append(slices.Clone(cmd.Env), "TS_DEBUG_ALWAYS_USE_DERP=1")
+			return cmd.CombinedOutput()
+		}
+
+		out, err := relayedPerf("--via-derp")
+		if err != nil {
+			t.Fatalf("perf --via-derp: %v\n%s", err, out)
+		}
+		if !regexp.MustCompile(`(?m)^# path: relayed via DERP\(`).Match(out) {
+			t.Errorf("output missing relayed path:\n%s", out)
+		}
+
+		out, err = relayedPerf()
+		if err == nil || !strings.Contains(string(out), "no direct path to the server") {
+			t.Errorf("perf without --via-derp: err=%v, want a no-direct-path refusal:\n%s", err, out)
 		}
 	})
 }
