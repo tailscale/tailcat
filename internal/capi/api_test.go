@@ -6,10 +6,13 @@ package capi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"runtime"
 	"testing"
 	"time"
+
+	"tailscale.com/types/key"
 )
 
 func testToken(t *testing.T, timeout time.Duration) Handle {
@@ -134,5 +137,53 @@ func TestInvalidConfigurationDoesNotEchoSecrets(t *testing.T) {
 	_, err = NewServer(`{"key":"secret-key"}`)
 	if err == nil || err.Error() != "invalid argument: invalid private key" {
 		t.Fatalf("new server: %v", err)
+	}
+}
+
+// TestAllowClientKeepsAllowlistSemantics checks that the C API keeps
+// its allowlist semantics on top of [tailcat.Server.AllowClient]: an
+// empty list admits any client, and adding a key restricts admission.
+func TestAllowClientKeepsAllowlistSemantics(t *testing.T) {
+	k1, k2, k3 := key.NewNode().Public(), key.NewNode().Public(), key.NewNode().Public()
+	admits := func(h Handle, k key.NodePublic) bool {
+		t.Helper()
+		var ok bool
+		if err := use[*server](h, NoCancel, func(ctx context.Context, e *entry, s *server) error {
+			ok = s.server.AllowClient(k)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+
+	open, err := NewServer(`{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close(open)
+	if !admits(open, k1) {
+		t.Errorf("server with empty allowlist rejected a client")
+	}
+	if err := AllowClient(open, NoCancel, k1.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !admits(open, k1) || admits(open, k2) {
+		t.Errorf("after adding k1: admits k1, k2 = %v, %v; want true, false", admits(open, k1), admits(open, k2))
+	}
+
+	listed, err := NewServer(fmt.Sprintf(`{"allowed_clients":[%q]}`, k1.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Close(listed)
+	if !admits(listed, k1) || admits(listed, k2) {
+		t.Errorf("configured with k1: admits k1, k2 = %v, %v; want true, false", admits(listed, k1), admits(listed, k2))
+	}
+	if err := AllowClient(listed, NoCancel, k3.String()); err != nil {
+		t.Fatal(err)
+	}
+	if !admits(listed, k3) {
+		t.Errorf("added k3 not admitted")
 	}
 }

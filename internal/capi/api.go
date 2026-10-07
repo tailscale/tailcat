@@ -47,10 +47,25 @@ type client struct {
 	ready  atomic.Bool
 }
 
+// allowed and restricted back the server's AllowClient hook. The C API
+// keeps the old allowlist semantics: an empty list admits any client,
+// and the first key added restricts admission to the listed keys.
 type server struct {
-	server  *tailcat.Server
-	gate    gate
-	started bool
+	server     *tailcat.Server
+	gate       gate
+	started    bool
+	allowed    tailcat.KeySet
+	restricted atomic.Bool
+}
+
+func (s *server) allowClient(k key.NodePublic) bool {
+	return !s.restricted.Load() || s.allowed.Contains(k)
+}
+
+// allow adds k to the allowlist and restricts admission to the list.
+func (s *server) allow(k key.NodePublic) {
+	s.allowed.Add(k)
+	s.restricted.Store(true)
 }
 
 type listener struct {
@@ -229,14 +244,16 @@ func NewServer(config string) (Handle, error) {
 		return 0, fmt.Errorf("%w: invalid UDP idle timeout", ErrArgument)
 	}
 	s := &tailcat.Server{Key: k, PresharedKey: psk, Region: cfg.Region, RegionID: cfg.RegionID, DERPMapURL: cfg.DERPMapURL, Logf: logger.Discard, UDPIdleTimeout: time.Duration(cfg.UDPIdleTimeout * float64(time.Second))}
+	srv := &server{server: s, gate: newGate()}
+	s.AllowClient = srv.allowClient
 	for _, text := range cfg.AllowedClients {
 		var pub key.NodePublic
 		if err := pub.UnmarshalText([]byte(text)); err != nil || pub.IsZero() {
 			return 0, fmt.Errorf("%w: invalid allowed client key", ErrArgument)
 		}
-		s.AllowedClients = append(s.AllowedClients, pub)
+		srv.allow(pub)
 	}
-	return register(&server{server: s, gate: newGate()}, 0)
+	return register(srv, 0)
 }
 
 func publishConnection(ctx context.Context, parent Handle, conn net.Conn, network int) (Handle, error) {
@@ -508,15 +525,7 @@ func AllowClient(id, token Handle, text string) error {
 		return ErrArgument
 	}
 	return use[*server](id, token, func(ctx context.Context, e *entry, s *server) error {
-		if err := s.gate.lock(ctx); err != nil {
-			return err
-		}
-		defer s.gate.unlock()
-		if !s.started {
-			s.server.AllowedClients = append(s.server.AllowedClients, pub)
-		} else {
-			s.server.AddAllowedClient(pub)
-		}
+		s.allow(pub)
 		return nil
 	})
 }
