@@ -366,6 +366,20 @@ Act as an exit node so the client can reach the server's network:
 $ tailcat serve exit-node
 ```
 
+The SOCKS proxy resolves other destination hostnames locally by default and
+reaches the resulting IPs through the exit node. To resolve them on the exit
+node's side instead, list DNS servers with `--dns` (or the `TAILCAT_SOCKS_DNS`
+environment variable). They're queried over TCP through the exit node, in order,
+moving on when one can't be reached or fails to answer. That resolves names that
+exist only on the exit node's network, such as intranet names, and works on
+hosts whose local DNS can't be used, such as ones that answer with fake IPs for
+a transparent proxy. The local hosts file still applies first, and `localhost`
+always means loopback.
+
+```sh
+$ tailcat socks --dns=10.0.0.53,1.1.1.1 <tc-addr> curl http://intranet.example/
+```
+
 Parse a tailcat address and print its contents (the server's WireGuard
 public key and DERP info) as JSON, without connecting to anything:
 
