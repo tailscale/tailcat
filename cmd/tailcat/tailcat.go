@@ -1440,14 +1440,18 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if t, ok := targets[port]; ok {
 			return t
 		}
-		return fmt.Sprintf("localhost:%v", port)
+		return net.JoinHostPort("localhost", strconv.Itoa(int(port)))
 	}
 
-	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
+	// tcpForwardTo returns a handler that proxies a connection to
+	// hostPort. That is an IP:port for exit node traffic, but a served
+	// port's target (see tcpTarget) is "localhost:port" or a mapping's
+	// host:port, whose host can be a name such as "android.lan".
+	tcpForwardTo := func(hostPort string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := targetDialer(ipPortStr).Dial("tcp", ipPortStr)
+			localConn, err := targetDialer(hostPort).Dial("tcp", hostPort)
 			if err != nil {
-				logf("error proxying to %v: %v", ipPortStr, err)
+				logf("error proxying to %v: %v", hostPort, err)
 				c.Close()
 				return
 			}
@@ -1543,7 +1547,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1572,7 +1576,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if !portSet.Contains(port) {
 			return nil // RST
 		}
-		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
 	}
 
 	if err := s.Start(); err != nil {
