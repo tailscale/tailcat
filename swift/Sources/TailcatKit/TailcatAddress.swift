@@ -47,7 +47,7 @@ public struct TailcatAddress: Sendable, Hashable, Codable, RawRepresentable, Cus
     /// Creates an address from its text. Only the "tc" prefix is checked
     /// here; parse() validates the rest.
     public init?(rawValue: String) {
-        guard rawValue.hasPrefix("tc"), rawValue.count > 2 else { return nil }
+        guard rawValue.hasPrefix("tc"), rawValue.count > 2, !rawValue.utf8.contains(0) else { return nil }
         self.rawValue = rawValue
     }
 
@@ -69,64 +69,33 @@ public struct TailcatAddress: Sendable, Hashable, Codable, RawRepresentable, Cus
         try container.encode(rawValue)
     }
 
-    /// Decodes the address without touching the network (tailcat_addr_parse,
-    /// the same as "tailcat parse"). Throws TailcatError.invalidAddress for a
-    /// malformed address.
+    /// Parses public metadata locally. The JSON omits the pre-shared key.
     public func parse() throws -> AddressInfo {
-        var out: UnsafeMutablePointer<CChar>? = nil
-        let err = rawValue.withCString { tailcat_addr_parse($0, &out) }
-        if let message = CStrings.take(err) {
-            free(out)
+        do {
+            let json = try rawValue.withCInput { input in
+                try CAPI.string { tc_address_parse(input, $0, $1) }
+            }
+            return try AddressInfo(json: Data(json.utf8))
+        } catch TailcatError.invalidArgument(let message) {
             throw TailcatError.invalidAddress(message)
         }
-        guard let json = CStrings.takeData(out) else {
-            throw TailcatError.internalError("tailcat_addr_parse returned no JSON")
-        }
-        return try AddressInfo(json: json)
     }
 
-    /// Returns the self-contained form of the address, with the relay's
-    /// details embedded so clients need no DERP map fetch (the same as
-    /// "tailcat resolve"). An address that already embeds them comes back
-    /// unchanged. The DERP map is fetched from derpMapURL, or the default
-    /// map when nil. The work runs off the Swift concurrency threads. The
-    /// timeout is rounded up to whole milliseconds; zero means no limit
-    /// beyond the fetch's own. Throws TailcatError.invalidAddress for a
-    /// malformed address, TailcatError.timeout when time runs out, and
-    /// otherwise the fetch's error, such as
-    /// TailcatError.posix(ECONNREFUSED, _) or TailcatError.internalError.
-    public func resolved(derpMapURL: URL? = nil, timeout: Duration = .seconds(10)) async throws -> TailcatAddress {
-        let address = rawValue
-        let url = derpMapURL?.absoluteString
-        let ms = timeout.millisecondsForC
-        let resolved: String = try await Blocking.run {
-            var out: UnsafeMutablePointer<CChar>? = nil
-            let err = address.withCString { a -> UnsafeMutablePointer<CChar>? in
-                if let url {
-                    return url.withCString { tailcat_addr_resolve(a, $0, ms, &out) }
+    /// Embeds relay details, fetching the relay map if needed. Swift task
+    /// cancellation interrupts the lookup without freeing its buffers early.
+    public func resolved(derpMapURL: URL? = nil, timeout: Duration? = .seconds(10)) async throws -> TailcatAddress {
+        _ = try parse()
+        return try await Blocking.run(timeout: timeout) { token in
+            let text = try rawValue.withCInput { address in
+                try (derpMapURL?.absoluteString ?? "").withCInput { url in
+                    try CAPI.string { tc_address_resolve(token, address, url, $0, $1) }
                 }
-                return tailcat_addr_resolve(a, nil, ms, &out)
             }
-            if let message = CStrings.take(err) {
-                free(out)
-                // Resolving fails either because the address is malformed,
-                // which parse() detects offline, or because the DERP map
-                // could not be fetched, which says nothing about the
-                // address.
-                if (try? self.parse()) == nil {
-                    throw TailcatError.invalidAddress(message)
-                }
-                throw TailcatError.classify(message: message)
+            guard let result = TailcatAddress(rawValue: text) else {
+                throw TailcatError.internalError("C API returned an invalid address")
             }
-            guard let text = CStrings.take(out) else {
-                throw TailcatError.internalError("tailcat_addr_resolve returned no address")
-            }
-            return text
+            return result
         }
-        guard let result = TailcatAddress(rawValue: resolved) else {
-            throw TailcatError.internalError("tailcat_addr_resolve returned an unexpected address")
-        }
-        return result
     }
 }
 
@@ -140,10 +109,10 @@ public struct AddressInfo: Sendable, Hashable {
     /// The hostnames of the relays embedded in the address, in order; empty
     /// when the address references a region by ID.
     public let relayHosts: [String]
-    /// The full decoded address as JSON, the output of "tailcat parse".
+    /// The full decoded address as JSON, public metadata from the C API.
     public let json: Data
 
-    /// Decodes the JSON of tailcat_addr_parse.
+    /// Decodes the JSON of tc_address_parse.
     init(json: Data) throws {
         let raw: RawAddress
         do {
@@ -171,9 +140,9 @@ public struct AddressInfo: Sendable, Hashable {
         var region: [RawRegion]?
 
         enum CodingKeys: String, CodingKey {
-            case serverPublic = "ServerPublic"
-            case regionID = "RegionID"
-            case region = "Region"
+            case serverPublic = "public_key"
+            case regionID = "region_id"
+            case region = "regions"
         }
     }
 

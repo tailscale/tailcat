@@ -4,200 +4,102 @@
 import CTailcat
 import Foundation
 
-/// A tailcat client: given a server's tailcat address, it pings the
-/// server and dials TCP ports on it.
-///
-/// Nothing happens on the network until the first ping, path or connect,
-/// which brings the tunnel up (resolving the relay, connecting to it and
-/// registering with the server). Those calls run off the Swift
-/// concurrency threads.
 public actor TailcatClient {
-    /// The server's tailcat address.
     public nonisolated let address: TailcatAddress
-
-    private var handle: Int32
+    private let handle: Handle
     private let logger: any LogSink
 
-    /// Creates a client for the server named by address (tailcat_client_new),
-    /// with an optional identity (so the server can allow it by public
-    /// key; ephemeral otherwise) and DERP map URL (used when the address
-    /// references a region by ID). Throws TailcatError.invalidAddress for a
-    /// malformed address.
-    public init(address: TailcatAddress, identity: Identity? = nil, derpMapURL: URL? = nil, logger: any LogSink = BlackholeLogger()) throws {
-        let h = address.rawValue.withCString { tailcat_client_new($0) }
-        guard h != 0 else {
-            var message = "malformed address"
-            do {
-                _ = try address.parse()
-            } catch TailcatError.invalidAddress(let text) {
-                message = text
-            } catch {}
-            throw TailcatError.invalidAddress(message)
+    /// Creates a client without network access. The first ping/dial starts it.
+    public init(address: TailcatAddress, identity: Identity? = nil, derpMapURL: URL? = nil,
+                logger: any LogSink = BlackholeLogger()) throws {
+        _ = try address.parse()
+        var config = ["address": address.rawValue]
+        if let identity { config["key"] = identity.privateKey }
+        if let derpMapURL { config["derp_map_url"] = derpMapURL.absoluteString }
+        let json = String(decoding: try JSONEncoder().encode(config), as: UTF8.self)
+        var raw: UInt64 = 0
+        try json.withCInput { input in
+            try CAPI.check { tc_client_new(input, &raw, $0) }
         }
-        do {
-            try TailcatError.check(tailcat_set_logfd(h, logger.logFileDescriptor ?? -1), handle: h)
-            if let identity {
-                try TailcatError.check(identity.json.withCString { tailcat_client_set_key(h, $0) }, handle: h)
-            }
-            if let derpMapURL {
-                try TailcatError.check(derpMapURL.absoluteString.withCString { tailcat_client_set_derpmap_url(h, $0) }, handle: h)
-            }
-        } catch {
-            _ = tailcat_client_close(h)
-            throw error
-        }
+        self.handle = Handle(raw)
         self.address = address
-        self.handle = h
         self.logger = logger
+        logger.log("TailcatClient: created")
     }
 
-    deinit {
-        if handle != 0 {
-            _ = tailcat_client_close(handle)
-        }
-    }
-
-    /// The client's node public key, "nodekey:<hex>": that of the
-    /// identity given at init, or else of the ephemeral key generated
-    /// then. Give it to the server's allow(_:). It never blocks, not even
-    /// while a ping or connect is bringing the client up.
     public var publicKey: NodePublicKey {
-        get throws {
-            let h = try activeHandle()
-            var buf = [CChar](repeating: 0, count: 128)
-            try TailcatError.check(buf.withUnsafeMutableBufferPointer { tailcat_client_public_key(h, $0.baseAddress, $0.count) }, handle: h)
-            guard let key = NodePublicKey(rawValue: CStrings.string(buf)) else {
-                throw TailcatError.internalError("unexpected client public key format")
+        get async throws {
+            let raw = try handle.value()
+            return try await Blocking.run { token in
+                let info = try CAPI.info(raw, token)
+                guard let text = info.publicKey, let key = NodePublicKey(rawValue: text) else {
+                    throw TailcatError.internalError("client info contained no public key")
+                }
+                return key
             }
-            return key
         }
     }
 
-    /// Checks that the server is reachable and accepts this client, and
-    /// returns the relay round trip (tailcat_client_ping, off-thread).
-    /// The probe is resent every second until acknowledged or the timeout
-    /// expires, so a ping right after the server started succeeds as soon
-    /// as the server is on its relay; a server that does not allow this
-    /// client never answers, which shows up as TailcatError.timeout. The
-    /// timeout is rounded up to whole milliseconds; zero means no limit
-    /// beyond tailcat's own.
-    public func ping(timeout: Duration = .seconds(10)) async throws -> Duration {
-        let h = try activeHandle()
-        let ms = timeout.millisecondsForC
-        let latencyMs: Double = try await Blocking.run {
-            var latency = 0.0
-            try TailcatError.check(tailcat_client_ping(h, ms, &latency), handle: h)
-            return latency
+    /// Measures relay round-trip latency. Zero is valid (sub-millisecond RTT).
+    public func ping(timeout: Duration? = .seconds(10)) async throws -> Duration {
+        let raw = try handle.value()
+        return try await Blocking.run(timeout: timeout) { token in
+            var latency: Int32 = 0
+            try CAPI.check { tc_client_ping(raw, token, &latency, $0) }
+            return .milliseconds(latency)
         }
-        return .milliseconds(latencyMs)
     }
 
-    /// Reports how packets reach the server (tailcat_client_path_json,
-    /// off-thread): a direct path, or the relay carrying them. Calling it
-    /// repeatedly nudges direct path discovery along. The timeout is
-    /// rounded up to whole milliseconds; zero means no limit beyond
-    /// tailcat's own.
-    public func path(timeout: Duration = .seconds(10)) async throws -> PathInfo {
-        let h = try activeHandle()
-        let ms = timeout.millisecondsForC
-        let json: Data = try await Blocking.run {
-            var out: UnsafeMutablePointer<CChar>? = nil
-            try TailcatError.check(tailcat_client_path_json(h, ms, &out), handle: h)
-            guard let json = CStrings.takeData(out) else {
-                throw TailcatError.internalError("tailcat_client_path_json returned no JSON")
-            }
-            return json
+    public func path(timeout: Duration? = .seconds(10)) async throws -> PathInfo {
+        let raw = try handle.value()
+        return try await Blocking.run(timeout: timeout) { token in
+            let json = try CAPI.string { tc_client_disco_ping(raw, token, $0, $1) }
+            return try PathInfo(json: Data(json.utf8))
         }
-        return try PathInfo(json: json)
     }
 
-    /// Opens a TCP connection to port on the server (tailcat_client_dial,
-    /// off-thread). Throws TailcatError.invalidPort for port 0 and
-    /// TailcatError.posix(ECONNREFUSED, _) when nothing listens on the
-    /// port. The timeout is rounded up to whole milliseconds; zero means
-    /// no limit beyond tailcat's own.
-    public func connect(port: UInt16, timeout: Duration = .seconds(15)) async throws -> Connection {
-        guard port != 0 else {
-            throw TailcatError.invalidPort
+    public func connect(port: UInt16, timeout: Duration? = .seconds(15)) async throws -> Connection {
+        guard port != 0 else { throw TailcatError.invalidPort }
+        let raw = try handle.value()
+        return try await Blocking.run(timeout: timeout) { token in
+            var connection: UInt64 = 0
+            try CAPI.check { tc_client_dial(raw, token, port, Int32(TC_TCP), &connection, $0) }
+            return try Connection.adopt(connection, token: token)
         }
-        let h = try activeHandle()
-        let ms = timeout.millisecondsForC
-        let fd: Int32 = try await Blocking.run {
-            var fd: Int32 = -1
-            try TailcatError.check(tailcat_client_dial(h, Int32(port), ms, &fd), handle: h)
-            guard fd >= 0 else {
-                throw TailcatError.internalError("tailcat_client_dial returned no connection")
-            }
-            return fd
-        }
-        logger.log("TailcatClient: connected to port \(port)")
-        return Connection(fd: fd, remoteAddress: nil, localPort: nil)
     }
 
-    /// Shuts the client down: connections opened through it are closed
-    /// on the Go side (their reads see EOF; the Connection objects still
-    /// own their descriptors until closed), the tunnel is torn down and
-    /// the handle is freed. Idempotent; deinit calls it.
-    public func close() {
-        guard handle != 0 else { return }
-        let h = handle
-        handle = 0
-        _ = tailcat_client_close(h)
+    public func drain(timeout: Duration = .seconds(5)) async throws {
+        let raw = try handle.value()
+        try await Blocking.run(timeout: timeout) { token in
+            try CAPI.check { tc_drain(raw, token, $0) }
+        }
+    }
+
+    /// Closes the client and its connections and waits for pending C calls.
+    public func close() async {
+        await handle.close()
         logger.log("TailcatClient: closed")
-    }
-
-    private func activeHandle() throws -> Int32 {
-        guard handle != 0 else {
-            throw TailcatError.closed
-        }
-        return handle
     }
 }
 
-/// How a client's packets reach the server, from TailcatClient.path.
 public struct PathInfo: Sendable, Hashable {
-    /// Whether the probe came back over a direct (peer-to-peer) path.
     public let isDirect: Bool
-    /// The direct path's "ip:port", when isDirect.
     public let endpoint: String?
-    /// The code of the DERP region relaying the packets, when not direct.
     public let relayRegionCode: String?
-    /// The probe's round trip.
     public let latency: Duration
-    /// The full result, the JSON encoding of ipnstate.PingResult.
     public let json: Data
 
-    /// Decodes the JSON of tailcat_client_path_json.
     init(json: Data) throws {
-        let raw: RawResult
-        do {
-            raw = try JSONDecoder().decode(RawResult.self, from: json)
-        } catch {
-            throw TailcatError.internalError("decoding path JSON: \(error)")
+        struct Result: Decodable {
+            var latency: Double
+            var endpoint: String
+            var derp_region_code: String
         }
-        if let err = raw.err, !err.isEmpty {
-            throw TailcatError.internalError(err)
-        }
-        let endpoint = (raw.endpoint ?? "").isEmpty ? nil : raw.endpoint
-        self.isDirect = endpoint != nil
-        self.endpoint = endpoint
-        let code = (raw.derpRegionCode ?? "").isEmpty ? nil : raw.derpRegionCode
-        self.relayRegionCode = endpoint == nil ? code : nil
-        self.latency = .seconds(raw.latencySeconds ?? 0)
+        let raw = try JSONDecoder().decode(Result.self, from: json)
+        endpoint = raw.endpoint.isEmpty ? nil : raw.endpoint
+        isDirect = endpoint != nil
+        relayRegionCode = isDirect || raw.derp_region_code.isEmpty ? nil : raw.derp_region_code
+        latency = .seconds(raw.latency)
         self.json = json
-    }
-
-    private struct RawResult: Decodable {
-        var err: String?
-        var latencySeconds: Double?
-        var endpoint: String?
-        var derpRegionCode: String?
-
-        enum CodingKeys: String, CodingKey {
-            case err = "Err"
-            case latencySeconds = "LatencySeconds"
-            case endpoint = "Endpoint"
-            case derpRegionCode = "DERPRegionCode"
-        }
     }
 }

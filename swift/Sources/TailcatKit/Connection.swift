@@ -2,300 +2,140 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import CTailcat
-import Dispatch
 import Foundation
 import os
 
-/// A TCP connection through the tunnel: one accepted by a Listener or one
-/// opened by TailcatClient.connect.
-///
-/// The connection is one end of a socketpair pumped by the Go side. It is
-/// driven by DispatchIO, so reads and writes never block a Swift
-/// concurrency thread. Reads deliver whatever has arrived (up to
-/// maxLength) as soon as anything has; the Go side applies TCP
-/// backpressure once the socket buffer and one read's worth of internal
-/// buffering are full. One receive (or incoming stream consumer) at a
-/// time; sends may overlap with receives.
+/// A TCP stream backed by an opaque C handle. One receive and one send can run
+/// concurrently. Overlapping receives, or overlapping sends/closeWrite calls,
+/// are rejected so logical sends cannot interleave and cancellation never waits
+/// behind another Swift operation. Await send before calling closeWrite.
 public final class Connection: Sendable {
-    /// The peer's address as "ip:port"; nil for connections opened by
-    /// TailcatClient.connect.
     public let remoteAddress: String?
-    /// The server port the peer dialed; nil for connections opened by
-    /// TailcatClient.connect.
+    public let localAddress: String?
     public let localPort: UInt16?
-
-    private let fd: Int32
-    private let queue: DispatchQueue
-    private let io: DispatchIO
-    private let state: OSAllocatedUnfairLock<State>
+    private let handle: Handle
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     private struct State: Sendable {
-        var closed = false
-        var writeClosed = false
-        /// Bytes read but not yet handed to a receiver.
-        var buffer = Data()
-        var eof = false
-        var readError: TailcatError?
-        /// Whether a DispatchIO read is outstanding, and its bookkeeping:
-        /// an operation that ends without error before delivering what it
-        /// asked for hit EOF.
         var reading = false
-        var readRequested = 0
-        var readDelivered = 0
-        /// The receive waiting for data, if any, with the serial of the
-        /// receive() call that registered it, so that a cancellation
-        /// handler acts only on its own registration.
-        var receiver: CheckedContinuation<Data, any Error>?
-        var receiverMax = 0
-        var receiverSerial: UInt64 = 0
-        var lastSerial: UInt64 = 0
+        var writing = false
+        var eof = false
+        var pendingError: (any Error)?
     }
 
-    /// Wraps the descriptor, which the connection now owns and closes
-    /// exactly once.
-    init(fd: Int32, remoteAddress: String?, localPort: UInt16?) {
-        self.fd = fd
-        self.remoteAddress = remoteAddress
-        self.localPort = localPort
-        self.state = OSAllocatedUnfairLock(initialState: State())
-        let queue = DispatchQueue(label: "dev.tailcat.connection")
-        self.queue = queue
-        self.io = DispatchIO(type: .stream, fileDescriptor: fd, queue: queue) { _ in
-            // Runs once the channel is closed and every operation on it
-            // has finished: the one moment the descriptor is no longer in
-            // use, and the only place it is closed.
-            _ = Darwin.close(fd)
-        }
-        // Deliver reads as soon as any byte is available rather than
-        // waiting for a full chunk.
-        io.setLimit(lowWater: 1)
+    private init(handle: Handle, info: ResourceInfo) {
+        self.handle = handle
+        self.remoteAddress = info.remoteAddress
+        self.localAddress = info.localAddress
+        self.localPort = info.localPort
     }
 
-    deinit {
-        close()
-    }
-
-    /// Sends data, returning once it has been handed to the tunnel (the
-    /// Go side forwards it as the peer accepts it). Throws
-    /// TailcatError.closed when the connection is closed, or
-    /// TailcatError.posix for a write error such as EPIPE after the peer
-    /// went away. Task cancellation does not interrupt a send in
-    /// progress.
-    public func send(_ data: Data) async throws {
-        try state.withLock { s in
-            if s.closed {
-                throw TailcatError.closed
-            }
-        }
-        if data.isEmpty {
-            return
-        }
-        let chunk = data.withUnsafeBytes { DispatchData(bytes: $0) }
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            io.write(offset: 0, data: chunk, queue: queue) { [weak self] done, _, error in
-                guard done else { return }
-                if error == 0 {
-                    continuation.resume()
-                } else {
-                    continuation.resume(throwing: self?.ioError(error) ?? TailcatError.closed)
-                }
-            }
+    /// Called on a C worker. Metadata lookup can fail after a successful dial or
+    /// accept, so that failure must still release the newly returned handle.
+    static func adopt(_ raw: UInt64, token: UInt64) throws -> Connection {
+        do {
+            let info = try CAPI.info(raw, token)
+            return Connection(handle: Handle(raw), info: info)
+        } catch {
+            _ = tc_close(raw, nil)
+            throw error
         }
     }
 
-    /// Receives up to maxLength bytes, returning as soon as any are
-    /// available. Returns empty Data at EOF (the peer closed or
-    /// half-closed its side). Throws TailcatError.closed once the
-    /// connection is closed, and CancellationError if the task is
-    /// cancelled while waiting; data arriving meanwhile is kept for the
-    /// next receive.
-    public func receive(maxLength: Int = 65_536) async throws -> Data {
-        guard maxLength > 0 else {
-            throw TailcatError.internalError("receive needs a positive maxLength")
-        }
+    /// Returns available bytes up to maxLength, or empty Data at TCP EOF.
+    /// Cancellation/timeout leaves the connection usable. Bytes returned with
+    /// an error are delivered first; the next receive reports that error.
+    public func receive(maxLength: Int = 65_536, timeout: Duration? = nil) async throws -> Data {
+        guard maxLength > 0 else { throw TailcatError.invalidArgument("maxLength must be positive") }
+        let raw = try handle.value()
         try Task.checkCancellation()
-        let serial = state.withLock { s -> UInt64 in
-            s.lastSerial += 1
-            return s.lastSerial
+        try state.withLock { state in
+            guard !state.reading else { throw TailcatError.invalidArgument("a receive is already in progress") }
+            state.reading = true
         }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, any Error>) in
-                enum Action {
-                    case resume(Data)
-                    case fail(any Error)
-                    case wait(startRead: Bool)
+        defer { state.withLock { $0.reading = false } }
+        return try await Blocking.run(timeout: timeout) { [state] token in
+            let eof = try state.withLock { state in
+                if let error = state.pendingError {
+                    state.pendingError = nil
+                    throw error
                 }
-                let action: Action = state.withLock { s in
-                    if s.closed {
-                        return .fail(TailcatError.closed)
-                    }
-                    if !s.buffer.isEmpty {
-                        return .resume(Self.take(&s, maxLength))
-                    }
-                    if let error = s.readError {
-                        return .fail(error)
-                    }
-                    if s.eof {
-                        return .resume(Data())
-                    }
-                    if s.receiver != nil {
-                        return .fail(TailcatError.internalError("a receive is already in progress"))
-                    }
-                    // A cancellation that landed before this point ran the
-                    // handler with nothing registered yet; checking under
-                    // the lock closes that window, since any later one
-                    // finds the registration.
-                    if Task.isCancelled {
-                        return .fail(CancellationError())
-                    }
-                    s.receiver = continuation
-                    s.receiverMax = maxLength
-                    s.receiverSerial = serial
-                    if s.reading {
-                        return .wait(startRead: false)
-                    }
-                    s.reading = true
-                    s.readRequested = maxLength
-                    s.readDelivered = 0
-                    return .wait(startRead: true)
-                }
-                switch action {
-                case .resume(let data):
-                    continuation.resume(returning: data)
-                case .fail(let error):
-                    continuation.resume(throwing: error)
-                case .wait(let startRead):
-                    if startRead {
-                        self.startRead(length: maxLength)
-                    }
-                }
+                return state.eof
             }
-        } onCancel: {
-            // Only this call's registration: another receive may be the
-            // one waiting.
-            let receiver = state.withLock { s -> CheckedContinuation<Data, any Error>? in
-                guard s.receiverSerial == serial, let r = s.receiver else {
-                    return nil
-                }
-                s.receiver = nil
-                return r
+            if eof { return Data() }
+            var data = Data(count: maxLength)
+            var count = 0
+            var message: UnsafeMutablePointer<CChar>?
+            let status = data.withUnsafeMutableBytes {
+                tc_conn_read(raw, token, $0.baseAddress, $0.count, &count, &message)
             }
-            receiver?.resume(throwing: CancellationError())
+            let text = CAPI.take(message)
+            let error = status == TC_EOF ? nil : CAPI.error(status, text)
+            if status == TC_EOF { state.withLock { $0.eof = true } }
+            if count > 0 {
+                data.count = count
+                state.withLock { $0.pendingError = error }
+                return data
+            }
+            if let error { throw error }
+            return Data()
         }
     }
 
-    /// The bytes the peer sends, as they arrive, until EOF. Pull-based:
-    /// each step is one receive(), so it applies backpressure and stops
-    /// when the consuming task is cancelled. Single consumer.
+    /// Sends all bytes under one deadline. A failure after any bytes were sent
+    /// throws PartialWriteError with their count; cancellation cannot undo them.
+    public func send(_ data: Data, timeout: Duration? = nil) async throws {
+        let raw = try handle.value()
+        try beginWrite()
+        defer { state.withLock { $0.writing = false } }
+        try await Blocking.run(timeout: timeout) { token in
+            var written = 0
+            do {
+                try data.withUnsafeBytes { bytes in
+                    while written < bytes.count {
+                        var count = 0
+                        var message: UnsafeMutablePointer<CChar>?
+                        let status = tc_conn_write(raw, token,
+                            UnsafeMutableRawPointer(mutating: bytes.baseAddress!.advanced(by: written)),
+                            bytes.count - written, &count, &message)
+                        written += count
+                        if let error = CAPI.error(status, CAPI.take(message)) { throw error }
+                        guard count > 0 else { throw TailcatError.internalError("C write made no progress") }
+                    }
+                }
+            } catch {
+                if written > 0 { throw PartialWriteError(bytesWritten: written, underlyingError: error) }
+                throw error
+            }
+        }
+    }
+
+    /// Sends FIN, retaining the ability to receive a reply. Await prior sends
+    /// first; overlapping write operations throw invalidArgument.
+    public func closeWrite(timeout: Duration? = nil) async throws {
+        let raw = try handle.value()
+        try beginWrite()
+        defer { state.withLock { $0.writing = false } }
+        try await Blocking.run(timeout: timeout) { token in
+            try CAPI.check { tc_conn_close_write(raw, token, $0) }
+        }
+    }
+
+    private func beginWrite() throws {
+        try Task.checkCancellation()
+        try state.withLock { state in
+            guard !state.writing else { throw TailcatError.invalidArgument("a write is already in progress") }
+            state.writing = true
+        }
+    }
+
     public var incoming: AsyncThrowingStream<Data, any Error> {
         AsyncThrowingStream(unfolding: { [self] in
-            let chunk = try await self.receive()
-            return chunk.isEmpty ? nil : chunk
+            let data = try await receive()
+            return data.isEmpty ? nil : data
         })
     }
 
-    /// Half-closes the connection for writing (shutdown(2) with SHUT_WR):
-    /// the peer's reads see EOF once it has read everything sent, while
-    /// its writes still arrive here. Idempotent.
-    public func closeWrite() {
-        state.withLock { s in
-            guard !s.closed, !s.writeClosed else { return }
-            s.writeClosed = true
-            // Under the lock so the descriptor cannot be closed meanwhile.
-            _ = Darwin.shutdown(fd, SHUT_WR)
-        }
-    }
-
-    /// Closes the connection: outstanding operations end with
-    /// TailcatError.closed, the Go side tears the tunnel connection down,
-    /// and the descriptor is closed once DispatchIO is done with it.
-    /// Idempotent; deinit calls it.
-    public func close() {
-        let (first, receiver) = state.withLock { s -> (Bool, CheckedContinuation<Data, any Error>?) in
-            if s.closed {
-                return (false, nil)
-            }
-            s.closed = true
-            let r = s.receiver
-            s.receiver = nil
-            return (true, r)
-        }
-        guard first else { return }
-        io.close(flags: .stop)
-        receiver?.resume(throwing: TailcatError.closed)
-    }
-
-    private func startRead(length: Int) {
-        io.read(offset: 0, length: length, queue: queue) { [weak self] done, data, error in
-            self?.handleRead(done: done, data: data, error: error)
-        }
-    }
-
-    private func handleRead(done: Bool, data: DispatchData?, error: Int32) {
-        typealias Resume = (CheckedContinuation<Data, any Error>, Result<Data, TailcatError>)
-        let (resume, restart): (Resume?, Int?) = state.withLock { s in
-            if let data, !data.isEmpty {
-                for region in data.regions {
-                    region.withUnsafeBytes { s.buffer.append(contentsOf: $0) }
-                }
-                s.readDelivered += data.count
-            }
-            if done {
-                s.reading = false
-                if error != 0 {
-                    s.readError = error == ECANCELED || s.closed ? .closed : TailcatError.posix(error)
-                } else if s.readDelivered < s.readRequested {
-                    s.eof = true
-                }
-            }
-            guard let receiver = s.receiver else {
-                return (nil, nil)
-            }
-            if !s.buffer.isEmpty {
-                s.receiver = nil
-                return ((receiver, .success(Self.take(&s, s.receiverMax))), nil)
-            }
-            if let readError = s.readError {
-                s.receiver = nil
-                return ((receiver, .failure(readError)), nil)
-            }
-            if s.eof {
-                s.receiver = nil
-                return ((receiver, .success(Data())), nil)
-            }
-            if !s.reading && !s.closed {
-                // The operation ended without anything for the waiting
-                // receiver (it completed its length in an earlier
-                // delivery); read again on its behalf.
-                s.reading = true
-                s.readRequested = s.receiverMax
-                s.readDelivered = 0
-                return (nil, s.receiverMax)
-            }
-            return (nil, nil)
-        }
-        if let restart {
-            startRead(length: restart)
-        }
-        if let (receiver, result) = resume {
-            receiver.resume(with: result.mapError { $0 as any Error })
-        }
-    }
-
-    /// Removes and returns up to max bytes from the buffer.
-    private static func take(_ s: inout State, _ max: Int) -> Data {
-        let n = Swift.min(max, s.buffer.count)
-        let out = Data(s.buffer.prefix(n))
-        s.buffer.removeFirst(n)
-        return out
-    }
-
-    /// Maps a DispatchIO error code.
-    private func ioError(_ error: Int32) -> TailcatError {
-        if error == ECANCELED {
-            return .closed
-        }
-        let closed = state.withLock { $0.closed }
-        return closed ? .closed : TailcatError.posix(error)
-    }
+    /// Interrupts pending reads/writes and waits for teardown off-thread.
+    public func close() async { await handle.close() }
 }

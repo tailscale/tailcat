@@ -15,6 +15,7 @@ import (
 // find a direct localhost path, the same mechanism "tailcat ping
 // --until-direct" users rely on to verify NAT traversal.
 func TestPing(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	_, addr, _ := e.startServer()
 

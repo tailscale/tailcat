@@ -6,6 +6,7 @@ import TailcatKit
 import XCTest
 
 /// Offline tests of TailcatAddress, AddressInfo and NodePublicKey.
+@MainActor
 final class AddressTests: XCTestCase {
     /// The address in the README, referencing DERP region 302.
     static let readmeAddress = "tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu"
@@ -22,8 +23,8 @@ final class AddressTests: XCTestCase {
         XCTAssertEqual(info.regionID, 302)
         XCTAssertEqual(info.relayHosts, [])
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: info.json) as? [String: Any])
-        XCTAssertEqual(json["RegionID"] as? Int, 302)
-        XCTAssertEqual(json["ServerPublic"] as? String, Self.readmeKey)
+        XCTAssertEqual(json["region_id"] as? Int, 302)
+        XCTAssertEqual(json["public_key"] as? String, Self.readmeKey)
     }
 
     func testParseResolvedAddress() throws {
@@ -86,8 +87,8 @@ final class AddressTests: XCTestCase {
         } catch TailcatError.invalidAddress(let message) {
             XCTFail("a network failure was reported as an invalid address: \(message)")
         } catch let error as TailcatError {
-            if case .posix(let code, _) = error {
-                XCTAssertEqual(code, ECONNREFUSED)
+            guard case .internalError = error else {
+                return XCTFail("unexpected network error: \(error)")
             }
         }
         // A malformed address is invalid whatever the map.

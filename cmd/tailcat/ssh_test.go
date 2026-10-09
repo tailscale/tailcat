@@ -28,7 +28,7 @@ func TestSSHRejectsInvalidAddr(t *testing.T) {
 		{"invalid CBOR", "tc" + base64.RawURLEncoding.EncodeToString([]byte("not CBOR")), "CBOR unmarshal"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			err := clientSSHMode("22", []string{tt.addr})
+			err := clientSSHMode("22", false, []string{tt.addr})
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("clientSSHMode(%q) error = %v; want an error containing %q", tt.addr, err, tt.wantErr)
 			}

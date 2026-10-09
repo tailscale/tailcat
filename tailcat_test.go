@@ -4,8 +4,10 @@
 package tailcat
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,20 +15,237 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/wireguard-go/device"
 	"go4.org/mem"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"tailscale.com/envknob"
+	"tailscale.com/net/netcheck"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 )
+
+// TestMain keeps the tests hermetic: engines under test must not
+// touch the real network. The test binary links tailscale.com
+// features that the tailcat library and the released binary omit
+// (build-tags.txt strips them via ts_omit_portmapper and
+// ts_omit_captiveportal), and untagged builds of those features probe
+// the real world during every full netcheck:
+//
+//   - The portmapper sends UPnP/NAT-PMP/PCP queries to the machine's
+//     default gateway, and netcheck blocks its report on the probe
+//     finishing. Home routers can take over a second to answer, which
+//     delayed the engine's DERP connection and made every
+//     engine-starting test that much slower. IN_TS_TEST is
+//     magicsock's own knob for skipping it (netcheck's
+//     SkipExternalNetwork).
+//
+//   - Captive portal detection makes HTTP requests to detection
+//     endpoints across the machine's interfaces, and netcheck also
+//     blocks its report on it. The hook stub reports "done, no
+//     captive portal" immediately.
+func TestMain(m *testing.M) {
+	envknob.Setenv("IN_TS_TEST", "true")
+	netcheck.HookStartCaptivePortalDetection.SetForTest(func(ctx context.Context, c *netcheck.Client, dm *tailcfg.DERPMap, preferredDERP tailcfg.DERPRegionID, setCaptivePortal func(bool)) (done <-chan struct{}, stop func()) {
+		return syncs.ClosedChan(), func() {}
+	})
+	os.Exit(m.Run())
+}
+
+const testNICID = 1
+
+func newTestTCPStack(t *testing.T, addr tcpip.Address) (*stack.Stack, *channel.Endpoint) {
+	t.Helper()
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	})
+	ep := channel.New(16, 1500, "")
+	if err := s.CreateNIC(testNICID, ep); err != nil {
+		t.Fatalf("CreateNIC: %v", err)
+	}
+	if err := s.AddProtocolAddress(testNICID, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: addr.WithPrefix(),
+	}, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress: %v", err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: testNICID}})
+	t.Cleanup(func() {
+		ep.Close()
+		s.Close()
+		s.Wait()
+	})
+	return s, ep
+}
+
+func relayTestPackets(ctx context.Context, src, dst *channel.Endpoint, packet func(*stack.PacketBuffer) bool) {
+	for {
+		pkt := src.ReadContext(ctx)
+		if pkt == nil {
+			return
+		}
+		forward := packet == nil || packet(pkt)
+		if forward {
+			in := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: pkt.ToBuffer()})
+			dst.InjectInbound(pkt.NetworkProtocolNumber, in)
+			in.DecRef()
+		}
+		pkt.DecRef()
+	}
+}
+
+func testPacketTCPFlags(pkt *stack.PacketBuffer) header.TCPFlags {
+	v := pkt.ToView()
+	defer v.Release()
+	ip := header.IPv4(v.AsSlice())
+	if ip.TransportProtocol() != tcp.ProtocolNumber {
+		return 0
+	}
+	return header.TCP(ip[ip.HeaderLength():]).Flags()
+}
+
+type testTCPStateEndpoint interface {
+	tcpStateEndpoint
+	LockUser()
+	UnlockUser()
+}
+
+func checkTestTCPState(t *testing.T, c *gonet.TCPConn, want tcp.EndpointState) {
+	t.Helper()
+	ep, _ := gonetTCPConnInternals(c)
+	lep := ep.(testTCPStateEndpoint)
+	lep.LockUser()
+	got := tcp.EndpointState(ep.State())
+	lep.UnlockUser()
+	if got != want {
+		t.Fatalf("TCP state = %v; want %v", got, want)
+	}
+}
+
+func TestCloseProxyConnRetransmitsFIN(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	clientAddr := tcpip.AddrFrom4([4]byte{192, 0, 2, 1})
+	serverAddr := tcpip.AddrFrom4([4]byte{192, 0, 2, 2})
+	clientStack, clientLink := newTestTCPStack(t, clientAddr)
+	serverStack, serverLink := newTestTCPStack(t, serverAddr)
+
+	go relayTestPackets(ctx, clientLink, serverLink, nil)
+	firstServerFIN := make(chan struct{})
+	secondServerFIN := make(chan struct{})
+	finCount := 0
+	go relayTestPackets(ctx, serverLink, clientLink, func(pkt *stack.PacketBuffer) bool {
+		if testPacketTCPFlags(pkt)&header.TCPFlagFin == 0 {
+			return true
+		}
+		finCount++
+		switch finCount {
+		case 1:
+			close(firstServerFIN)
+			return false
+		case 2:
+			close(secondServerFIN)
+		}
+		return true
+	})
+
+	ln, err := gonet.ListenTCP(serverStack, tcpip.FullAddress{
+		NIC:  testNICID,
+		Addr: serverAddr,
+		Port: 1234,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("ListenTCP: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan *gonet.TCPConn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c.(*gonet.TCPConn)
+	}()
+	client, err := gonet.DialTCP(clientStack, tcpip.FullAddress{
+		NIC:  testNICID,
+		Addr: serverAddr,
+		Port: 1234,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialTCP: %v", err)
+	}
+	defer client.Close()
+	server := <-accepted
+
+	// Put the server in LAST-ACK: first receive the client's FIN, then send
+	// the server FIN. The packet relay deliberately drops that first FIN.
+	if err := client.CloseWrite(); err != nil {
+		t.Fatalf("client CloseWrite: %v", err)
+	}
+	if _, err := io.Copy(io.Discard, server); err != nil {
+		t.Fatalf("server read to EOF: %v", err)
+	}
+	checkTestTCPState(t, server, tcp.StateCloseWait)
+	if err := server.CloseWrite(); err != nil {
+		t.Fatalf("server CloseWrite: %v", err)
+	}
+	select {
+	case <-firstServerFIN:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not send its first FIN")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		closeProxyConnTimeout(server, time.Second)
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("closeProxyConn returned before the dropped FIN was retransmitted")
+	case <-time.After(50 * time.Millisecond):
+	}
+	select {
+	case <-secondServerFIN:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not retransmit its FIN")
+	}
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("client SetReadDeadline: %v", err)
+	}
+	if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("client read after retransmitted FIN = %d, %v; want 0, EOF", n, err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		sep, _ := gonetTCPConnInternals(server)
+		cep, _ := gonetTCPConnInternals(client)
+		t.Logf("states: server=%v client=%v", tcp.EndpointState(sep.State()), tcp.EndpointState(cep.State()))
+		t.Fatal("closeProxyConn did not return after the retransmitted FIN was acknowledged")
+	}
+}
 
 func mkLogger(t testing.TB, name string) logger.Logf {
 	return func(format string, args ...any) {
@@ -72,12 +291,34 @@ func TestTailcat(t *testing.T) {
 	}
 	// Start with a non-matching allowlist entry so the first ping can verify
 	// that disallowed clients get no acknowledgement.
-	s.AddAllowedClient(key.NewNode().Public())
+	var allow KeySet
+	allow.Add(key.NewNode().Public())
+	s.AllowClient = allow.Contains
 
 	if err := s.Start(); err != nil {
 		t.Fatalf("server Start: %v", err)
 	}
 	t.Logf("server: %v", s.TailcatAddr())
+
+	// Even an explicitly allowed client that knows the server's public keys
+	// cannot establish a tunnel without the PSK from the real address.
+	badInfo, err := ParseAddr(s.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for badInfo.PresharedKey.Equal(s.lb.presharedKey) {
+		badInfo.PresharedKey = NewPresharedKey()
+	}
+	bad := &Client{Server: badInfo.Addr(), Logf: mkLogger(t, "wrong-psk-client")}
+	allow.Add(bad.PublicKey())
+	PingForTest(t, s, bad) // the pre-WireGuard discovery handshake still works
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if conn, err := bad.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("client with wrong pre-shared key established a tunnel")
+	}
+	cancel()
+	bad.Close()
 
 	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
 	t.Cleanup(func() { c.Close() })
@@ -85,12 +326,12 @@ func TestTailcat(t *testing.T) {
 	t.Logf("Client is %v", c.PublicKey())
 
 	WaitForDERPForTest(t, s, c)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
 	if _, err := c.Ping(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Ping from disallowed client = %v; want context deadline exceeded", err)
 	}
 	cancel()
-	s.AddAllowedClient(c.PublicKey())
+	allow.Add(c.PublicKey())
 
 	pi := PingForTest(t, s, c)
 	t.Logf("got ping: %+v", pi)
@@ -113,6 +354,664 @@ func TestTailcat(t *testing.T) {
 		t.Fatalf("DialTCP = %v, %v", conn, err)
 	}
 
+}
+
+// TestStatusReportsPeers checks that Server.Status reports connected clients.
+func TestStatusReportsPeers(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	var allow KeySet
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: reg, AllowClient: allow.Contains}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	allow.Add(c.PublicKey())
+
+	// A successful ping means the server has fully added us as a peer.
+	PingForTest(t, s, c)
+
+	st := s.Status()
+	ps, ok := st.Peer[c.PublicKey()]
+	if !ok {
+		t.Fatalf("Status().Peer has no entry for client %v; got %d peer(s)", c.PublicKey(), len(st.Peer))
+	}
+	// The path may still be settling, so wait for CurAddr or Relay to show up.
+	deadline := time.Now().Add(10 * time.Second)
+	for ps.CurAddr == "" && ps.Relay == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("peer status has neither CurAddr nor Relay: %v", logger.AsJSON(ps))
+		}
+		time.Sleep(10 * time.Millisecond)
+		if ps, ok = s.Status().Peer[c.PublicKey()]; !ok {
+			t.Fatalf("client %v disappeared from Status().Peer", c.PublicKey())
+		}
+	}
+	t.Logf("peer %v: CurAddr=%q Relay=%q", c.PublicKey(), ps.CurAddr, ps.Relay)
+}
+
+// pingRejectedForTest checks that the server never acknowledges c's
+// meow: a disallowed client gets no reply, so Ping must run out its
+// context deadline rather than fail fast.
+func pingRejectedForTest(t testing.TB, s *Server, c *Client) {
+	t.Helper()
+	WaitForDERPForTest(t, s, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := c.Ping(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Ping from disallowed client = %v; want context deadline exceeded", err)
+	}
+}
+
+// TestAllowClient checks that Server.AllowClient admits and rejects
+// clients, is asked once per admission rather than on every meow,
+// and may block and call back into the Server without deadlocking.
+func TestAllowClient(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	approved := key.NewNode()
+	rejected := key.NewNode()
+	slow := key.NewNode()
+
+	var (
+		mu       sync.Mutex
+		calls    = map[key.NodePublic]int{}
+		inFlight = map[key.NodePublic]bool{}
+	)
+	var s *Server
+	s = &Server{
+		Logf:   mkLogger(t, "server"),
+		Region: reg,
+		AllowClient: func(k key.NodePublic) bool {
+			mu.Lock()
+			calls[k]++
+			if inFlight[k] {
+				t.Errorf("concurrent AllowClient calls for %v", k)
+			}
+			inFlight[k] = true
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				defer mu.Unlock()
+				inFlight[k] = false
+			}()
+			if k == slow.Public() {
+				// Outlast a meow retry, so a second meow arrives
+				// while this one is pending, and take the backend
+				// lock via Status to prove the hook runs without it.
+				time.Sleep(1500 * time.Millisecond)
+				s.Status()
+			}
+			return k != rejected.Public()
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	newClient := func(name string, k key.NodePrivate) *Client {
+		c := &Client{Server: s.TailcatAddr(), Key: k, Logf: mkLogger(t, name)}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	callsFor := func(k key.NodePublic) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls[k]
+	}
+
+	// An approved key is admitted, and once connected the client's
+	// later pings are acknowledged without asking again.
+	approvedClient := newClient("approved", approved)
+	PingForTest(t, s, approvedClient)
+	PingForTest(t, s, approvedClient)
+	if n := callsFor(approved.Public()); n != 1 {
+		t.Errorf("AllowClient called %d times for the approved key; want 1", n)
+	}
+
+	// A rejected key gets no reply, but the hook was consulted.
+	pingRejectedForTest(t, s, newClient("rejected", rejected))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for callsFor(rejected.Public()) < 1 {
+		select {
+		case <-ctx.Done():
+			t.Fatal("AllowClient never called for the rejected key")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	// A slow hook delays only its own client, which is still admitted.
+	// Meows arriving while the hook is pending are dropped rather than
+	// starting a second call.
+	PingForTest(t, s, newClient("slow", slow))
+	if n := callsFor(slow.Public()); n != 1 {
+		t.Errorf("AllowClient called %d times for the slow key; want 1", n)
+	}
+}
+
+// TestDisconnectClient checks that dropping a connected client
+// removes it from the server and stops its traffic, while leaving
+// other clients untouched.
+func TestDisconnectClient(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	var allow KeySet
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: reg, AllowClient: allow.Contains}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		if port != 80 {
+			return nil
+		}
+		return func(c net.Conn) {
+			io.WriteString(c, "hello\n")
+			c.Close()
+		}
+	}
+	if s.DisconnectClient(key.NewNode().Public()) {
+		t.Error("DisconnectClient before Start reported a connected client")
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	revokedKey := key.NewNode()
+	revoked := &Client{Server: s.TailcatAddr(), Key: revokedKey, Logf: mkLogger(t, "revoked")}
+	t.Cleanup(func() { revoked.Close() })
+	kept := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "kept")}
+	t.Cleanup(func() { kept.Close() })
+	allow.Add(revoked.PublicKey())
+	allow.Add(kept.PublicKey())
+
+	PingForTest(t, s, revoked)
+	PingForTest(t, s, kept)
+	if _, ok := s.Status().Peer[revoked.PublicKey()]; !ok {
+		t.Fatal("revoked client not a peer before removal")
+	}
+
+	// Revoke: stop admitting the key, then drop the live client.
+	allow.Remove(revoked.PublicKey())
+	if !s.DisconnectClient(revoked.PublicKey()) {
+		t.Fatal("DisconnectClient reported the revoked client as not connected")
+	}
+	if s.DisconnectClient(revoked.PublicKey()) {
+		t.Fatal("second DisconnectClient reported the revoked client as still connected")
+	}
+
+	if _, ok := s.Status().Peer[revoked.PublicKey()]; ok {
+		t.Fatal("revoked client still reported as a peer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if conn, err := revoked.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("revoked client dialed the server after removal")
+	}
+	cancel()
+
+	// A fresh client presenting the revoked key is ignored at the meow.
+	again := &Client{Server: s.TailcatAddr(), Key: revokedKey, Logf: mkLogger(t, "again")}
+	t.Cleanup(func() { again.Close() })
+	pingRejectedForTest(t, s, again)
+
+	// The other client is unaffected.
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := kept.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatalf("kept client DialTCPPort = %v", err)
+	}
+	if got, _ := io.ReadAll(conn); string(got) != "hello\n" {
+		t.Fatalf("kept client read %q; want %q", got, "hello\n")
+	}
+}
+
+func TestUDP(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	type flow struct {
+		local, remote netip.AddrPort
+	}
+	flows := make(chan flow, 2)
+	handlerErr := make(chan error, 2)
+	var onUDPCalls atomic.Int32
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDP = func(port uint16) func(ConnPacketConn) {
+		onUDPCalls.Add(1)
+		if port != 53 {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			defer c.Close()
+			local, err := netip.ParseAddrPort(c.LocalAddr().String())
+			if err != nil {
+				handlerErr <- err
+				return
+			}
+			remote, err := netip.ParseAddrPort(c.RemoteAddr().String())
+			if err != nil {
+				handlerErr <- err
+				return
+			}
+			flows <- flow{local, remote}
+			for range 2 {
+				buf := make([]byte, 65535)
+				n, err := c.Read(buf)
+				if err != nil {
+					handlerErr <- err
+					return
+				}
+				if _, err := c.Write(buf[:n]); err != nil {
+					handlerErr <- err
+					return
+				}
+			}
+			handlerErr <- nil
+		}
+	}
+	s.ServedUDPPorts = []filter.PortRange{{First: 53, Last: 53}}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	clients := []*Client{
+		{Server: s.ConnBlob(), Logf: mkLogger(t, "client1")},
+		{Server: s.ConnBlob(), Logf: mkLogger(t, "client2")},
+	}
+	for _, c := range clients {
+		t.Cleanup(func() { c.Close() })
+		PingForTest(t, s, c)
+		pc, err := c.DialUDPPort(t.Context(), 53)
+		if err != nil {
+			t.Fatalf("DialUDPPort: %v", err)
+		}
+		defer pc.Close()
+		if err := pc.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		// MaxUDPPayload is the largest datagram that fits Tailcat's 1280-byte
+		// IPv6 tunnel MTU without fragmentation.
+		for _, payload := range [][]byte{[]byte("small datagram"), bytes.Repeat([]byte("m"), MaxUDPPayload)} {
+			if n, err := pc.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("UDP Write = %d, %v; want %d, nil", n, err, len(payload))
+			}
+			got := make([]byte, len(payload)+1)
+			n, err := pc.Read(got)
+			if err != nil {
+				t.Fatalf("UDP Read: %v", err)
+			}
+			if !bytes.Equal(got[:n], payload) {
+				t.Fatalf("UDP echo = %d bytes; want %d-byte datagram", n, len(payload))
+			}
+		}
+		gotFlow := <-flows
+		if gotFlow.local != netip.AddrPortFrom(s.Addr(), 53) {
+			t.Errorf("server flow local address = %v; want %v:53", gotFlow.local, s.Addr())
+		}
+		clientLocal, err := netip.ParseAddrPort(pc.LocalAddr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotFlow.remote != clientLocal {
+			t.Errorf("server flow remote address = %v; want client %v", gotFlow.remote, clientLocal)
+		}
+		if err := <-handlerErr; err != nil {
+			t.Fatalf("UDP handler: %v", err)
+		}
+	}
+
+	// Dialing a filtered UDP port creates a local socket immediately, but its
+	// datagrams must be silently dropped before reaching OnUDP.
+	pc, err := clients[0].DialUDPPort(t.Context(), 54)
+	if err != nil {
+		t.Fatalf("DialUDPPort(54): %v", err)
+	}
+	defer pc.Close()
+	pc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := pc.Write([]byte("drop me")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := pc.Read(make([]byte, 32)); err == nil {
+		t.Fatalf("filtered UDP read = %d, nil; want timeout", n)
+	} else if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("filtered UDP read error = %v; want timeout", err)
+	}
+	if got := onUDPCalls.Load(); got != int32(len(clients)) {
+		t.Fatalf("OnUDP called %d times; want %d served flows and no filtered flow", got, len(clients))
+	}
+}
+
+func TestUDPForward(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	backend, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := backend.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := backend.WriteToUDP(buf[:n], src); err != nil {
+				return
+			}
+		}
+	}()
+	backendAddr := backend.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDPForward = func(dst netip.AddrPort) func(ConnPacketConn) {
+		if dst != backendAddr {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			upstream, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				c.Close()
+				return
+			}
+			ProxyPacketConns(c, upstream)
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	forwarded, err := c.DialUDP(t.Context(), backendAddr)
+	if err != nil {
+		t.Fatalf("DialUDP(%v): %v", backendAddr, err)
+	}
+	defer forwarded.Close()
+	forwarded.SetDeadline(time.Now().Add(5 * time.Second))
+	const payload = "forwarded datagram"
+	if _, err := forwarded.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := forwarded.Read(buf)
+	if err != nil {
+		t.Fatalf("reading forwarded UDP echo: %v", err)
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Fatalf("forwarded UDP echo = %q; want %q", got, payload)
+	}
+}
+
+func TestUDPIdleTimeout(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	handlerStarted := make(chan struct{})
+	handlerDone := make(chan error, 1)
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 50 * time.Millisecond,
+		OnUDP: func(port uint16) func(ConnPacketConn) {
+			if port != 53 {
+				return nil
+			}
+			return func(c ConnPacketConn) {
+				defer c.Close()
+				close(handlerStarted)
+				buf := make([]byte, 1)
+				if _, err := c.Read(buf); err != nil {
+					handlerDone <- err
+					return
+				}
+				_, err := c.Read(buf)
+				handlerDone <- err
+			}
+		},
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handlerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP handler did not start")
+	}
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("UDP flow ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP flow did not time out")
+	}
+}
+
+func TestServerRejectsNegativeUDPIdleTimeout(t *testing.T) {
+	s := &Server{UDPIdleTimeout: -time.Second}
+	if err := s.Start(); err == nil {
+		t.Fatal("Server.Start succeeded with a negative UDP idle timeout")
+	}
+}
+
+func TestUDPIdleTimeoutDefault(t *testing.T) {
+	if got := (&Server{}).udpIdleTimeout(); got != DefaultUDPIdleTimeout {
+		t.Fatalf("zero UDPIdleTimeout = %v; want DefaultUDPIdleTimeout %v", got, DefaultUDPIdleTimeout)
+	}
+	const custom = 5 * time.Second
+	if got := (&Server{UDPIdleTimeout: custom}).udpIdleTimeout(); got != custom {
+		t.Fatalf("custom UDPIdleTimeout = %v; want %v", got, custom)
+	}
+}
+
+func TestUDPForwardIdleTimeout(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	backend, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, src, err := backend.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if _, err := backend.WriteToUDP(buf[:n], src); err != nil {
+				return
+			}
+		}
+	}()
+	backendAddr := backend.LocalAddr().(*net.UDPAddr).AddrPort()
+
+	handlerDone := make(chan struct{})
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 50 * time.Millisecond,
+	}
+	t.Cleanup(func() { s.Close() })
+	s.OnUDPForward = func(dst netip.AddrPort) func(ConnPacketConn) {
+		if dst != backendAddr {
+			return nil
+		}
+		return func(c ConnPacketConn) {
+			defer close(handlerDone)
+			upstream, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				c.Close()
+				return
+			}
+			ProxyPacketConns(c, upstream)
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	forwarded, err := c.DialUDP(t.Context(), backendAddr)
+	if err != nil {
+		t.Fatalf("DialUDP(%v): %v", backendAddr, err)
+	}
+	defer forwarded.Close()
+	if err := forwarded.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	const payload = "forwarded datagram"
+	if _, err := forwarded.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64)
+	n, err := forwarded.Read(buf)
+	if err != nil {
+		t.Fatalf("reading forwarded UDP echo: %v", err)
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Fatalf("forwarded UDP echo = %q; want %q", got, payload)
+	}
+	// Now go idle: the server-side forward flow must time out and the
+	// ProxyPacketConns handler must return.
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forwarded UDP flow did not time out")
+	}
+}
+
+func TestUDPIdleTimeoutReset(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	handlerDone := make(chan error, 1)
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		UDPIdleTimeout: 200 * time.Millisecond,
+		OnUDP: func(port uint16) func(ConnPacketConn) {
+			if port != 53 {
+				return nil
+			}
+			return func(c ConnPacketConn) {
+				defer c.Close()
+				buf := make([]byte, 32)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						handlerDone <- err
+						return
+					}
+					if _, err := c.Write(buf[:n]); err != nil {
+						handlerDone <- err
+						return
+					}
+				}
+			}
+		},
+	}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.ConnBlob(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if err := pc.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Each exchange resets the 200ms idle timer; the flow must survive
+	// well past the original deadline as long as activity continues.
+	for i := range 4 {
+		msg := []byte{byte('a' + i)}
+		if _, err := pc.Write(msg); err != nil {
+			t.Fatalf("UDP Write %d: %v", i, err)
+		}
+		buf := make([]byte, 32)
+		n, err := pc.Read(buf)
+		if err != nil {
+			t.Fatalf("UDP Read %d (flow closed despite activity): %v", i, err)
+		}
+		if !bytes.Equal(buf[:n], msg) {
+			t.Fatalf("UDP echo %d = %q; want %q", i, buf[:n], msg)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Now go idle: the server must close the flow.
+	select {
+	case err := <-handlerDone:
+		if err == nil {
+			t.Fatal("UDP flow ended without an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("UDP flow did not time out after going idle")
+	}
 }
 
 // TestHalfClose tests that a client's write shutdown (CloseWrite)
@@ -234,7 +1133,7 @@ func TestServerCloseClosesActiveConnections(t *testing.T) {
 	s := &Server{
 		Logf:           mkLogger(t, "server"),
 		Region:         reg,
-		AllowedClients: []key.NodePublic{clientKey.Public()},
+		AllowClient:    func(k key.NodePublic) bool { return k == clientKey.Public() },
 		ServedTCPPorts: []filter.PortRange{{First: 80, Last: 80}},
 		OnTCP: func(port uint16) func(net.Conn) {
 			if port != 80 {
@@ -458,6 +1357,45 @@ func TestAddrSeparateDiscoKey(t *testing.T) {
 	}
 }
 
+func TestAddrPresharedKey(t *testing.T) {
+	psk := NewPresharedKey()
+	if psk.IsZero() {
+		t.Fatal("NewPresharedKey returned zero")
+	}
+	priv := NewPrivateKey()
+	priv.Public.PresharedKey = psk
+	priv.Public.RegionID = 10
+
+	got, err := ParseAddr(priv.Public.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.PresharedKey.Equal(psk) {
+		t.Fatalf("pre-shared key changed in address round trip: got %x, want %x", got.PresharedKey, psk)
+	}
+
+	j, err := json.Marshal(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back PrivateKey
+	if err := json.Unmarshal(j, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Public.PresharedKey.Equal(psk) {
+		t.Fatalf("pre-shared key changed in JSON round trip: got %x, want %x", back.Public.PresharedKey, psk)
+	}
+	if !strings.Contains(string(j), `"PresharedKey":"psk:`) {
+		t.Fatalf("JSON pre-shared key is not in typed text form: %s", j)
+	}
+
+	withoutPSK := priv.Public
+	withoutPSK.PresharedKey = PresharedKey{}
+	if got, want := len(withoutPSK.Addr()), len(priv.Public.Addr()); got >= want {
+		t.Errorf("address without PSK length = %d; want less than %d", got, want)
+	}
+}
+
 func TestClientRejectsLegacyAddr(t *testing.T) {
 	legacy := (&ConnInfo{
 		ServerPublic: NodePublic{key.NewNode().Public()},
@@ -467,6 +1405,26 @@ func TestClientRejectsLegacyAddr(t *testing.T) {
 	_, err := c.Ping(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "legacy tailcat address") {
 		t.Fatalf("Ping error = %v; want legacy address rejection", err)
+	}
+}
+
+func TestClientAcceptsAddrWithoutPresharedKey(t *testing.T) {
+	priv := key.NewNode()
+	addr := (&ConnInfo{
+		ServerPublic:      NodePublic{priv.Public()},
+		ServerDiscoPublic: DiscoPublicForNode(priv),
+		RegionID:          10,
+	}).Addr()
+	c := NewClient(addr)
+	c.startMu.Lock()
+	err := c.initLocked()
+	c.startMu.Unlock()
+	if err != nil {
+		t.Fatalf("initLocked: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	if !c.lb.presharedKey.IsZero() {
+		t.Fatal("client configured a PSK for an address without one")
 	}
 }
 
@@ -522,6 +1480,40 @@ func TestParseAddrMalformedDiscoPublicKey(t *testing.T) {
 				t.Fatal("ParseAddr unexpectedly accepted malformed disco public key")
 			}
 		})
+	}
+}
+
+func TestParseAddrMalformedPresharedKey(t *testing.T) {
+	for name, keyBytes := range map[string][]byte{
+		"short": make([]byte, presharedKeyLen-1),
+		"long":  make([]byte, presharedKeyLen+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := cbor.Marshal(map[string][]byte{
+				"p": key.NewNode().Public().AppendTo(nil),
+				"q": keyBytes,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := Addr("tc" + base64.RawURLEncoding.EncodeToString(raw))
+			if _, err := ParseAddr(addr); err == nil {
+				t.Fatal("ParseAddr unexpectedly accepted malformed pre-shared key")
+			}
+		})
+	}
+}
+
+func TestPeerConfigIncludesPresharedKey(t *testing.T) {
+	server := key.NewNode().Public()
+	psk := NewPresharedKey()
+	b := &locoBackend{serverPub: server, presharedKey: psk}
+	conf, ok := b.peerConfig(server)
+	if !ok {
+		t.Fatal("peerConfig did not find server peer")
+	}
+	if conf.PresharedKey != device.NoisePresharedKey(psk) {
+		t.Fatalf("peerConfig pre-shared key = %x, want %x", conf.PresharedKey, psk)
 	}
 }
 
@@ -611,5 +1603,82 @@ func TestParseAddrRawKeepsNulls(t *testing.T) {
 	}
 	if len(w.Region) != 1 || w.Region[0] != nil {
 		t.Errorf("Region = %v; want a single nil element", w.Region)
+	}
+}
+
+func TestPeerKey(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	type peerKey struct {
+		key key.NodePublic
+		ok  bool
+	}
+	tcpKey := make(chan peerKey, 1)
+	udpKey := make(chan peerKey, 1)
+
+	s := &Server{Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		return func(c net.Conn) {
+			defer c.Close()
+			k, ok := s.PeerKey(c.RemoteAddr())
+			tcpKey <- peerKey{k, ok}
+		}
+	}
+	s.OnUDP = func(port uint16) func(ConnPacketConn) {
+		return func(c ConnPacketConn) {
+			defer c.Close()
+			k, ok := s.PeerKey(c.RemoteAddr())
+			udpKey <- peerKey{k, ok}
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	want := c.PublicKey()
+
+	conn, err := c.DialTCPPort(t.Context(), 80)
+	if err != nil {
+		t.Fatalf("DialTCPPort: %v", err)
+	}
+	io.Copy(io.Discard, conn)
+	conn.Close()
+
+	pc, err := c.DialUDPPort(t.Context(), 53)
+	if err != nil {
+		t.Fatalf("DialUDPPort: %v", err)
+	}
+	defer pc.Close()
+	if _, err := pc.Write([]byte("hello")); err != nil {
+		t.Fatalf("UDP Write: %v", err)
+	}
+
+	for _, tt := range []struct {
+		proto string
+		ch    chan peerKey
+	}{
+		{"TCP", tcpKey},
+		{"UDP", udpKey},
+	} {
+		select {
+		case got := <-tt.ch:
+			if !got.ok {
+				t.Errorf("PeerKey on %s: ok=false; want the client's key", tt.proto)
+				continue
+			}
+			if got.key != want {
+				t.Errorf("PeerKey on %s = %v; want %v", tt.proto, got.key, want)
+			}
+		case <-time.After(30 * time.Second):
+			t.Errorf("timeout waiting for the %s handler", tt.proto)
+		}
 	}
 }

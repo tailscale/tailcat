@@ -4,6 +4,11 @@
 
 <p align="center"><em>"Tailscale without Tailscale, by Tailscale"</em></p>
 
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/tailscale/tailcat"><img src="https://pkg.go.dev/badge/github.com/tailscale/tailcat.svg" alt="Go Reference"></a>
+  <a href="https://bsky.app/profile/tailcat.dev"><img src="https://img.shields.io/badge/Bluesky-@tailcat.dev-0285FF?logo=bluesky&logoColor=white" alt="Follow @tailcat.dev on Bluesky"></a>
+</p>
+
 # Tailcat
 
 Tailcat is a remix of Tailscale open source pieces to act like
@@ -43,65 +48,22 @@ support ([#4](https://github.com/tailscale/tailcat/issues/4)).
 
 ## Install
 
-Prebuilt binaries are on the
-[Releases page](https://github.com/tailscale/tailcat/releases): static
-Linux binaries (tar.gz) plus Debian (.deb) and RPM (.rpm) packages for
-amd64, arm64, and armv7, and Windows binaries (zip) for amd64 and
-arm64.
+See [INSTALL.md](./INSTALL.md) for details on each, including notes
+for packagers building from source:
 
-There's also a
-[container image](https://github.com/tailscale/tailcat/pkgs/container/tailcat):
-
-```sh
-$ docker pull ghcr.io/tailscale/tailcat:v0.1.0  # or :latest
-$ docker run --rm -it ghcr.io/tailscale/tailcat:latest
-```
-
-For macOS, install with [Homebrew](https://brew.sh/):
-
-```sh
-$ brew install tailcat
-```
-
-Or build from source with a Go toolchain:
-
-```sh
-$ go install github.com/tailscale/tailcat/cmd/tailcat@latest
-```
-
-Or with Nix flakes, run it directly or install it:
-
-```sh
-$ nix run github:tailscale/tailcat
-$ nix profile install github:tailscale/tailcat
-```
-
-Or from archlinux AUR:
-
-[![tailcat on AUR](https://img.shields.io/aur/version/tailcat?label=tailcat)](https://aur.archlinux.org/packages/tailcat/)
-[![tailcat-bin on AUR](https://img.shields.io/aur/version/tailcat-bin?label=tailcat-bin)](https://aur.archlinux.org/packages/tailcat-bin/)
-
-```bash
-# Build release package from source
-yay -S tailcat
-
-# OR install the binary release
-yay -S tailcat-bin
-```
-
-### Packaging from source
-
-The official binaries are built with a list of build tags that omits
-unused Tailscale features, making them about 16% smaller. The
-recommended tag list is checked in as
-[build-tags.txt](./build-tags.txt) (and kept accurate by a CI test),
-so packagers (Homebrew, AUR, NixOS, etc.) can build the same way:
-
-```sh
-$ go build -tags "$(cat build-tags.txt)" -ldflags "-s -w" ./cmd/tailcat
-```
-
-See [build-tags.md](./build-tags.md) for the details.
+| Method | Linux | macOS | Windows | FreeBSD,<br>OpenBSD | Browser<br>(js/wasm) |
+|--------|:-----:|:-----:|:-------:|:-------------------:|:--------------------:|
+| [Static binaries](INSTALL.md#prebuilt-binaries) | ✅ | | ✅ | | |
+| [.deb packages](INSTALL.md#prebuilt-binaries) | Debian, Ubuntu, ... | | | | |
+| [.rpm packages](INSTALL.md#prebuilt-binaries) | Red Hat, Fedora, ... | | | | |
+| [Homebrew](INSTALL.md#homebrew-macos) | | ✅ | | | |
+| [Scoop](INSTALL.md#scoop-windows) | | | ✅ | | |
+| [Snap](INSTALL.md#snap-linux) | ✅ | | | | |
+| [Container image](INSTALL.md#container-image) | ✅ | | | | |
+| [Nix](INSTALL.md#nix) | ✅ | ✅ | | | |
+| [AUR](INSTALL.md#arch-linux-aur) | Arch | | | | |
+| [conda-forge](INSTALL.md#conda-forge) | ✅ | ✅ | ✅ | | |
+| [Build from source](INSTALL.md#go-toolchain) | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ## Usage
 
@@ -152,6 +114,16 @@ HTTP/1.1 200 OK
 ....
 ```
 
+A port mapping proxies a port somewhere other than the same port on localhost: to a different local port, or to a host and port elsewhere on the server's network. This serves port 5555 by proxying it to an Android device's adb port on the LAN, without exposing the rest of the network the way `exit-node` would:
+
+```sh
+$ tailcat serve 5555:10.2.200.213:5555
+# Proxying port 5555 to 10.2.200.213:5555
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Then on the client, `tailcat forward tcXXXXXXXXX 5555` followed by `adb connect 127.0.0.1:5555`. Write IPv6 targets in brackets: `5555:[fd7a::1]:5555`.
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:
@@ -165,6 +137,19 @@ $ tailcat forward tcXXXXXXXXX 18080:8080 3306
 
 A local port of 0 asks the operating system for a free port; each listener prints its address once it's listening.
 
+To forward local ports to assets on the network reachable by an exit-node server, run the server in exit-node mode and specify each remote IP address and port in the mapping:
+
+```sh
+$ tailcat serve exit-node
+# 🐈 Server listening with new address: tcXXXXXXXXX
+
+$ tailcat forward tcXXXXXXXXX \
+    3001:172.23.52.30:3001 \
+    17170:172.23.52.31:17170
+```
+
+This forwards `127.0.0.1:3001` to `172.23.52.30:3001` and `127.0.0.1:17170` to `172.23.52.31:17170` through the exit-node server.
+
 By default, listeners bind to `127.0.0.1` and diagnostic logs are suppressed. Pass `--verbose` before the subcommand to enable verbose networking logs. Use `--bind=0.0.0.0` only when clients on other machines should be able to connect:
 
 ```sh
@@ -173,20 +158,95 @@ $ tailcat forward --bind=0.0.0.0 tcXXXXXXXXX 18080:8080
 
 Press Ctrl-C to stop forwarding.
 
+### Open a browser to a tailcat server
+
+To view a web server behind a tailcat server, run `browse`:
+
+```sh
+$ tailcat serve 80
+# 🐈 Server listening with new address: tcXXXXXXXXX
+
+$ tailcat browse tcXXXXXXXXX
+```
+
+This is an alias for `tailcat forward --open-browser <tc-addr> 0:80`: it opens `http://127.0.0.1:<port>/` in a web browser once the local listener is ready, then blocks, forwarding connections, until interrupted. The `--open-browser` flag works with any single `forward` port mapping.
+
+### Public-key-authenticated SSH server
+
+Run an SSH server that accepts keys from local `authorized_keys` files,
+literal OpenSSH public key lines, or GitHub accounts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=~/.ssh/authorized_keys ssh
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+Multiple sources can be comma-separated. A `user@github` source fetches
+`https://github.com/user.keys` once, before the server starts:
+
+```sh
+$ tailcat serve --ssh-authorized-keys=bradfitz@github,./contractor.pub ssh
+```
+
+Every source must exist, fetch successfully, and contain valid public key
+lines or startup fails. Authorized-key options such as `command=` and
+`from=` are rejected because the built-in server does not implement them.
+Running `tailcat serve ssh` without `--ssh-authorized-keys` also fails; use the
+explicit `no-auth-ssh` service when the tunnel identity alone is sufficient.
+
 ### Auth-free SSH server
 
-On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat serve 22` and proxy to your system SSH server)
+On Linux, macOS, and Windows, you can also explicitly run the SSH server with
+no client authentication. The encrypted tunnel provides the client identity.
 
 ```sh
 $ tailcat serve no-auth-ssh
 # 🐈 Server listening with new address: tcXXXXXXXXX
 ```
 
+> [!WARNING]
+> With `no-auth-ssh`, the address **is** the credential: anyone who
+> learns it gets a shell as the user running the server. Share it only
+> over private channels, and never publish it, in a DNS TXT record or
+> anywhere else public. If you want an SSH server reachable by DNS
+> name, it must require client authentication: `--allow` at the tunnel
+> layer, `--ssh-authorized-keys` at the SSH layer, or both.
+
 And on the client side:
 
 ```sh
 $ tailcat ssh tcXXXXXXXXX
 $ tailcat ssh tcXXXXXXXXX ls -la
+```
+
+### Run a command per connection
+
+Like inetd, the `exec` service runs a command for each incoming
+connection, with the connection as the command's stdin and stdout.
+The command comes after `--`:
+
+```sh
+$ tailcat serve exec -- /usr/bin/fortune
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat tcXXXXXXXXX 80 < /dev/null
+```
+
+The command's stderr goes to the server's. It gets the peer's node
+key in `$TAILCAT_PEER_KEY` (in `--allow`'s format) and the peer's
+tailcat IP:port in `$TAILCAT_REMOTE_ADDR`.
+
+Given with the `ssh` or `no-auth-ssh` service, the command instead
+replaces the shell, like OpenSSH's `ForceCommand`: every SSH session
+runs only that command (on a PTY if the client asks for one), and the
+server offers no shell, no client-chosen command, and no SFTP. The
+client's requested command, if any, arrives in `$SSH_ORIGINAL_COMMAND`.
+
+```sh
+$ tailcat serve --ssh-authorized-keys=alice@github ssh -- ./deploy.sh
+$ tailcat serve no-auth-ssh -- git-upload-pack /srv/repo.git
 ```
 
 ### Send and receive files
@@ -229,14 +289,48 @@ The server confines all paths to the served directory (via Go's
 `os.Root`), so neither `..` nor symlinks escape it. The file service
 speaks SFTP, so the stock `sftp` and `scp` clients also work against
 it, given a ProxyCommand that pipes through tailcat (the same trick
-`tailcat cp` and `tailcat ssh` use). A `no-auth-ssh` server serves
-SFTP too, with the same access as the shell.
+`tailcat cp` and `tailcat ssh` use). Both `ssh` and `no-auth-ssh`
+servers serve SFTP too, with the same access as the shell.
 
 Transfers are not compressed: the SFTP protocol has no compression
 of its own, and the SSH transport here doesn't either (Go's SSH
 stack omits it; transport compression has a history of security
 problems, and TLS dropped it too). Compress files before sending
 if it matters.
+
+### Measure throughput and latency
+
+Run an iperf-like test between two machines. The server accepts tests
+with the `perf` service and the client sends to it for 10 seconds by
+default, printing progress each second and both sides' totals at the
+end. `--reverse` sends the other way, `--bidir` both ways at once,
+`--udp` tests UDP (paced to `--bitrate`, default 1 Mbit/s) and reports
+loss, reordering, and jitter, and `--parallel` runs several streams.
+Round trips over the test's control connection measure latency while
+the tunnel is loaded:
+
+```sh
+$ tailcat serve perf
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat perf tcXXXXXXXXX
+# path: direct via 203.0.113.7:41641, rtt 1.2ms
+TCP, client -> server, 1 stream, 10s
+[   1.0s]  sent    118 MB    943 Mbit/s  rtt 2.1ms
+...
+sent        1.18 GB in   10.0s    943 Mbit/s
+received    1.18 GB in   10.0s    942 Mbit/s
+rtt under load  min 1.9ms  avg 2.3ms  max 4.1ms  (50 samples)
+```
+
+The test first waits for a direct path (up to `--timeout`) and refuses
+to run through a DERP relay otherwise, since a throughput test through
+a shared relay mostly measures its rate limit while crowding out
+everyone else. `--via-derp` allows a relayed test through [a relay you
+run yourself](#bring-your-own-derp-relay); Tailscale's shared relays
+are always refused. `tailcat --json perf` prints the results as JSON.
 
 ### Misc commands 
 
@@ -317,8 +411,8 @@ A server can print the long self-contained form directly with the
 
 ## Key Management
 
-A server's tailcat address is derived from its WireGuard key, so
-the key you use determines who can reach you:
+A server's tailcat address contains its WireGuard public key and an independent
+WireGuard pre-shared key, so the saved key material determines who can reach you:
 
 * **Ephemeral keys (the default):** each server run generates a fresh key in
   memory and prints an address nobody has ever seen. When the process exits,
@@ -334,6 +428,11 @@ the key you use determines who can reach you:
 The CLI says at startup which kind it's using, so you know whether you're
 starting a fresh single-use server or re-listening on an address you may
 have shared in the past.
+
+WireGuard pre-shared keys are enabled by default and strongly recommended. For
+compatibility with tailcat clients v0.5.0 and earlier, `--psk=false` on `serve`
+or `genkey` produces shorter addresses, but removes post-quantum protection and
+protection from public DERP operators that observe the peers' public keys.
 
 ```sh
 $ tailcat genkey --key=default --region=nyc
@@ -365,6 +464,20 @@ $ tailcat ssh example.com
 $ tailcat ping example.com
 ```
 
+> [!WARNING]
+> A tailcat address is normally a secret: knowing it is what lets a
+> client connect. A DNS TXT record is **not** secret. It is public,
+> world-readable, and actively scanned. Publishing an address in DNS
+> hands it to everyone on the internet, so the server behind it must
+> authenticate clients by something other than knowledge of the
+> address: restrict the tunnel to known client keys with `tailcat
+> serve --allow=...`, or, for SSH, require public keys with `tailcat
+> serve --ssh-authorized-keys=... ssh`. Never publish the address of a
+> `no-auth-ssh` server (or any other server that trusts whoever
+> connects): that is a shell on your machine, published in a TXT
+> record. See [Protected SSH server over
+> DNS](#protected-ssh-server-over-dns) for the safe setup.
+
 ## Examples
 
 ### Protected SSH server over DNS
@@ -373,6 +486,14 @@ Who needs port forwarding or port knocking? This runs an SSH server
 reachable from anywhere by name, with no open inbound ports on the
 server, where WireGuard authenticates the client before the SSH
 server ever sees a packet.
+
+> [!WARNING]
+> The `--allow` flag below is not optional decoration. The DNS TXT
+> record makes the tailcat address public, so possession of the
+> address no longer proves anything: the server must authenticate
+> clients itself, here by allowing only one client node key. Without
+> `--allow` (or SSH-level `--ssh-authorized-keys`), anyone on the
+> internet who reads the TXT record can connect.
 
 On the client machine, generate a client identity keypair. It prints
 the public key, which is all the server needs to know:
@@ -411,6 +532,16 @@ Client modes automatically use the saved `client-default` key when it
 exists, so no extra flags are needed to present the allowed identity.
 Anyone else's handshake is silently ignored: they can't reach the SSH
 server, or even learn that one is running.
+
+As a safety net, `tailcat ssh` probes a DNS-named destination before
+connecting: it attempts an SSH login as a stranger would, with a
+freshly generated client key and no SSH credentials. If the server
+accepts that login, anyone who reads the TXT record could do the
+same, so tailcat refuses to connect and says why. The probe
+catches the misconfiguration the first time you test your own server;
+the `--skip-dns-safety-check` flag skips it, whether because you
+really do want a public server or just to shave off the probe's
+round trips.
 
 Why `--fixed-region`: it discovers the nearest DERP region once, at
 genkey time, and bakes its ID into both the printed tailcat address and the
@@ -532,6 +663,37 @@ $ ./client tcomFwWCAWf933BLELdzd3RkHiOufJ...
 hello from port 80
 ```
 
+UDP uses a connected packet connection for each client flow, preserving
+datagram boundaries and both endpoint addresses:
+
+```go
+s.OnUDP = func(port uint16) func(tailcat.ConnPacketConn) {
+	if port != 53 {
+		return nil
+	}
+	return func(c tailcat.ConnPacketConn) {
+		defer c.Close()
+		buf := make([]byte, tailcat.MaxUDPPayload)
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+			c.Write(buf[:n])
+		}
+	}
+}
+
+pc, err := cl.DialUDPPort(context.Background(), 53)
+```
+
+`ConnPacketConn` implements both `net.Conn` and `net.PacketConn`. Keep payloads
+at or below `tailcat.MaxUDPPayload` (1232 bytes) to fit the IPv6 tunnel MTU
+without fragmentation. Use `OnUDPForward` and `DialUDP` for exit-node traffic;
+`ProxyPacketConns` provides datagram-safe bidirectional forwarding. Inactive
+server-side UDP flows close after `tailcat.DefaultUDPIdleTimeout` (two minutes);
+set `Server.UDPIdleTimeout` to change the timeout.
+
 ## How it works
 
 ### Tailcat addresses
@@ -542,12 +704,23 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 
 - The server's WireGuard public key (Curve25519, 32 bytes)
 - A separate path-discovery public key (Curve25519, 32 bytes)
+- By default, an independent WireGuard pre-shared key (256 random bits),
+  which prevents a DERP operator that observes the peers' public keys from
+  joining the tunnel and provides post-quantum protection against recorded
+  traffic
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
   2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
 
-A typical tailcat address with just an integer region ID is around 95 bytes. With
-embedded DERP node details it's longer but self-contained.
+A typical tailcat address with just an integer region ID is around 140 bytes.
+With embedded DERP node details it's longer but self-contained.
+
+The default address is a secret bearer capability because it contains the
+pre-shared key. Share it only with clients that should be able to connect.
+Publishing it, in a public DNS TXT record or anywhere else, gives that
+capability to the whole internet, which is only safe when the server also
+authenticates clients: `serve --allow` restricts the tunnel to listed
+client node keys, and the `ssh` service requires `--ssh-authorized-keys`.
 
 ### Network stack
 
@@ -569,15 +742,17 @@ without the control plane.
 
 ### Connection flow
 
-1. **Server starts.** It generates (or loads) a WireGuard keypair,
-   connects to a DERP relay, and prints its tailcat address to stderr.
-   It then waits for clients.
+1. **Server starts.** It generates (or loads) a WireGuard keypair and, by
+   default, a pre-shared key, connects to a DERP relay, and prints its tailcat
+   address to stderr. It then waits for clients.
 
-2. **Client parses the tailcat address** to learn the server's public key and
-   path-discovery key, plus its DERP region. It generates its own ephemeral
-   keypair and connects to the same DERP relay. The separate path-discovery
-   key can appear in cleartext direct-path disco frames without revealing the
-   WireGuard public key that acts as the unlisted connection capability.
+2. **Client parses the tailcat address** to learn the server's public key,
+   path-discovery key, optional pre-shared key, and DERP region. It generates
+   its own ephemeral keypair and connects to the same DERP relay. The separate
+   path-discovery key can appear in cleartext direct-path disco frames without
+   revealing the WireGuard public key. The pre-shared key remains the secret
+   connection capability even when a relay operator observes both peers'
+   public keys.
 
 3. **Discovery handshake.** The client sends a "**Meow**" ping message
   to the server through the
@@ -586,10 +761,10 @@ without the control plane.
    network map, reconfigures the WireGuard engine, and replies with a
    "**Meowed**" acknowledgment.
 
-4. **WireGuard tunnel.** With both sides configured as WireGuard
-   peers, the standard WireGuard handshake proceeds (routed through
-   DERP initially). Once complete, the tunnel is up and encrypted
-   traffic can flow.
+4. **WireGuard tunnel.** With both sides configured as WireGuard peers using
+   the address's pre-shared key when present, the WireGuard handshake proceeds
+   (routed through DERP initially). Once complete, the tunnel is up and
+   encrypted traffic can flow.
 
 5. **NAT traversal.** In parallel, each side advertises its UDP
    endpoints (public IP:port learned via STUN, plus local interface
@@ -655,9 +830,9 @@ It was open sourced August 2026 at the
 
 ## Swift / C bindings
 
-[`libtailcat/`](./libtailcat/) exports a small C API over the Go library,
-built as static archives for macOS, iOS and the iOS simulator and packaged
-as `CTailcat.xcframework`, and [`swift/`](./swift/) wraps it as the
-`TailcatKit` Swift package (Swift 6, async/await servers, clients and
-connections) with a demo tool and tests. See their READMEs to build and
-use them.
+[`cmd/libtailcat/`](./cmd/libtailcat/) provides the C API.
+[`swift/`](./swift/) wraps that API as `TailcatKit`, a Swift 6 package with
+async/await servers, clients, and TCP connections for macOS 14+ and iOS 17+.
+Its Makefile builds the upstream C API as `CTailcat.xcframework` for macOS,
+iOS, and the simulator. See the [Swift README](./swift/README.md) for building,
+examples, and local relay tests.

@@ -3,7 +3,7 @@
 
 # Builds libtailcat as Go c-archives for macOS (arm64 + x86_64), iOS
 # devices (arm64) and the iOS simulator (arm64 + x86_64), and packages
-# them with include/ as ../swift/CTailcat.xcframework.
+# them with the upstream C header as CTailcat.xcframework.
 #
 # Every archive is built with the release build tags from
 # ../build-tags.txt, which trim the tailscale.com dependency down to
@@ -13,7 +13,7 @@ GO ?= go
 TAGS := $(shell cat ../build-tags.txt)
 BUILD := build
 SCRIPT := $(abspath script)
-XCFRAMEWORK := ../swift/CTailcat.xcframework
+XCFRAMEWORK := CTailcat.xcframework
 
 # `?=` so the environment can override them.
 MACOS_TARGET ?= 14.0
@@ -32,37 +32,39 @@ $(BUILD):
 macos: $(BUILD) ## Builds the fat macOS archive build/libtailcat_macos.a
 	MACOSX_DEPLOYMENT_TARGET=$(MACOS_TARGET) GOOS=darwin GOARCH=arm64 \
 		CGO_CFLAGS="-mmacos-version-min=$(MACOS_TARGET)" CGO_LDFLAGS="-mmacos-version-min=$(MACOS_TARGET)" \
-		$(GO) build -buildmode=c-archive -tags "$(TAGS)" -ldflags "-s -w" -o $(BUILD)/libtailcat_macos_arm64.a .
+		$(GO) build -buildmode=c-archive -tags "$(TAGS)" -ldflags "-s -w" -o $(BUILD)/libtailcat_macos_arm64.a ../cmd/libtailcat
 	MACOSX_DEPLOYMENT_TARGET=$(MACOS_TARGET) GOOS=darwin GOARCH=amd64 CC=$(SCRIPT)/clangwrap-macos-x86.sh \
-		$(GO) build -buildmode=c-archive -tags "$(TAGS)" -ldflags "-s -w" -o $(BUILD)/libtailcat_macos_x86_64.a .
+		$(GO) build -buildmode=c-archive -tags "$(TAGS)" -ldflags "-s -w" -o $(BUILD)/libtailcat_macos_x86_64.a ../cmd/libtailcat
 	lipo -create -output $(BUILD)/libtailcat_macos.a $(BUILD)/libtailcat_macos_arm64.a $(BUILD)/libtailcat_macos_x86_64.a
 
 .PHONY: ios
 ios: $(BUILD) ## Builds the iOS device archive build/libtailcat_ios.a (iOS SDK required)
 	GOOS=ios GOARCH=arm64 CC=$(SCRIPT)/clangwrap-ios.sh \
-		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_ios.a .
+		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_ios.a ../cmd/libtailcat
 
 .PHONY: ios-sim
 ios-sim: $(BUILD) ## Builds the fat iOS simulator archive build/libtailcat_iossim.a (iOS SDK required)
 	GOOS=ios GOARCH=arm64 CC=$(SCRIPT)/clangwrap-ios-sim-arm.sh \
-		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_iossim_arm64.a .
+		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_iossim_arm64.a ../cmd/libtailcat
 	GOOS=ios GOARCH=amd64 CC=$(SCRIPT)/clangwrap-ios-sim-x86.sh \
-		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_iossim_x86_64.a .
+		$(GO) build -buildmode=c-archive -tags "ios,$(TAGS)" -ldflags -w -o $(BUILD)/libtailcat_iossim_x86_64.a ../cmd/libtailcat
 	lipo -create -output $(BUILD)/libtailcat_iossim.a $(BUILD)/libtailcat_iossim_arm64.a $(BUILD)/libtailcat_iossim_x86_64.a
 
 .PHONY: xcframework
-xcframework: macos ios ios-sim ## Builds ../swift/CTailcat.xcframework from the three archives
+xcframework: macos ios ios-sim ## Builds CTailcat.xcframework from the three archives
+	mkdir -p $(BUILD)/include
+	cp ../cmd/libtailcat/tailcat.h include/module.modulemap $(BUILD)/include/
 	rm -rf $(XCFRAMEWORK)
 	mkdir -p $(dir $(XCFRAMEWORK))
 	xcodebuild -create-xcframework \
-		-library $(BUILD)/libtailcat_macos.a -headers include \
-		-library $(BUILD)/libtailcat_ios.a -headers include \
-		-library $(BUILD)/libtailcat_iossim.a -headers include \
+		-library $(BUILD)/libtailcat_macos.a -headers $(BUILD)/include \
+		-library $(BUILD)/libtailcat_ios.a -headers $(BUILD)/include \
+		-library $(BUILD)/libtailcat_iossim.a -headers $(BUILD)/include \
 		-output $(XCFRAMEWORK)
 
 .PHONY: test
-test: ## Runs the offline Go tests of the exported functions
-	cd .. && $(GO) test ./libtailcat/ -run . -count=1
+test: ## Runs Swift tests against a local DERP/STUN relay
+	cd .. && $(GO) test -v -count=1 -timeout 180s ./swift/testdata
 
 .PHONY: clean
 clean: ## Removes build/ and the xcframework

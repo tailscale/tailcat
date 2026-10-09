@@ -9,6 +9,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +30,12 @@ func runSFTPBatch(t *testing.T, e *testEnv, addr, batch string) ([]byte, error) 
 	if err := os.WriteFile(batchFile, []byte(batch), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sftp",
+	// The timeout is a context rather than a watchdog goroutine calling
+	// cmd.Process.Kill: Start can itself block for a long time in fork
+	// on a loaded CI machine, and cmd.Process is nil until it returns.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sftp",
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile "+os.DevNull,
 		"-o", "LogLevel ERROR",
@@ -37,22 +43,13 @@ func runSFTPBatch(t *testing.T, e *testEnv, addr, batch string) ([]byte, error) 
 		"-b", batchFile,
 		sshDestHost(addr))
 	cmd.Env = e.env
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-done:
-		case <-time.After(30 * time.Second):
-			cmd.Process.Kill()
-		}
-	}()
-	out, err := cmd.CombinedOutput()
-	close(done)
-	return out, err
+	return cmd.CombinedOutput()
 }
 
 // TestLS lists a read-only file server with the native ls
 // subcommand, which needs no OpenSSH binaries.
 func TestLS(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 
 	serveDir := t.TempDir()
@@ -90,6 +87,7 @@ func TestLS(t *testing.T) {
 // checks that the stock OpenSSH sftp client can fetch a file from it
 // but not write one to it.
 func TestServeFiles(t *testing.T) {
+	t.Parallel()
 	if _, err := exec.LookPath("sftp"); err != nil {
 		t.Skipf("no sftp client in $PATH: %v", err)
 	}

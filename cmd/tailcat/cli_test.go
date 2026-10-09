@@ -5,14 +5,20 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"maps"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"tailscale.com/tstest"
 )
 
 func TestClassifyTailcatAddrArg(t *testing.T) {
@@ -54,9 +60,10 @@ func TestClassifyTailcatAddrArg(t *testing.T) {
 // mentions every subcommand and the global flags, the declarative
 // help dump that motivated the ff port.
 func TestHelpListsCommandTree(t *testing.T) {
+	tstest.AssertNotParallel(t) // newRootCommand rebinds global flag variables
 	help := ffhelp.Command(newRootCommand()).String()
 	for _, want := range []string{
-		"serve", "recv", "ping", "socks", "ssh", "cp", "parse", "resolve",
+		"serve", "recv", "ping", "perf", "socks", "ssh", "cp", "parse", "resolve",
 		"forward", "genkey", "printpub", "version", "readme",
 		"--serve", "--key", "--derpmap-url",
 	} {
@@ -70,7 +77,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	// Server-only flags live on the serve subcommand, not the root.
 	// (The long help prose may still mention them; only reject them
 	// as rendered flag entries.)
-	for _, notWant := range []string{"\n  --allow", "\n  --full-address"} {
+	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk", "\n  --ssh-authorized-keys"} {
 		if strings.Contains(help, notWant) {
 			t.Errorf("root help lists server-only flag %q", strings.TrimSpace(notWant))
 		}
@@ -80,6 +87,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 // TestServeHelpListsServerFlags verifies that the server-only flags
 // moved off the root command render in the serve subcommand's help.
 func TestServeHelpListsServerFlags(t *testing.T) {
+	tstest.AssertNotParallel(t) // newRootCommand rebinds global flag variables
 	root := newRootCommand()
 	var serve *ff.Command
 	for _, sub := range root.Subcommands {
@@ -91,10 +99,38 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 		t.Fatal("no serve subcommand")
 	}
 	help := ffhelp.Command(serve).String()
-	for _, want := range []string{"--allow", "--full-address", "--key"} {
+	for _, want := range []string{"--allow", "--full-address", "--key", "--psk", "--ssh-authorized-keys"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
 		}
+	}
+}
+
+func TestPSKFlagDefaults(t *testing.T) {
+	if _, err := parseCLI(t, "serve"); err != nil {
+		t.Fatal(err)
+	}
+	if !*flagPSK {
+		t.Error("serve --psk defaulted to false; want true")
+	}
+	if _, err := parseCLI(t, "serve", "--psk=false"); err != nil {
+		t.Fatal(err)
+	}
+	if *flagPSK {
+		t.Error("serve --psk=false parsed as true")
+	}
+
+	if _, err := parseCLI(t, "genkey", "--key=k", "--region=1"); err != nil {
+		t.Fatal(err)
+	}
+	if !*genkeyPSK {
+		t.Error("genkey --psk defaulted to false; want true")
+	}
+	if _, err := parseCLI(t, "genkey", "--key=k", "--region=1", "--psk=false"); err != nil {
+		t.Fatal(err)
+	}
+	if *genkeyPSK {
+		t.Error("genkey --psk=false parsed as true")
 	}
 }
 
@@ -119,9 +155,12 @@ func TestParseFilesFlagWriteOnlyModes(t *testing.T) {
 }
 
 // parseCLI parses args against a fresh command tree and returns the
-// root command. It doesn't run anything.
+// root command. It doesn't run anything. The command tree parses into
+// package-level flag variables, so tests that parse must not run in
+// parallel with anything.
 func parseCLI(t *testing.T, args ...string) (root *ff.Command, err error) {
 	t.Helper()
+	tstest.AssertNotParallel(t)
 	root = newRootCommand()
 	return root, root.Parse(args)
 }
@@ -155,6 +194,27 @@ func TestServeSubcommand(t *testing.T) {
 	var ue usageError
 	if !errors.As(err, &ue) {
 		t.Errorf("serve --serve=80 443: err = %v; want a usageError", err)
+	}
+}
+
+func TestServeSSHAuthorizedKeysFlag(t *testing.T) {
+	root, err := parseCLI(t, "serve", "--ssh-authorized-keys=one.pub,alice@github", "ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := *flagSSHAuthorizedKeys, "one.pub,alice@github"; got != want {
+		t.Errorf("--ssh-authorized-keys = %q; want %q", got, want)
+	}
+	args := root.GetSelected().Flags.(*ff.FlagSet).GetArgs()
+	if len(args) != 1 || args[0] != "ssh" {
+		t.Errorf("serve args = %q; want [ssh]", args)
+	}
+	_, services, _, err := parsePortSet("ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !services.Contains("ssh") {
+		t.Error("parsePortSet did not select the ssh service")
 	}
 }
 
@@ -249,6 +309,7 @@ func TestHelpRequests(t *testing.T) {
 // written to stdout, so it can be piped into a pager, while
 // usage-error help stays on stderr, off a pipeline's stdout.
 func TestHelpGoesToStdout(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 	run := func(args ...string) (stdout, stderr string, err error) {
 		var outBuf, errBuf bytes.Buffer
@@ -332,6 +393,52 @@ func TestGenkeyRequiresKeyName(t *testing.T) {
 	}
 }
 
+func TestGenkeyPSK(t *testing.T) {
+	t.Parallel()
+	bin := buildTailcat(t)
+	for _, tt := range []struct {
+		name    string
+		pskArg  string
+		wantPSK bool
+	}{
+		{name: "default", wantPSK: true},
+		{name: "disabled", pskArg: "--psk=false", wantPSK: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			keyFile := filepath.Join(t.TempDir(), "server.private.json")
+			args := []string{"genkey", "--key=" + keyFile, "--region=1"}
+			if tt.pskArg != "" {
+				args = append(args, tt.pskArg)
+			}
+			cmd := exec.Command(bin, args...)
+			cmd.Env = append(os.Environ(), cacheEnv(t)...)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("genkey: %v", err)
+			}
+			ci, err := tailcat.ParseAddr(tailcat.Addr(strings.TrimSpace(string(out))))
+			if err != nil {
+				t.Fatalf("ParseAddr: %v", err)
+			}
+			if got := !ci.PresharedKey.IsZero(); got != tt.wantPSK {
+				t.Errorf("address has PSK = %v; want %v", got, tt.wantPSK)
+			}
+
+			j, err := os.ReadFile(keyFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var key tailcat.PrivateKey
+			if err := json.Unmarshal(j, &key); err != nil {
+				t.Fatal(err)
+			}
+			if got := !key.Public.PresharedKey.IsZero(); got != tt.wantPSK {
+				t.Errorf("saved key has PSK = %v; want %v", got, tt.wantPSK)
+			}
+		})
+	}
+}
+
 // TestForwardSubcommand verifies that forward parses its bind flag and
 // positional tailcat address and mappings without executing the listener.
 func TestForwardSubcommand(t *testing.T) {
@@ -375,5 +482,177 @@ func TestUnknownArgSelectsRoot(t *testing.T) {
 	}
 	if sel := root.GetSelected(); sel != root {
 		t.Errorf("selected command = %q; want root", sel.Name)
+	}
+}
+
+// TestGenkeyEmbedDERPMapRejectsRegionlessModes verifies that
+// --embed-derp-map rejects the --region forms that name no region in
+// the fetched DERP map, rather than dereferencing the missing region
+// and panicking (issue #90).
+func TestGenkeyEmbedDERPMapRejectsRegionlessModes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string // expected substring of the error
+	}{
+		{
+			name: "explicit auto",
+			args: []string{"genkey", "--key=k", "--embed-derp-map", "--region=auto"},
+			want: "mutually exclusive",
+		},
+		{
+			name: "custom DERP hostname",
+			args: []string{"genkey", "--key=k", "--embed-derp-map", "--region=derp1.example.com"},
+			want: "does not take DERP hostnames",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			root, err := parseCLI(t, tt.args...)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tt.args, err)
+			}
+			err = root.Run(t.Context())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("run %q: err = %v; want one containing %q", tt.args, err, tt.want)
+			}
+			var ue usageError
+			if !errors.As(err, &ue) {
+				t.Errorf("run %q: err is not a usageError", tt.args)
+			}
+		})
+	}
+}
+
+// TestGenkeyEmbedDERPMap verifies that --embed-derp-map bakes the
+// region's nodes into the address instead of panicking when --region
+// is left at its "auto" default (issue #90).
+func TestGenkeyEmbedDERPMap(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	for _, tt := range []struct {
+		name  string
+		extra []string
+	}{
+		{name: "default region"},
+		{name: "explicit region", extra: []string{"--region=1"}},
+		{name: "fixed region", extra: []string{"--fixed-region"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			keyFile := filepath.Join(t.TempDir(), "server.private.json")
+			args := append([]string{
+				"genkey",
+				"--key=" + keyFile,
+				"--derpmap-url=" + e.derpMapURL,
+				"--embed-derp-map",
+			}, tt.extra...)
+			out, err := e.cmd(args...).Output()
+			if err != nil {
+				t.Fatalf("genkey %q: %v", tt.extra, err)
+			}
+			ci, err := tailcat.ParseAddr(tailcat.Addr(strings.TrimSpace(string(out))))
+			if err != nil {
+				t.Fatalf("ParseAddr: %v", err)
+			}
+			if len(ci.Region) == 0 {
+				t.Fatal("address embeds no DERP region")
+			}
+			if len(ci.Region[0].Nodes) == 0 {
+				t.Error("embedded DERP region has no nodes")
+			}
+			// The embedded region replaces the region ID, so
+			// servers and clients need no DERP map to find it.
+			if ci.RegionID != 0 {
+				t.Errorf("RegionID = %d; want 0 for an embedded region", ci.RegionID)
+			}
+		})
+	}
+}
+
+// TestGenkeyEmbedDERPMapUnknownRegion verifies that naming a region
+// absent from the DERP map fails with a diagnostic rather than a nil
+// map lookup panic (issue #90).
+func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	keyFile := filepath.Join(t.TempDir(), "server.private.json")
+	out, err := e.cmd(
+		"genkey",
+		"--key="+keyFile,
+		"--derpmap-url="+e.derpMapURL,
+		"--embed-derp-map",
+		"--region=99999",
+	).CombinedOutput()
+	if err == nil {
+		t.Fatalf("genkey --region=99999 succeeded; want an error\n%s", out)
+	}
+	if bytes.Contains(out, []byte("panic:")) {
+		t.Errorf("genkey panicked:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("no DERP region 99999")) {
+		t.Errorf("output = %q; want it to name the missing region", out)
+	}
+}
+
+// TestParsePortSetTargets covers the "port:target" serve mappings:
+// a bare port target means that port on localhost, a host:port
+// target is kept as given (IPv6 in brackets), and conflicting
+// mappings of one port are rejected.
+func TestParsePortSetTargets(t *testing.T) {
+	for _, tt := range []struct {
+		spec        string
+		wantPorts   []uint16
+		wantTargets map[uint16]string
+		wantErr     string
+	}{
+		{
+			spec:        "5555:10.2.200.213:5555",
+			wantPorts:   []uint16{5555},
+			wantTargets: map[uint16]string{5555: "10.2.200.213:5555"},
+		},
+		{
+			spec:        "8080:80,443",
+			wantPorts:   []uint16{443, 8080},
+			wantTargets: map[uint16]string{8080: "localhost:80"},
+		},
+		{
+			spec:        "5555:[fd7a::1]:5555",
+			wantPorts:   []uint16{5555},
+			wantTargets: map[uint16]string{5555: "[fd7a::1]:5555"},
+		},
+		{
+			spec:        "5555:android.lan:5555",
+			wantPorts:   []uint16{5555},
+			wantTargets: map[uint16]string{5555: "android.lan:5555"},
+		},
+		{
+			spec:        "5555:10.2.200.213:5555,5555:10.2.200.213:5555",
+			wantPorts:   []uint16{5555},
+			wantTargets: map[uint16]string{5555: "10.2.200.213:5555"},
+		},
+		{spec: "5555:10.2.200.213:5555,5555:10.2.200.214:5555", wantErr: "mapped to both"},
+		{spec: "5555:10.2.200.213", wantErr: "not a port or host:port"},
+		{spec: "0:10.2.200.213:5555", wantErr: "not a valid port"},
+		{spec: "5555:10.2.200.213:0", wantErr: "not a valid port"},
+		{spec: "5555:10.2.200.213:99999", wantErr: "not a valid port"},
+		{spec: "5555::5555", wantErr: "not a port or host:port"},
+		{spec: "http:10.2.200.213:5555", wantErr: "not a valid port"},
+	} {
+		ports, _, targets, err := parsePortSet(tt.spec)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("parsePortSet(%q) error = %v; want one containing %q", tt.spec, err, tt.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parsePortSet(%q): %v", tt.spec, err)
+			continue
+		}
+		if got := slices.Sorted(maps.Keys(ports)); !slices.Equal(got, tt.wantPorts) {
+			t.Errorf("parsePortSet(%q) ports = %v; want %v", tt.spec, got, tt.wantPorts)
+		}
+		if !maps.Equal(targets, tt.wantTargets) {
+			t.Errorf("parsePortSet(%q) targets = %v; want %v", tt.spec, targets, tt.wantTargets)
+		}
 	}
 }

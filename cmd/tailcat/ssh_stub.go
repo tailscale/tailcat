@@ -14,6 +14,10 @@ import (
 
 const tailCatSSHEnabled = false
 
+func loadSSHAuthorizedKeys(context.Context, string) ([]string, error) {
+	return nil, errors.New("SSH support not compiled in")
+}
+
 // sshCommand returns a stub "tailcat ssh" subcommand that only
 // reports that SSH support was omitted from this build.
 func sshCommand(parent *ff.FlagSet) *ff.Command {

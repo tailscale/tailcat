@@ -12,7 +12,5 @@
 *.test
 *.out
 
-# libtailcat / TailcatKit build outputs.
-/libtailcat/build/
-/swift/CTailcat.xcframework
-/swift/.build
+# libtailcat build output (see cmd/libtailcat/README.md).
+/build

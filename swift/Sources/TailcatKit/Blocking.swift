@@ -1,48 +1,98 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
+import CTailcat
 import Dispatch
+import os
 
-/// Runs blocking C calls off the Swift concurrency thread pool.
-///
-/// tailcat_server_start, tailcat_client_ping, tailcat_client_path_json,
-/// tailcat_client_dial and tailcat_addr_resolve block for the duration
-/// of their network work, so they run on a dedicated dispatch queue and
-/// callers await a continuation. They are never called on an actor
-/// executor or on the cooperative pool.
+/// Keeps synchronous C calls, including resource teardown, off actor executors.
 enum Blocking {
-    static let queue = DispatchQueue(
-        label: "dev.tailcat.blocking",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
+    static let queue = DispatchQueue(label: "dev.tailcat.blocking", qos: .userInitiated, attributes: .concurrent)
 
-    /// Runs body on the blocking queue and returns its result.
-    static func run<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+    static func perform<T: Sendable>(on queue: DispatchQueue = queue,
+                                    _ body: @escaping @Sendable () throws -> T) async throws -> T {
         try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                continuation.resume(with: Result(catching: body))
-            }
+            queue.async { continuation.resume(with: Result(catching: body)) }
+        }
+    }
+
+    /// Each operation gets its own token. Its deadline includes dispatch queue
+    /// time, and Swift cancellation interrupts C without retiring the resource.
+    /// A successful result wins a cancellation race and remains caller-owned.
+    static func run<T: Sendable>(timeout: Duration? = nil, on queue: DispatchQueue = queue,
+                                _ body: @escaping @Sendable (UInt64) throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        let token = try CancellationToken(timeout: timeout)
+        return try await withTaskCancellationHandler {
+            try await perform(on: queue) { try body(token.handle) }
+        } onCancel: {
+            token.cancel()
         }
     }
 }
 
+private final class CancellationToken: Sendable {
+    let handle: UInt64
+
+    init(timeout: Duration?) throws {
+        var handle: UInt64 = 0
+        try CAPI.check { tc_token_new(timeout?.nanosecondsForC ?? -1, &handle, $0) }
+        self.handle = handle
+    }
+
+    func cancel() { _ = tc_token_cancel(handle, nil) }
+    // The operation and its cancellation handler retain us until both return.
+    deinit { _ = tc_close(handle, nil) }
+}
+
+/// Owns one never-reused C handle. Explicit close waits for teardown on a worker;
+/// deinit schedules it there without blocking an actor or the cooperative pool.
+final class Handle: Sendable {
+    private struct State: Sendable {
+        var raw: UInt64
+        var closing: Task<Void, Never>?
+    }
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(_ handle: UInt64) { state = OSAllocatedUnfairLock(initialState: State(raw: handle)) }
+
+    func value() throws -> UInt64 {
+        try state.withLock {
+            guard $0.raw != 0 else { throw TailcatError.closed }
+            return $0.raw
+        }
+    }
+
+    func close() async {
+        let closing = state.withLock { state in
+            if let closing = state.closing { return closing }
+            let raw = state.raw
+            state.raw = 0
+            let closing = Task.detached {
+                _ = try? await Blocking.perform { tc_close(raw, nil) }
+            }
+            state.closing = closing
+            return closing
+        }
+        await closing.value
+    }
+
+    deinit {
+        let raw = state.withLock { $0.raw }
+        if raw != 0 { Blocking.queue.async { _ = tc_close(raw, nil) } }
+    }
+}
+
 extension Duration {
-    /// The duration in whole milliseconds as the C layer takes timeouts,
-    /// rounded up, since a positive timeout must never become 0, which
-    /// means no limit, and clamped to Int32. Zero or less means no limit
-    /// beyond tailcat's own.
-    var millisecondsForC: Int32 {
-        guard self > .zero else {
-            return 0
-        }
+    /// ABI timeouts are nanoseconds. Round positive fractions up and saturate.
+    /// Zero/negative durations expire immediately; nil means no deadline.
+    var nanosecondsForC: Int64 {
+        guard self > .zero else { return 0 }
         let (seconds, attoseconds) = components
-        if seconds >= Int64(Int32.max) / 1000 {
-            return Int32.max
-        }
-        let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
-        let (wholeMilliseconds, rest) = attoseconds.quotientAndRemainder(dividingBy: attosecondsPerMillisecond)
-        let milliseconds = seconds * 1000 + wholeMilliseconds + (rest > 0 ? 1 : 0)
-        return Int32(clamping: milliseconds)
+        let (whole, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        guard !overflow else { return .max }
+        let fraction = attoseconds / 1_000_000_000 + (attoseconds % 1_000_000_000 > 0 ? 1 : 0)
+        let (result, sumOverflow) = whole.addingReportingOverflow(fraction)
+        return sumOverflow ? .max : result
     }
 }

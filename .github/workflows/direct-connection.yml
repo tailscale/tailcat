@@ -1,0 +1,101 @@
+# Checks whether two GitHub Actions runner VMs can reach each other
+# over a direct (non-DERP) path with tailcat. Run it by hand from the
+# Actions tab; the answer is in the job summary and the server/client
+# job logs.
+#
+# The genkey job makes a server key and a client key with the real
+# tailcat CLI and passes them to the other two jobs as outputs. The
+# server and client jobs then run in parallel on separate VMs using
+# tool/directtest: the server allowlists the client, echoes on a TCP
+# port, and reports what Server.Status says about the client's path;
+# the client waits for the server to come up, checks connectivity with
+# an echo round trip, and pings for 30 seconds hoping for a direct
+# pong. A relayed path is a warning, not a failure: this workflow
+# exists to find out, and connectivity failures are what turn it red.
+#
+# The keys are single-use and thrown away with the run, and the
+# server only admits the one client key, so having them appear in job
+# outputs and logs is fine. (Masking them with ::add-mask:: would make
+# GitHub drop the outputs, since it refuses to pass masked values
+# between jobs.)
+
+name: direct-connection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  genkey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      addr: ${{ steps.gen.outputs.addr }}
+      client-pub: ${{ steps.gen.outputs.client-pub }}
+      server-key: ${{ steps.gen.outputs.server-key }}
+      client-key: ${{ steps.gen.outputs.client-key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build -o /tmp/tailcat ./cmd/tailcat
+      - name: generate server and client keys
+        id: gen
+        # --fixed-region picks the DERP region nearest this runner now
+        # and bakes it into the key and address, so the server job
+        # doesn't have to probe for one and the client job can be
+        # given the final address before the server exists.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/keys
+          addr=$(/tmp/tailcat genkey --key=/tmp/keys/server.private.json --fixed-region)
+          client_pub=$(/tmp/tailcat genkey --client --key=/tmp/keys/client.private.json)
+          echo "tailcat address: $addr"
+          echo "client node key: $client_pub"
+          {
+            echo "addr=$addr"
+            echo "client-pub=$client_pub"
+            echo "server-key=$(base64 -w0 /tmp/keys/server.private.json)"
+            echo "client-key=$(base64 -w0 /tmp/keys/client.private.json)"
+          } >> "$GITHUB_OUTPUT"
+
+  server:
+    needs: genkey
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build -o /tmp/directtest ./tool/directtest
+      - name: serve and watch the client's path
+        env:
+          SERVER_KEY: ${{ needs.genkey.outputs.server-key }}
+          CLIENT_PUB: ${{ needs.genkey.outputs.client-pub }}
+        run: |
+          set -euo pipefail
+          echo "$SERVER_KEY" | base64 -d > /tmp/server.private.json
+          /tmp/directtest server --key=/tmp/server.private.json --allow="$CLIENT_PUB" --timeout=4m
+
+  client:
+    needs: genkey
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go build -o /tmp/directtest ./tool/directtest
+      - name: connect and ping for a direct path
+        env:
+          CLIENT_KEY: ${{ needs.genkey.outputs.client-key }}
+          ADDR: ${{ needs.genkey.outputs.addr }}
+        run: |
+          set -euo pipefail
+          echo "$CLIENT_KEY" | base64 -d > /tmp/client.private.json
+          /tmp/directtest client --key=/tmp/client.private.json --connect-timeout=3m --direct-timeout=30s "$ADDR"

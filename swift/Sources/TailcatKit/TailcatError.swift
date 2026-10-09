@@ -4,136 +4,96 @@
 import CTailcat
 import Foundation
 
-/// The errors TailcatKit throws.
+/// Errors returned by TailcatKit. C errors are classified by ABI status code.
 public enum TailcatError: Error, Sendable, Equatable, CustomStringConvertible {
-    /// The underlying C handle is not valid, typically because the object
-    /// was closed.
-    case invalidHandle
-    /// The tailcat address is malformed; the payload is the parser's
-    /// message.
+    case invalidArgument(String)
     case invalidAddress(String)
-    /// The identity JSON is malformed; the payload is the parser's message.
     case invalidKey(String)
-    /// The identity leaves the relay to be picked when a server starts, so
-    /// its address is only known once such a server is running.
-    case relayNotFixed
-    /// The operation needs a started server.
-    case notStarted
-    /// The server is already starting or started.
-    case alreadyStarted
-    /// The object (server, client, listener or connection) is closed.
     case closed
-    /// The operation did not complete within its timeout.
     case timeout
-    /// The port is not valid for the operation.
     case invalidPort
-    /// A POSIX error: errno and its text.
-    case posix(Int32, String)
-    /// Any other error, with the text reported by the Go side.
     case internalError(String)
 
-    /// A short description of the error.
     public var description: String {
         switch self {
-        case .invalidHandle: "invalid handle"
+        case .invalidArgument(let message): "invalid argument: \(message)"
         case .invalidAddress(let message): "invalid tailcat address: \(message)"
         case .invalidKey(let message): "invalid identity: \(message)"
-        case .relayNotFixed: "the identity's relay is chosen at start; the address is only known once a server using it has started"
-        case .notStarted: "the server is not started"
-        case .alreadyStarted: "the server is already started"
         case .closed: "closed"
         case .timeout: "timed out"
         case .invalidPort: "invalid port"
-        case .posix(let code, let message): "\(message) (errno \(code))"
         case .internalError(let message): message
         }
     }
 }
 
-extension TailcatError {
-    /// Throws the error a handle function's return code stands for, if any.
-    static func check(_ rc: Int32, handle: Int32) throws {
-        if rc != 0 {
-            throw fromReturnCode(rc, handle: handle)
+/// A failed send that already handed bytes to the tunnel. Do not replay them.
+public struct PartialWriteError: Error, Sendable {
+    public let bytesWritten: Int
+    public let underlyingError: any Error
+}
+
+/// The only owner of error and string allocations crossing the C boundary.
+enum CAPI {
+    static func error(_ status: Int32, _ message: String?) -> (any Error)? {
+        switch Int(status) {
+        case TC_OK: nil
+        case TC_INVALID_ARGUMENT: TailcatError.invalidArgument(message ?? "invalid argument")
+        case TC_CLOSED: TailcatError.closed
+        case TC_TIMEOUT: TailcatError.timeout
+        case TC_CANCELLED: CancellationError()
+        default: TailcatError.internalError(message ?? "C API status \(status)")
         }
     }
 
-    /// Maps a handle function's non-zero return code: EBADF, ERANGE, or -1
-    /// with the message tailcat_errmsg holds for the handle.
-    static func fromReturnCode(_ rc: Int32, handle: Int32) -> TailcatError {
-        switch rc {
-        case EBADF:
-            return .invalidHandle
-        case ERANGE:
-            return .internalError("buffer too small")
-        default:
-            return classify(message: lastMessage(handle: handle))
-        }
+    static func check(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32) throws {
+        var message: UnsafeMutablePointer<CChar>?
+        let status = body(&message)
+        if let error = error(status, take(message)) { throw error }
     }
 
-    /// Reads the last error message recorded on handle.
-    static func lastMessage(handle: Int32) -> String {
-        for size in [1024, 16384] {
-            var buf = [CChar](repeating: 0, count: size)
-            let rc = buf.withUnsafeMutableBufferPointer { tailcat_errmsg(handle, $0.baseAddress, $0.count) }
-            switch rc {
-            case 0:
-                let message = CStrings.string(buf)
-                return message.isEmpty ? "unknown error" : message
-            case ERANGE:
-                continue
-            default:
-                return "unknown error (handle \(handle) is invalid)"
-            }
-        }
-        return "unknown error (message too long)"
+    static func string(_ body: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+                                UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32) throws -> String {
+        var out: UnsafeMutablePointer<CChar>?
+        defer { tc_free(out) }
+        try check { body(&out, $0) }
+        guard let out else { throw TailcatError.internalError("C API returned no string") }
+        return String(cString: out)
     }
 
-    /// Picks the error case that best fits a message from the Go side.
-    static func classify(message: String) -> TailcatError {
-        let m = message.lowercased()
-        if m.contains("deadline exceeded") || m.contains("timeout") || m.contains("timed out") {
-            return .timeout
-        }
-        if m.contains("already started") {
-            return .alreadyStarted
-        }
-        if m.contains("server closed") || m.contains("client closed") {
-            return .closed
-        }
-        if m.contains("connection refused") || m.contains("connection was refused") {
-            return .posix(ECONNREFUSED, message)
-        }
-        return .internalError(message)
+    static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
+        guard let pointer else { return nil }
+        defer { tc_free(pointer) }
+        return String(cString: pointer)
     }
 
-    /// A POSIX error with the system's text for code.
-    static func posix(_ code: Int32) -> TailcatError {
-        .posix(code, String(cString: strerror(code)))
+    static func info(_ handle: UInt64, _ token: UInt64) throws -> ResourceInfo {
+        let json = try string { tc_info(handle, token, $0, $1) }
+        return try JSONDecoder().decode(ResourceInfo.self, from: Data(json.utf8))
     }
 }
 
-/// Helpers for strings crossing the C boundary.
-enum CStrings {
-    /// Returns the text of a malloc'd C string and frees it; nil for NULL.
-    static func take(_ p: UnsafeMutablePointer<CChar>?) -> String? {
-        guard let p else { return nil }
-        defer { free(p) }
-        return String(cString: p)
+struct ResourceInfo: Decodable, Sendable {
+    var address: String?
+    var publicKey: String?
+    var localAddress: String?
+    var remoteAddress: String?
+
+    enum CodingKeys: String, CodingKey {
+        case address
+        case publicKey = "public_key"
+        case localAddress = "local_address"
+        case remoteAddress = "remote_address"
     }
 
-    /// Returns the bytes of a malloc'd C string and frees it; nil for NULL.
-    static func takeData(_ p: UnsafeMutablePointer<CChar>?) -> Data? {
-        guard let p else { return nil }
-        defer { free(p) }
-        return Data(bytes: p, count: strlen(p))
+    var localPort: UInt16? {
+        localAddress?.split(separator: ":").last.flatMap { UInt16($0) }
     }
+}
 
-    /// The string in a NUL-terminated buffer.
-    static func string(_ buf: [CChar]) -> String {
-        buf.withUnsafeBufferPointer { p in
-            guard let base = p.baseAddress, p.contains(0) else { return "" }
-            return String(cString: base)
-        }
+extension String {
+    // The C ABI borrows input strings and never modifies or retains them.
+    func withCInput<T>(_ body: (UnsafeMutablePointer<CChar>) throws -> T) rethrows -> T {
+        try withCString { try body(UnsafeMutablePointer(mutating: $0)) }
     }
 }

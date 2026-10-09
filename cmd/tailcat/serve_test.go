@@ -6,16 +6,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tailscale/tailcat"
 )
 
 // startEchoListener starts a TCP echo server on a 127.0.0.1 ephemeral
@@ -42,6 +46,92 @@ func startEchoListener(t *testing.T) uint16 {
 	return uint16(ln.Addr().(*net.TCPAddr).Port)
 }
 
+// startUDPEcho starts a UDP echo server on 127.0.0.1 and returns its port.
+func startUDPEcho(t *testing.T) uint16 {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 64<<10)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			pc.WriteTo(buf[:n], addr)
+		}
+	}()
+	return uint16(pc.LocalAddr().(*net.UDPAddr).Port)
+}
+
+func TestServeWithoutPSK(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	_, addr, serverStderr := e.startServer("serve", "--psk=false", strconv.Itoa(int(port)))
+
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.PresharedKey.IsZero() {
+		t.Fatal("serve --psk=false produced an address containing a PSK")
+	}
+	waitForLog(t, serverStderr, "# ⚠️ WARNING: serving without a WireGuard PSK\n")
+
+	const payload = "echo without a pre-shared key"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to server without PSK: %v", err)
+	}
+	if got != payload {
+		t.Errorf("server echoed %q; want %q", got, payload)
+	}
+}
+
+func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	keyFile := filepath.Join(t.TempDir(), "server.private.json")
+	genkey := e.cmd("genkey", "--key="+keyFile, "--region=1", "--psk=false")
+	if out, err := genkey.CombinedOutput(); err != nil {
+		t.Fatalf("genkey: %v\n%s", err, out)
+	}
+
+	addrFile := filepath.Join(t.TempDir(), "addr")
+	server := e.cmd("--key="+keyFile, "--derpmap-url="+e.derpMapURL, "serve", strconv.Itoa(int(port)))
+	server.Env = append(server.Env, "TAILCAT_ADDR_FILE="+addrFile)
+	var serverStderr lockedBuf
+	server.Stderr = &serverStderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { server.Process.Kill() })
+	addr := waitAddr(t, addrFile, &serverStderr)
+
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.PresharedKey.IsZero() {
+		t.Fatal("saved PSK-free key produced an address containing a PSK")
+	}
+	waitForLog(t, &serverStderr, fmt.Sprintf("# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", keyFile))
+
+	const payload = "echo with saved PSK policy"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), &serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to saved server without PSK: %v", err)
+	}
+	if got != payload {
+		t.Errorf("server echoed %q; want %q", got, payload)
+	}
+}
+
 // runClient runs an unstarted tailcat client command with payload on
 // its stdin and a 60 second watchdog, returning its stdout and error.
 // The watchdog only exists to catch true hangs; it's generous because
@@ -49,7 +139,7 @@ func startEchoListener(t *testing.T) uint16 {
 // waiting out TCP retransmit backoff. On failure, the error includes
 // the client's stderr and the given server stderr (which may be nil),
 // so both sides of a wedged conversation are visible.
-func runClient(t *testing.T, client *exec.Cmd, serverStderr *bytes.Buffer, payload string) (string, error) {
+func runClient(t *testing.T, client *exec.Cmd, serverStderr *lockedBuf, payload string) (string, error) {
 	t.Helper()
 	client.Stdin = strings.NewReader(payload)
 	var stdout, stderr bytes.Buffer
@@ -85,6 +175,7 @@ func runClient(t *testing.T, client *exec.Cmd, serverStderr *bytes.Buffer, paylo
 // port to the same local port, and refuses connections to ports
 // outside the list.
 func TestServePorts(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 
@@ -107,9 +198,30 @@ func TestServePorts(t *testing.T) {
 		t.Errorf("served port echoed %q; want %q", got, payload)
 	}
 
-	got, err = runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(unservedPort)), serverStderr, payload)
-	if err == nil {
-		t.Errorf("client to unserved port %v succeeded with output %q; want connection failure", unservedPort, got)
+	// The packet filter silently drops SYNs to unserved ports (no
+	// RST; see Server.ServedTCPPorts), so instead of waiting out the
+	// client's whole dial timeout, watch the verbose server's filter
+	// log for the drop and then check the client never got the echo.
+	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(unservedPort))
+	client.Stdin = strings.NewReader(payload)
+	var clientOut bytes.Buffer
+	client.Stdout = &clientOut
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	dropRx := regexp.MustCompile(fmt.Sprintf(`Drop: TCP\{.*\]:%d\}`, unservedPort))
+	deadline := time.Now().Add(30 * time.Second)
+	for !dropRx.MatchString(serverStderr.String()) {
+		if time.Now().After(deadline) {
+			client.Process.Kill()
+			t.Fatalf("server never logged dropping the SYN to unserved port %v; server stderr:\n%s", unservedPort, serverStderr.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	client.Process.Kill()
+	client.Wait()
+	if clientOut.Len() > 0 {
+		t.Errorf("client to unserved port %v got output %q; want none", unservedPort, clientOut.String())
 	}
 }
 
@@ -118,6 +230,7 @@ func TestServePorts(t *testing.T) {
 // client given an IP:port argument and through the SOCKS5 proxy that
 // "tailcat socks" runs.
 func TestServeExitNode(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 	port := startEchoListener(t)
 	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
@@ -183,6 +296,50 @@ func TestServeExitNode(t *testing.T) {
 // CONNECT to the IPv4 destination dst, returning the proxied
 // connection. It hand-rolls the tiny client side of RFC 1928 rather
 // than adding a dependency on golang.org/x/net/proxy.
+
+// TestServeExitNodeUDP verifies that a --serve=exit-node server forwards
+// UDP flows to arbitrary IP:port destinations. Exit-node clients send UDP
+// through the tunnel the same way they send TCP (DNS, QUIC, ...), so a
+// server that only registers OnTCPForward leaves those flows black-holed:
+// the tunnel is up and TCP works, but UDP never comes back.
+func TestServeExitNodeUDP(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startUDPEcho(t)
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	_, addr, serverStderr := e.startServer("--verbose", "--serve=exit-node")
+
+	cl := &tailcat.Client{
+		Server:     tailcat.Addr(addr),
+		DERPMapURL: e.derpMapURL,
+		Logf:       testLogger(t, "client"),
+	}
+	t.Cleanup(func() { cl.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := cl.DialUDP(ctx, dst)
+	if err != nil {
+		t.Fatalf("DialUDP %v: %v", dst, err)
+	}
+	defer conn.Close()
+
+	const payload = "echo through the exit node over udp"
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatalf("udp write: %v", err)
+	}
+	buf := make([]byte, 64<<10)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("udp read (no reply through the exit node): %v\nserver log:\n%s", err, serverStderr.String())
+	}
+	if got := string(buf[:n]); got != payload {
+		t.Errorf("exit node echoed %q over udp; want %q", got, payload)
+	}
+}
+
 func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn {
 	t.Helper()
 	c, err := net.Dial("tcp", proxyAddr)
@@ -229,4 +386,35 @@ func socks5Connect(t *testing.T, proxyAddr string, dst netip.AddrPort) net.Conn 
 	}
 	c.SetDeadline(time.Time{})
 	return c
+}
+
+// TestServePortMapping serves a port mapped to a different port on
+// 127.0.0.1 (standing in for another host on the server's network)
+// and checks that a client connecting to the served port reaches the
+// mapping's target rather than the same port on localhost.
+func TestServePortMapping(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	echoPort := startEchoListener(t)
+	// Serve a port that nothing listens on locally, so only the
+	// mapping can make the connection work.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	servedPort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	mapping := fmt.Sprintf("%d:127.0.0.1:%d", servedPort, echoPort)
+	_, addr, serverStderr := e.startServer("serve", mapping)
+	waitForLog(t, serverStderr, fmt.Sprintf("# Proxying port %d to 127.0.0.1:%d\n", servedPort, echoPort))
+
+	const payload = "echo through a port mapping"
+	got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(servedPort)), serverStderr, payload)
+	if err != nil {
+		t.Fatalf("client to mapped port: %v", err)
+	}
+	if got != payload {
+		t.Errorf("mapped port echoed %q; want %q", got, payload)
+	}
 }

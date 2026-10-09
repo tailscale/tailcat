@@ -33,6 +33,8 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/internal/localhostdns"
+	"github.com/tailscale/tailcat/internal/perf"
 	"go4.org/mem"
 	xmaps "golang.org/x/exp/maps"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -50,15 +52,19 @@ import (
 // The global flags, shared by all subcommands. They're set by
 // newRootCommand, which must run before any of them are dereferenced.
 var (
-	flagServe       *string
-	flagKey         *string
-	flagAllow       *string
-	flagFiles       *string
-	flagVerbose     *bool
-	flagFullAddress *bool
-	flagJSON        *bool
-	flagDERPMapURL  *string
+	flagServe             *string
+	flagKey               *string
+	flagAllow             *string
+	flagFiles             *string
+	flagSSHAuthorizedKeys *string
+	flagPSK               *bool
+	flagVerbose           *bool
+	flagFullAddress       *bool
+	flagJSON              *bool
+	flagDERPMapURL        *string
 )
+
+var serveFS *ff.FlagSet
 
 // The genkey subcommand's flags, likewise set by newRootCommand.
 var (
@@ -71,6 +77,7 @@ var (
 	genkeyRegion       *string
 	genkeyFixedRegion  *bool
 	genkeyEmbedDERPMap *bool
+	genkeyPSK          *bool
 )
 
 // getLogf returns the logger implied by the --verbose flag.
@@ -86,16 +93,18 @@ func getLogf() logger.Logf {
 // package-level flag value pointers.
 func newRootCommand() *ff.Command {
 	rootFS := ff.NewFlagSet("tailcat")
-	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
+	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio), 'perf' (accept throughput tests from 'tailcat perf'). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
-	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
+	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout; with perf, write the results as JSON")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
 
-	serveFS := ff.NewFlagSet("serve").SetParent(rootFS)
+	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
+	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
+	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -119,7 +128,8 @@ func newRootCommand() *ff.Command {
 	genkeyList = genkeyFS.BoolLong("list", "list saved key names and exit")
 	genkeyRegion = genkeyFS.StringLong("region", "auto", "region ID, code, or substring to use. Or a hostname(s) comma-separated to use a custom DERP server(s). If 'auto', one is picked based on latency at each server startup. If 'list', list all regions.")
 	genkeyFixedRegion = genkeyFS.BoolLong("fixed-region", "discover the nearest DERP region once, now, and bake it into the key and tailcat address, so future server startups (and clients) use it without re-probing")
-	genkeyEmbedDERPMap = genkeyFS.BoolLong("embed-derp-map", "embed the DERP map nodes in the tailcat address")
+	genkeyEmbedDERPMap = genkeyFS.BoolLong("embed-derp-map", "embed the DERP map nodes in the tailcat address. Needs a region chosen now, so it implies --fixed-region unless --region names one")
+	genkeyPSK = genkeyFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the generated server key and tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 
 	return &ff.Command{
 		Name:      "tailcat",
@@ -130,11 +140,12 @@ func newRootCommand() *ff.Command {
 		Subcommands: []*ff.Command{
 			{
 				Name:      "serve",
-				Usage:     "tailcat serve [flags] [<port,service,...> ...]",
+				Usage:     "tailcat serve [flags] [<port,service,...> ...] [-- <command> [args...]]",
 				ShortHelp: "run a server (the default when tailcat is run with no arguments)",
 				LongHelp:  serveLongHelp,
 				Flags:     serveFS,
 				Exec: func(ctx context.Context, args []string) error {
+					args, execArgs := splitExecArgs(args)
 					spec := *flagServe
 					if len(args) > 0 {
 						if spec != "" {
@@ -142,7 +153,7 @@ func newRootCommand() *ff.Command {
 						}
 						spec = strings.Join(args, ",")
 					}
-					server(getLogf(), spec)
+					server(getLogf(), spec, execArgs)
 					return nil
 				},
 			},
@@ -156,6 +167,7 @@ func newRootCommand() *ff.Command {
 					return clientPingMode(getLogf(), *pingUntilDirect, *pingTimeout, args)
 				},
 			},
+			perfCommand(rootFS),
 			{
 				Name:      "socks",
 				Usage:     "tailcat socks [--listen=<addr:port>] [<tc-addr>] [<cmd> [args...]]",
@@ -188,7 +200,7 @@ func newRootCommand() *ff.Command {
 						mode = ":wo+"
 					}
 					*flagFiles = dir + mode
-					server(getLogf(), "")
+					server(getLogf(), "", nil)
 					return nil
 				},
 			},
@@ -196,6 +208,7 @@ func newRootCommand() *ff.Command {
 			cpCommand(rootFS),
 			lsCommand(rootFS),
 			forwardCommand(rootFS),
+			browseCommand(rootFS),
 			{
 				Name:      "parse",
 				Usage:     "tailcat parse <tc-addr>",
@@ -254,13 +267,17 @@ func newRootCommand() *ff.Command {
 			if len(args) > 0 && args[0] == "help" {
 				return ff.ErrHelp
 			}
+			args, execArgs := splitExecArgs(args)
 			serverMode := len(args) == 0 || *flagServe != ""
 			if len(args) > 0 && serverMode {
 				return usagef("no positional arguments are valid along with --serve")
 			}
 			if serverMode {
-				server(getLogf(), *flagServe)
+				server(getLogf(), *flagServe, execArgs)
 				return nil
+			}
+			if execArgs != nil {
+				return usagef("a -- command is only valid in server mode")
 			}
 			if len(args) > 2 {
 				return usagef("too many arguments; client mode takes <tc-addr> [<port>]")
@@ -286,10 +303,13 @@ Server mode, all ports:
 
 	tailcat serve all
 
-Server mode, certain ports and Tailscale SSH (auth without
-password or public key):
+Server mode, certain ports and auth-free SSH:
 
 	tailcat serve 80,no-auth-ssh
+
+Server mode, SSH requiring an authorized public key:
+
+	tailcat serve --ssh-authorized-keys=alice@github ssh
 
 Server mode, exit node (clients can reach the server's whole network):
 
@@ -312,6 +332,12 @@ Anywhere a <tc-addr> argument is accepted, a DNS name whose
 "tailcat=" TXT record contains one may be used instead:
 
 	tailcat ssh example.com
+
+But beware: a tailcat address is normally a secret, and a DNS TXT
+record is public, so a server named in DNS must authenticate its
+clients some other way: --allow at the tunnel layer, or the ssh
+service's --ssh-authorized-keys. Never publish a no-auth-ssh server's
+address; that gives a shell to anyone who reads the TXT record.
 
 Client mode, ping. Each pong reports whether it arrived via a DERP
 relay or a direct path. --until-direct keeps pinging (bounded by
@@ -401,19 +427,44 @@ const serveLongHelp = `Run a tailcat server, printing its tailcat address for cl
 connect to. Running tailcat with no arguments is the same as running
 "tailcat serve" with no arguments.
 
-The arguments are port numbers, port ranges, and service names,
-either as separate arguments or comma-separated. Ports are proxied
-to the same port on localhost. Service names are:
+The arguments are port numbers, port ranges, port mappings, and
+service names, either as separate arguments or comma-separated.
+Ports are proxied to the same port on localhost. A port mapping
+"port:target" proxies a port elsewhere instead: to a different port
+on localhost ("8080:80") or to a host:port on the server's network
+("5555:10.2.200.213:5555", or "5555:[fd7a::1]:5555" for IPv6).
+Service names are:
 
 	all          serve all ports
 	exit-node    run an exit node for all addresses
-	no-auth-ssh  auth-free SSH server (the tunnel provides identity)
+	ssh          SSH server requiring a public key listed by
+	             --ssh-authorized-keys
+	no-auth-ssh  auth-free SSH server (the tunnel provides identity;
+	             the served process gets the peer's node key in
+	             $TAILCAT_PEER_KEY)
 	files        file server for SFTP clients like scp and sftp,
 	             rooted in the --files directory (default: the
 	             current directory, read-only)
+	exec         run the command given after "--" for each
+	             connection to any port not otherwise served, with
+	             the connection as the command's stdin and stdout
+	             (like inetd); its stderr is the server's
+	perf         accept throughput and latency tests from
+	             "tailcat perf", on TCP and UDP port 5201
 
 With no arguments, the server accepts a single connection on any
 port, writes it to stdout, and exits.
+
+A command after "--" implies the exec service, unless the ssh or
+no-auth-ssh service is also given: then SSH sessions run only that
+command in place of a shell (like OpenSSH's ForceCommand), with a
+PTY if the client asks for one. Such a server offers no shell, no
+client-chosen command, and no SFTP. The client's requested command,
+if any, is passed to the command in $SSH_ORIGINAL_COMMAND.
+
+The command in either form gets the peer's node key in
+$TAILCAT_PEER_KEY (in --allow's format), and its tailcat IP:port in
+$TAILCAT_REMOTE_ADDR.
 
 Flags must come before the port and service arguments.
 
@@ -429,9 +480,22 @@ Serve all ports:
 
 	tailcat serve all
 
+Serve port 5555, proxied to port 5555 on another machine on the
+server's network:
+
+	tailcat serve 5555:10.2.200.213:5555
+
 Serve a port and the auth-free SSH server:
 
 	tailcat serve 80,no-auth-ssh
+
+Serve SSH, trusting public keys fetched from GitHub at startup:
+
+	tailcat serve --ssh-authorized-keys=alice@github ssh
+
+Serve SSH, trusting keys from files and a literal public key:
+
+	tailcat serve --ssh-authorized-keys="$HOME/.ssh/authorized_keys,ssh-ed25519 AAAA..." ssh
 
 Run an exit node (clients can reach the server's whole network):
 
@@ -440,6 +504,15 @@ Run an exit node (clients can reach the server's whole network):
 Serve the current directory read-only to scp and sftp clients:
 
 	tailcat serve files
+
+Run a command for each connection, with the connection as its stdio:
+
+	tailcat serve exec -- /usr/bin/fortune
+
+Serve SSH that runs only one command, in place of a shell:
+
+	tailcat serve --ssh-authorized-keys=alice@github ssh -- ./deploy.sh
+	tailcat serve no-auth-ssh -- git-upload-pack /srv/repo.git
 
 Serve a directory read-write, as a flat write-only drop box, or as a
 recursive write-only drop box:
@@ -1002,16 +1075,7 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 			if err != nil {
 				return nil, err
 			}
-			if dst.addr != "" {
-				return clientForAddr(dst.addr).DialTCPPort(ctx, dst.port)
-			}
-			if cl == nil {
-				return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
-			}
-			if dst.toServer {
-				return cl.DialTCPPort(ctx, dst.port)
-			}
-			return cl.DialTCP(ctx, dst.dst)
+			return dialSOCKSTarget(ctx, network, dst, cl, clientForAddr)
 		},
 	}
 	socksAddr := "socks5h://" + socksLn.Addr().String()
@@ -1035,6 +1099,36 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 		log.Fatalf("SOCKS5 server exited: %v", ss.Serve(socksLn))
 	}
 	return nil
+}
+
+// dialSOCKSTarget dials a classified SOCKS destination over the tailcat
+// tunnel. UDP ASSOCIATE targets (network == "udp") use the connected packet
+// connections from [tailcat.Client.DialUDPPort] and [tailcat.Client.DialUDP],
+// which satisfy net.Conn with datagram-preserving Read/Write as the SOCKS5
+// UDP relay expects; everything else dials TCP as before.
+func dialSOCKSTarget(ctx context.Context, network string, dst socksTarget, cl *tailcat.Client, clientForAddr func(tailcat.Addr) *tailcat.Client) (net.Conn, error) {
+	if network == "udp" {
+		if dst.addr != "" {
+			return clientForAddr(dst.addr).DialUDPPort(ctx, dst.port)
+		}
+		if cl == nil {
+			return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
+		}
+		if dst.toServer {
+			return cl.DialUDPPort(ctx, dst.port)
+		}
+		return cl.DialUDP(ctx, dst.dst)
+	}
+	if dst.addr != "" {
+		return clientForAddr(dst.addr).DialTCPPort(ctx, dst.port)
+	}
+	if cl == nil {
+		return nil, errors.New("no tailcat address argument was given to \"tailcat socks\"; only tailcat address hostnames can be dialed")
+	}
+	if dst.toServer {
+		return cl.DialTCPPort(ctx, dst.port)
+	}
+	return cl.DialTCP(ctx, dst.dst)
 }
 
 // socksTarget is where a SOCKS5 destination address should be dialed.
@@ -1124,10 +1218,51 @@ func clientResolveMode(args []string) error {
 	return nil
 }
 
-func server(logf logger.Logf, serveSpec string) {
-	portSet, services, err := parsePortSet(serveSpec)
+// splitExecArgs separates the positional arguments ff left over
+// into those before and after a "--" separator, the latter being the
+// command for the exec service and the SSH services' forced command.
+// ff drops the "--" itself when it terminates flag parsing (nothing
+// but flags preceded it), but keeps it when it follows a positional
+// argument, so the separator is located in os.Args, of which the
+// leftover arguments are always a suffix. execArgs is nil without a
+// separator, and empty with one followed by nothing.
+func splitExecArgs(args []string) (positional, execArgs []string) {
+	i := slices.Index(os.Args, "--")
+	if i < 0 {
+		return args, nil
+	}
+	execArgs = os.Args[i+1:]
+	positional = args[:len(args)-len(execArgs)]
+	if n := len(positional); n > 0 && positional[n-1] == "--" {
+		positional = positional[:n-1]
+	}
+	return positional, execArgs
+}
+
+// server runs a tailcat server. execArgs is the command given after
+// "--", or nil.
+func server(logf logger.Logf, serveSpec string, execArgs []string) {
+	portSet, services, targets, err := parsePortSet(serveSpec)
 	if err != nil {
 		log.Fatalf("invalid port or service to serve: %v", err)
+	}
+	if execArgs != nil {
+		if len(execArgs) == 0 {
+			log.Fatal("no command given after --")
+		}
+		exe, err := exec.LookPath(execArgs[0])
+		if err != nil {
+			log.Fatalf("exec command: %v", err)
+		}
+		execArgs = append([]string{exe}, execArgs[1:]...)
+		if services == nil {
+			services = set.Set[string]{}
+		}
+		if !services.Contains("ssh") && !services.Contains("no-auth-ssh") {
+			services.Add("exec")
+		}
+	} else if services.Contains("exec") {
+		log.Fatal("the 'exec' service requires a command after --")
 	}
 	if *flagFiles != "" {
 		if !tailCatSSHEnabled {
@@ -1137,6 +1272,37 @@ func server(logf logger.Logf, serveSpec string) {
 			services = set.Set[string]{}
 		}
 		services.Add("files")
+	}
+	servePerf := services.Contains("perf")
+	if servePerf && portSet.Contains(perf.Port) {
+		log.Fatalf("port %d is used by the 'perf' service and cannot also be proxied", perf.Port)
+	}
+	sshWithAuth := services.Contains("ssh")
+	sshWithoutAuth := services.Contains("no-auth-ssh")
+	if sshWithAuth && sshWithoutAuth {
+		log.Fatal("the 'ssh' and 'no-auth-ssh' services cannot be served together")
+	}
+	if sshWithAuth && *flagSSHAuthorizedKeys == "" {
+		log.Fatal("the 'ssh' service requires --ssh-authorized-keys")
+	}
+	if sshWithoutAuth && *flagSSHAuthorizedKeys != "" {
+		log.Fatal("--ssh-authorized-keys cannot be used with the 'no-auth-ssh' service; use 'ssh' instead")
+	}
+	if *flagSSHAuthorizedKeys != "" && !sshWithAuth {
+		log.Fatal("--ssh-authorized-keys requires the 'ssh' service")
+	}
+	if (sshWithAuth || sshWithoutAuth) && execArgs != nil && services.Contains("files") {
+		log.Fatal("the 'files' service cannot be served with an SSH -- command, which allows nothing but that command")
+	}
+	var sshAuthorizedKeys []string
+	if *flagSSHAuthorizedKeys != "" {
+		if !tailCatSSHEnabled {
+			log.Fatal("--ssh-authorized-keys requires SSH support, not included in binary per build tags")
+		}
+		sshAuthorizedKeys, err = loadSSHAuthorizedKeys(context.Background(), *flagSSHAuthorizedKeys)
+		if err != nil {
+			log.Fatalf("--ssh-authorized-keys: %v", err)
+		}
 	}
 	// A server running only named services isn't the empty-port-list
 	// accept-one-connection stdout mode.
@@ -1151,6 +1317,11 @@ func server(logf logger.Logf, serveSpec string) {
 
 	var priv key.NodePrivate
 	var ci *tailcat.ConnInfo
+	pskFlag, ok := serveFS.GetFlag("psk")
+	if !ok {
+		panic("serve flag set has no psk flag")
+	}
+	usePSK := *flagPSK
 
 	if *flagKey == "" {
 		if _, err := os.Stat(keyPath("default")); err == nil {
@@ -1162,8 +1333,10 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 	}
 	if *flagKey == "new" {
-		priv = key.NewNode()
-		ci = &tailcat.ConnInfo{RegionID: -1} // auto-detect
+		conf := tailcat.NewPrivateKey()
+		priv = conf.Private
+		ci = &conf.Public
+		ci.RegionID = -1 // auto-detect
 	} else {
 		path := keyPath(*flagKey)
 		j, err := os.ReadFile(path)
@@ -1176,7 +1349,19 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 		priv = conf.Private
 		ci = &conf.Public
+		if ci.PresharedKey.IsZero() && !pskFlag.IsSet() {
+			// Saved keys remember whether they use a PSK, so a key made with
+			// genkey --psk=false needs no corresponding serve flag.
+			usePSK = false
+		}
+		if usePSK && ci.PresharedKey.IsZero() {
+			log.Fatalf("key file %v has no WireGuard pre-shared key", path)
+		}
 	}
+	if !usePSK {
+		ci.PresharedKey = tailcat.PresharedKey{}
+	}
+	psk := ci.PresharedKey
 	if reg == nil {
 		// A key created with custom DERP hostnames (genkey --region=<host>)
 		// has pre-populated regions with no DERP map ID to reference, so its
@@ -1191,7 +1376,7 @@ func server(logf logger.Logf, serveSpec string) {
 		clearUnnecessaryRegionFields(reg)
 		fmt.Fprintf(os.Stderr, "# Selected bootstrap relay region %v, %v\n", reg.RegionID, reg.RegionName)
 
-		ci = new(tailcat.ConnInfo)
+		ci = &tailcat.ConnInfo{PresharedKey: psk}
 		if embed {
 			ci.Region = []*tailcfg.DERPRegion{reg}
 		} else {
@@ -1202,6 +1387,7 @@ func server(logf logger.Logf, serveSpec string) {
 		// to reference, so the address must embed it.
 		ci = &tailcat.ConnInfo{
 			ServerPublic: tailcat.NodePublic{NodePublic: priv.Public()},
+			PresharedKey: psk,
 			Region:       []*tailcfg.DERPRegion{reg},
 		}
 	}
@@ -1209,38 +1395,63 @@ func server(logf logger.Logf, serveSpec string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, Logf: logf, Region: reg}
-	sshServices := services.Contains("no-auth-ssh") || services.Contains("files")
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
+	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
 	}
-	// Outside the accept-one-connection stdout mode (and exit-node
-	// mode, which accepts any port), tighten the packet filter to just
-	// the served ports for defense in depth behind the OnTCP gate.
-	if !oneShotStdout && !services.Contains("exit-node") {
+	// Outside the accept-one-connection stdout mode (and the exit-node
+	// and exec services, which accept any port), tighten the packet
+	// filter to just the served ports for defense in depth behind the
+	// OnTCP gate.
+	if !oneShotStdout && !services.Contains("exit-node") && !services.Contains("exec") {
 		ports := slices.Sorted(maps.Keys(portSet))
 		if sshServices && !portSet.Contains(22) {
 			ports = append([]uint16{22}, ports...)
 		}
+		if servePerf {
+			ports = append(ports, perf.Port)
+			slices.Sort(ports)
+		}
 		s.ServedTCPPorts = portRanges(ports)
 	}
+	if servePerf {
+		s.ServedUDPPorts = []filter.PortRange{{First: perf.Port, Last: perf.Port}}
+	}
 	if *flagAllow != "" {
-		for _, ks := range strings.Split(*flagAllow, ",") {
+		var allow tailcat.KeySet
+		for ks := range strings.SplitSeq(*flagAllow, ",") {
 			if ks == "none" {
-				s.AddAllowedClient(key.NodePublic{})
-				continue
+				continue // an empty set allows no clients
 			}
 			var k key.NodePublic
 			if err := k.UnmarshalText([]byte(ks)); err != nil {
 				log.Fatalf("invalid key %q in --allow: %v", ks, err)
 			}
-			s.AddAllowedClient(k)
+			allow.Add(k)
 		}
+		s.AllowClient = allow.Contains
+	}
+
+	// localDialer dials the local services that incoming connections
+	// are proxied to. Its resolver answers "localhost" itself with
+	// both loopback addresses; see the localhostdns package comment
+	// for why the OS resolver can't be trusted to (issue #108).
+	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
+
+	// tcpTarget returns the host:port a served TCP port is proxied
+	// to: its mapping's target if the serve spec gave one, else the
+	// same port on localhost.
+	tcpTarget := func(port uint16) string {
+		if t, ok := targets[port]; ok {
+			return t
+		}
+		return fmt.Sprintf("localhost:%v", port)
 	}
 
 	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := net.Dial("tcp", ipPortStr)
+			localConn, err := localDialer.Dial("tcp", ipPortStr)
 			if err != nil {
 				logf("error proxying to %v: %v", ipPortStr, err)
 				c.Close()
@@ -1250,15 +1461,41 @@ func server(logf logger.Logf, serveSpec string) {
 		}
 	}
 
+	udpForwardTo := func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+		return func(c tailcat.ConnPacketConn) {
+			localConn, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(dst))
+			if err != nil {
+				logf("error proxying to %v: %v", dst, err)
+				c.Close()
+				return
+			}
+			tailcat.ProxyPacketConns(c, localConn)
+		}
+	}
+
 	if services.Contains("exit-node") {
 		s.OnTCPForward = func(dst netip.AddrPort) (handler func(net.Conn)) {
 			return tcpForwardTo(dst.String())
+		}
+		// Exit-node clients send UDP through the tunnel the same way they
+		// send TCP (DNS, QUIC, ...). Without this, those flows are dropped:
+		// the tunnel is up and TCP works, but every UDP flow silently goes
+		// nowhere. See OnUDPForward and ProxyPacketConns in the README.
+		s.OnUDPForward = func(dst netip.AddrPort) (handler func(tailcat.ConnPacketConn)) {
+			return udpForwardTo(dst)
 		}
 	}
 
 	var sshHandler func(net.Conn)
 	if sshServices {
-		opts := tailcat.SSHOptions{Shell: services.Contains("no-auth-ssh")}
+		opts := tailcat.SSHOptions{
+			Shell:          services.Contains("ssh") || services.Contains("no-auth-ssh"),
+			AuthorizedKeys: sshAuthorizedKeys,
+		}
+		if opts.Shell && execArgs != nil {
+			opts.Exec = execArgs
+			fmt.Fprintf(os.Stderr, "# SSH sessions run only %v\n", strings.Join(execArgs, " "))
+		}
 		if services.Contains("files") {
 			fsrv, modeName, err := parseFilesFlag(*flagFiles)
 			if err != nil {
@@ -1270,9 +1507,44 @@ func server(logf logger.Logf, serveSpec string) {
 		sshHandler = s.SSHConnHandler(opts)
 	}
 
+	var perfSrv *perf.Server
+	if servePerf {
+		perfSrv = &perf.Server{
+			Logf: logf,
+			OnResult: func(remote net.Addr, res *perf.Result) {
+				fmt.Fprintf(os.Stderr, "# perf test from %v: %v\n", remote, perfSummary(res))
+			},
+		}
+		s.OnUDP = func(port uint16) (handler func(tailcat.ConnPacketConn)) {
+			if port != perf.Port {
+				return nil
+			}
+			return func(c tailcat.ConnPacketConn) { perfSrv.HandleUDP(c) }
+		}
+		fmt.Fprintf(os.Stderr, "# Accepting perf tests on TCP and UDP port %d\n", perf.Port)
+	}
+
+	var execHandler func(net.Conn)
+	if services.Contains("exec") {
+		execHandler = s.ExecConnHandler(execArgs)
+		fmt.Fprintf(os.Stderr, "# Running %v for each connection\n", strings.Join(execArgs, " "))
+	}
+	for _, port := range slices.Sorted(maps.Keys(targets)) {
+		fmt.Fprintf(os.Stderr, "# Proxying port %d to %v\n", port, targets[port])
+	}
+
 	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
 		if port == 22 && sshHandler != nil {
 			return sshHandler
+		}
+		if port == perf.Port && perfSrv != nil {
+			return perfSrv.HandleTCP
+		}
+		if portSet.Contains(port) {
+			return tcpForwardTo(tcpTarget(port))
+		}
+		if execHandler != nil {
+			return execHandler
 		}
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
@@ -1311,6 +1583,20 @@ func server(logf logger.Logf, serveSpec string) {
 
 	if err := s.Start(); err != nil {
 		log.Fatalf("Server.Start: %v", err)
+	}
+	if psk.IsZero() {
+		if *flagKey == "new" {
+			fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: serving without a WireGuard PSK")
+		} else {
+			fmt.Fprintf(os.Stderr, "# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", *flagKey)
+		}
+	}
+	if sshWithoutAuth && *flagAllow == "" {
+		if execArgs != nil {
+			fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: no-auth-ssh runs the command for anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow")
+		} else {
+			fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: no-auth-ssh gives a shell to anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow")
+		}
 	}
 	if devDERP != nil {
 		// Wait until we're connected to our own dev DERP before
@@ -1398,15 +1684,22 @@ var (
 	numRx       = regexp.MustCompile(`^\d+$`)
 )
 
-func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ error) {
+// parsePortSet parses a serve spec: a comma-separated list of ports,
+// port ranges, service names, and port mappings of the form
+// "port:target", where target is a port on localhost or a host:port
+// elsewhere. It returns the set of served ports, the named services,
+// and the targets of the mapped ports; ports without a target are
+// proxied to the same port on localhost.
+func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], targets map[uint16]string, _ error) {
 	services = set.Set[string]{}
 	if s == "" {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	ret := set.Set[uint16]{}
+	targets = map[uint16]string{}
 	s = strings.TrimSpace(s)
 
-	for _, r := range strings.Split(s, ",") {
+	for r := range strings.SplitSeq(s, ",") {
 		r = strings.TrimSpace(r)
 		switch r {
 		case "all":
@@ -1414,18 +1707,30 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 				ret.Add(uint16(i))
 			}
 			continue
-		case "no-auth-ssh", "files":
+		case "ssh", "no-auth-ssh", "files":
 			if !tailCatSSHEnabled {
-				return nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
+				return nil, nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
 			}
 			services.Add(r)
 			continue
-		case "exit-node":
+		case "exit-node", "exec", "perf":
 			services.Add(r)
 			continue
 		}
+		if portStr, targetStr, ok := strings.Cut(r, ":"); ok {
+			port, target, err := parsePortTarget(portStr, targetStr)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if prev, ok := targets[port]; ok && prev != target {
+				return nil, nil, nil, fmt.Errorf("port %d is mapped to both %v and %v", port, prev, target)
+			}
+			ret.Add(port)
+			targets[port] = target
+			continue
+		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, no-auth-ssh, files, exit-node)", r)
+			return nil, nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node, perf)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {
@@ -1434,13 +1739,13 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 
 		lo, err := strconv.ParseUint(a, 10, 16)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%q is not a valid port", a)
+			return nil, nil, nil, fmt.Errorf("%q is not a valid port", a)
 		}
 		hi := lo
 		if b != "" {
 			hi, err = strconv.ParseUint(b, 10, 16)
 			if err != nil {
-				return nil, nil, fmt.Errorf("%q is not a valid port number", b)
+				return nil, nil, nil, fmt.Errorf("%q is not a valid port number", b)
 			}
 		}
 		if hi < lo {
@@ -1450,7 +1755,29 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], _ 
 			ret.Add(uint16(i))
 		}
 	}
-	return ret, services, nil
+	return ret, services, targets, nil
+}
+
+// parsePortTarget parses the two halves of a "port:target" serve
+// mapping. The target is either a bare port, meaning that port on
+// localhost, or a host:port (with an IPv6 host in brackets). It
+// returns the served port and the target as a dialable host:port.
+func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
+		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", portStr, portStr+":"+targetStr)
+	}
+	if numRx.MatchString(targetStr) {
+		return uint16(port), net.JoinHostPort("localhost", targetStr), nil
+	}
+	host, targetPort, err := net.SplitHostPort(targetStr)
+	if err != nil || host == "" {
+		return 0, "", fmt.Errorf("target %q in mapping %q is not a port or host:port", targetStr, portStr+":"+targetStr)
+	}
+	if p, err := strconv.ParseUint(targetPort, 10, 16); err != nil || p == 0 {
+		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetPort, portStr+":"+targetStr)
+	}
+	return uint16(port), net.JoinHostPort(host, targetPort), nil
 }
 
 // portRanges coalesces the ascending-sorted ports into contiguous
@@ -1559,6 +1886,7 @@ func genKey(args []string) error {
 		region       = genkeyRegion
 		fixedRegion  = genkeyFixedRegion
 		embedDERPMap = genkeyEmbedDERPMap
+		psk          = genkeyPSK
 	)
 	// isSet reports whether the named genkey flag was set explicitly,
 	// as opposed to holding its default value.
@@ -1599,6 +1927,9 @@ func genKey(args []string) error {
 				return usagef("genkey --client does not take --%s; client keys have no DERP region", name)
 			}
 		}
+		if isSet("psk") {
+			return usagef("genkey --client does not take --psk; pre-shared keys belong to server addresses")
+		}
 		if *key == "default" {
 			return usagef("genkey --client with --key=default is probably a mistake: \"default\" is the name server mode loads automatically, and client modes load \"client-default\", so you likely want --key=client-default")
 		}
@@ -1609,6 +1940,21 @@ func genKey(args []string) error {
 		}
 		// The empty region means "pick the best region now", below.
 		*region = ""
+	}
+	if *embedDERPMap {
+		// Embedding bakes one region's DERP nodes into the address,
+		// so there has to be a specific region to bake in.
+		switch {
+		case isSet("region") && *region == "auto":
+			return usagef("genkey --embed-derp-map and --region=auto are mutually exclusive; embedding needs a region chosen now, so use --fixed-region or name a region with --region")
+		case strings.Contains(*region, "."):
+			return usagef("genkey --embed-derp-map does not take DERP hostnames in --region; naming hosts already embeds them in the address")
+		case !isSet("region"):
+			// --region defaults to "auto", which has no nodes to
+			// embed, so discover the nearest region now the way
+			// --fixed-region does.
+			*region = ""
+		}
 	}
 	if !keyIsPath(*key) {
 		*key = keyPath(*key)
@@ -1625,6 +1971,9 @@ func genKey(args []string) error {
 	}
 
 	priv := tailcat.NewPrivateKey()
+	if !*psk {
+		priv.Public.PresharedKey = tailcat.PresharedKey{}
+	}
 
 	if *client {
 		privj, err := json.MarshalIndent(priv, "", "\t")
@@ -1698,6 +2047,9 @@ func genKey(args []string) error {
 	}
 	if *embedDERPMap {
 		reg := dm.Regions[ci.RegionID]
+		if reg == nil {
+			log.Fatalf("no DERP region %d in the DERP map; can't embed its nodes", ci.RegionID)
+		}
 		reg.Nodes = reg.Nodes[:min(2, len(reg.Nodes))]
 		for _, n := range reg.Nodes {
 			n.IPv6 = ""

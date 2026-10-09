@@ -29,19 +29,27 @@ func tagSet(t *testing.T, tags string) map[string]bool {
 
 func TestTags(t *testing.T) {
 	release := tagSet(t, ReleaseTags())
-	for _, want := range []string{"netgo", "osusergo", "omitidna", "omitpemdecrypt", "ts_omit_taildrop", "ts_omit_webclient"} {
+	for _, want := range []string{"ts_omit_taildrop", "ts_omit_webclient"} {
 		if !release[want] {
 			t.Errorf("ReleaseTags missing %q", want)
 		}
 	}
-	for _, notWant := range []string{"ts_omit_netstack", "ts_omit_ssh", "ts_omit_gro", "ts_omit_c2n", "ts_omit_dbus"} {
+	// See the comment in buildtags.go for why these historical
+	// non-feature tags must stay gone. In particular, netgo broke
+	// resolving "localhost" on Windows (issue #108).
+	for _, notWant := range []string{"netgo", "osusergo", "omitidna", "omitpemdecrypt"} {
+		if release[notWant] {
+			t.Errorf("ReleaseTags contains %q; see the comment in buildtags.go", notWant)
+		}
+	}
+	for _, notWant := range []string{"ts_omit_netstack", "ts_omit_ssh", "ts_omit_gro", "ts_omit_c2n", "ts_omit_dbus", "ts_omit_udptransport", "ts_omit_nattraversal"} {
 		if release[notWant] {
 			t.Errorf("ReleaseTags contains %q; that feature must stay linked in release builds", notWant)
 		}
 	}
 
 	wasm := tagSet(t, WasmTags())
-	for _, want := range []string{"ts_omit_ssh", "ts_omit_gro"} {
+	for _, want := range []string{"ts_omit_ssh", "ts_omit_gro", "ts_omit_udptransport", "ts_omit_nattraversal"} {
 		if !wasm[want] {
 			t.Errorf("WasmTags missing %q", want)
 		}

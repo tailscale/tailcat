@@ -10,7 +10,7 @@ import (
 )
 
 // SupportsSSHServer reports whether the platform supports running the built-in
-// auth-free SSH server.
+// SSH server.
 func SupportsSSHServer() bool { return false }
 
 func (s *Server) HandleTailscaleSSHConn(c net.Conn) {

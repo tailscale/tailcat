@@ -13,7 +13,7 @@ let package = Package(
     ],
     targets: [
         // The Go library as a static archive per platform, built by
-        // `make xcframework` in ../libtailcat.
+        // `make xcframework` in this directory, using ../cmd/libtailcat.
         .binaryTarget(name: "CTailcat", path: "CTailcat.xcframework"),
         .target(
             name: "TailcatKit",

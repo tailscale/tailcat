@@ -11,7 +11,7 @@
 //   tailcat-demo parse <address>           print the address's contents
 //   tailcat-demo genkey                    print a new identity JSON and its public key
 //
-// Set TAILCAT_VERBOSE=1 to see the Go side's logs on stderr.
+// Set TAILCAT_VERBOSE=1 to see Swift lifecycle messages on stderr.
 
 import Foundation
 import TailcatKit
@@ -55,11 +55,11 @@ func echo(_ connection: Connection) async {
         for try await chunk in connection.incoming {
             try await connection.send(uppercased(chunk))
         }
-        connection.closeWrite()
+        try await connection.closeWrite()
     } catch {
         note("# connection error: \(error)")
     }
-    connection.close()
+    await connection.close()
     note("# connection closed")
 }
 
@@ -68,7 +68,7 @@ func serve(port: UInt16) async throws {
     let listener = try await server.listen(on: port)
     note("# public key: \(server.publicKey)")
     let address = try await server.start()
-    note("# Server listening on port \(port) with new address: \(address)")
+    note("# Server listening on port \(listener.port) with new address: \(address)")
     for try await connection in listener.connections {
         Task { await echo(connection) }
     }
@@ -95,16 +95,17 @@ func connect(address: TailcatAddress, port: UInt16) async throws {
                 if chunk.isEmpty { break }
                 try await connection.send(chunk)
             }
+            try await connection.closeWrite()
         } catch {
             note("# send error: \(error)")
         }
-        connection.closeWrite()
     }
     for try await chunk in connection.incoming {
         FileHandle.standardOutput.write(chunk)
     }
     sender.cancel()
-    connection.close()
+    await connection.close()
+    try await client.drain()
     await client.close()
 }
 

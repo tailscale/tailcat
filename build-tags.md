@@ -10,9 +10,7 @@ library but only needs its data plane. Upstream maintains a registry
 of omittable features (`tailscale.com/feature/featuretags`), each
 disabled by a `ts_omit_<feature>` build tag. Building with the tags in
 build-tags.txt omits every feature tailcat doesn't use, which makes
-the binaries about 16% smaller. It also includes a few non-feature
-tags (such as `netgo` and `osusergo`) selecting the pure Go resolver
-and user lookup for static binaries.
+the binaries about 16% smaller.
 
 ## For packagers
 

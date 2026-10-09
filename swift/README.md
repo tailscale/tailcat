@@ -1,142 +1,169 @@
 # TailcatKit
 
-A Swift package wrapping [libtailcat](../libtailcat/README.md), the C API
-over the [tailcat](../README.md) Go library, in async/await actors for
-macOS 14+ and iOS 17+. A `TailcatServer` announces a tailcat address;
-a `TailcatClient` holding the address dials TCP ports on it; both ends
-handle bytes through `Connection`. Swift 6 language mode, strict
-concurrency, no Combine.
+A Swift 6 package wrapping the upstream [libtailcat C API](../cmd/libtailcat/README.md)
+for macOS 14+ and iOS 17+. `TailcatServer` and `TailcatClient` expose async TCP
+connections through opaque C handles, with Swift task cancellation and deadlines.
 
 ## Building
 
-Build the Go archives first (Go and Xcode with the iOS SDK required):
+From this directory, with Go and Xcode (including the iOS SDK) installed:
 
 ```sh
-cd ../libtailcat && make xcframework   # writes ./CTailcat.xcframework
-cd ../swift
-swift build                            # the TailcatKit library and tailcat-demo
-swift build -c release
-swift test                             # offline tests
-TAILCAT_E2E=1 swift test               # plus a server/client round trip over the public relays
+make xcframework
+swift build -c release -Xswiftc -warnings-as-errors
+make test
 ```
 
-The package is `swift-tools-version: 6.0`; it declares the binary
-target `CTailcat` (the xcframework with slices for macOS arm64/x86_64,
-iOS arm64 and the iOS simulator arm64/x86_64), the library `TailcatKit`,
-the executable `tailcat-demo` and the tests. Add it to an app as a local
-or remote package dependency; the `CoreFoundation` and `Security`
-frameworks and `libresolv` the Go runtime needs are linked by the
-package.
+The Makefile builds `../cmd/libtailcat` with `-buildmode=c-archive` and the release
+tags from `../build-tags.txt`. It copies the upstream `tailcat.h` into the
+XCFramework alongside a Swift module map. No separate C implementation is needed.
+The framework contains macOS arm64/x86_64, iOS arm64, and simulator arm64/x86_64.
+
+Add the built `swift` directory as a local Swift package dependency in Xcode.
+The framework is an ignored build output, so a remote SwiftPM dependency is not
+self-contained until binary distribution is added. The package links the Darwin
+frameworks and libraries needed by the Go runtime.
 
 ## Usage
 
-A server that echoes every connection to port 8080:
+A server that echoes TCP connections:
 
 ```swift
+import Foundation
 import TailcatKit
 
-let server = try TailcatServer(configuration: .init(relay: .automatic), logger: DefaultLogger())
-let listener = try await server.listen(on: 8080)   // before or after start; 0 is the catch-all
-let address = try await server.start()             // blocks off-thread: DERP map, latency check
-print("connect with: \(address)")
+let server = try TailcatServer()
+let listener = try await server.listen(on: 8080) // starts the server if needed
+let address = try await server.start()          // repeated starts succeed
+// Share address securely with the client. It grants access to the server.
 
 for try await connection in listener.connections {
     Task {
-        print("from \(connection.remoteAddress ?? "?") on port \(connection.localPort ?? 0)")
-        for try await chunk in connection.incoming {   // until the peer's EOF
-            try await connection.send(chunk)
+        do {
+            for try await chunk in connection.incoming {
+                try await connection.send(chunk)
+            }
+            try await connection.closeWrite()
+        } catch {
+            // Handle cancellation or a transport failure.
         }
-        connection.close()
+        await connection.close()
     }
 }
 ```
 
-A client:
+A client using that address:
 
 ```swift
 let client = try TailcatClient(address: address)
-let rtt = try await client.ping()                  // brings the tunnel up
-let path = try await client.path()                 // direct endpoint or relay region
 let connection = try await client.connect(port: 8080)
 try await connection.send(Data("hello\n".utf8))
-connection.closeWrite()                            // half-close: the server reads EOF
-let reply = try await connection.receive()         // empty Data at EOF
-connection.close()
+try await connection.closeWrite()
+for try await chunk in connection.incoming {
+    // Consume the reply. The stream ends at TCP EOF.
+}
+await connection.close()
+try await client.drain(timeout: .seconds(5))
 await client.close()
 ```
 
-Keys and addresses need no server or client:
+`listen(on: 0)` allocates a free port, exposed by `Listener.port`. Closing a
+listener leaves accepted connections alive. Closing a server or client retires
+all its child handles, interrupts active calls, and waits for teardown on a worker
+queue. `close()` is async and idempotent; deinitialization schedules fallback
+cleanup on a worker. Prefer explicit close when shutdown completion matters.
+`drain` waits for TCP shutdown traffic before the peer is closed.
+
+### Cancellation and I/O
+
+Every blocking operation has its own C token. Swift task cancellation calls
+`tc_token_cancel`, including when no timeout is supplied. `timeout: nil` means
+no caller deadline; zero or a negative duration expires immediately. Time spent
+waiting on a worker queue counts toward the deadline. C buffers and tokens stay
+alive until the original synchronous call returns. Completion can win a
+cancellation race, in which case the successful result is delivered and owned
+normally.
+
+One receive and one send can run concurrently on worker threads. Overlapping
+receives, or overlapping sends/`closeWrite` calls, throw `invalidArgument`;
+await a send before starting another or half-closing. `receive` returns available
+bytes, up to `maxLength`, and empty `Data` at EOF. Cancelling a read or accept
+leaves the connection or listener usable. `send` handles short writes under one
+deadline. A failure after bytes have been transmitted throws
+`PartialWriteError`, including `bytesWritten` and `underlyingError`; do not replay
+that prefix. If a read returns both bytes and an error, the bytes are delivered
+first and the next receive reports the error.
+
+Errors use C status codes, with messages belonging to the individual operation.
+`TC_CANCELLED` becomes `CancellationError`, `TC_TIMEOUT` becomes
+`TailcatError.timeout`, and `TC_CLOSED` becomes `TailcatError.closed`.
+All C allocations are released with `tc_free`.
+
+### Keys, relays, and diagnostics
 
 ```swift
-let identity = try Identity.generate()             // a private key; keep it in the Keychain
-identity.publicKey                                 // "nodekey:<hex>", for TailcatServer.allow
-let address = TailcatAddress(rawValue: "tc...")!
-let info = try address.parse()                     // server key, region ID or relay hosts
-let long = try await address.resolved()            // self-contained form, relay details embedded
+let identity = try Identity.generate()
+// Store identity.json in the Keychain, including its private and pre-shared keys.
+let server = try TailcatServer(configuration: .init(
+    identity: identity,
+    relay: .region(302),
+    allowedClients: [knownClientKey]
+))
+let info = try address.parse()       // public metadata only
+let resolved = try await address.resolved() // embeds relay details
+let latency = try await client.ping() // whole milliseconds; zero is valid
+let path = try await client.path()   // direct endpoint or relay region
 ```
 
-Restrict a server to known clients with `ServerConfiguration.allowedClients`
-or `TailcatServer.allow(_:)`, and give clients an `Identity` so their
-public key is stable. The allow list gates registration: a client that
-registered while it was empty stays connected, so list the clients before
-start to lock a server down from the beginning. With a saved identity,
-`RelaySelection.automatic`
-keeps the relay recorded in the key file (a fixed region keeps the address
-stable across restarts); `.region(id)` and `.hosts([...])` override it.
+Identity JSON uses the C API's `private_key`, `public_key`, and `preshared_key`
+fields. It is distinct from the CLI's key-file format. Restore the complete bundle
+to preserve a server's identity and capability. Relay selection belongs to
+`ServerConfiguration`, using `.automatic`, `.region(id)`, or `.custom(data)` with
+a DERPRegion JSON object. The server's address is available after `start()`.
 
-### Notes
+The allowlist restricts subsequent registration and does not disconnect existing
+flows. Configure it before startup when access should be restricted immediately.
+Addresses and private/pre-shared keys are secrets. The wrapper never logs them.
+`LogSink` receives Swift lifecycle messages; the C API discards Go logs.
 
-- Blocking C calls (server start, ping, path, connect, address resolve)
-  run on a dedicated dispatch queue, never on an actor or the
-  cooperative pool. Everything else is quick.
-- `Connection` is backed by DispatchIO: `receive` returns as soon as
-  any bytes are available (up to `maxLength`), `send` completes once the
-  data has been handed to the tunnel, `closeWrite` is a TCP half-close,
-  and `close` (also run by deinit) closes the descriptor exactly once.
-  One receive at a time; `incoming` is a pull-based stream over it.
-- `start()` returns once the server is configured and its address is
-  known, like the tailcat CLI; the relay connection completes in the
-  background right after, and pings resend until acknowledged, so a
-  client's `ping` right after `start()` succeeds within its timeout.
-- Closing a server or client also closes its listeners and connections
-  on the Go side: their reads see EOF and their accepts throw
-  `TailcatError.closed`. The Swift objects still own their descriptors
-  until closed or deinitialized.
-- Errors are `TailcatError`; the Go side's message is carried in
-  `.internalError`, `.invalidAddress` and `.invalidKey`.
+### Changes from the original PR API
 
-## The demo
+- The upstream `tc_*` API replaces the private `tailcat_*` layer and socketpairs.
+- `listen` starts the server and port zero chooses a free port. There is no
+  catch-all listener, and `start` is idempotent.
+- `closeWrite` is async and throwing; all resource `close` methods are async.
+- Identity JSON uses the C API key bundle. `Identity.address()` is removed;
+  obtain addresses from a started server.
+- `.hosts` is replaced by `.custom` DERPRegion JSON. The C API controls address
+  encoding, so `embedRelayInAddress` is removed.
+- The old WireGuard `status()` and Go log descriptor APIs are not exposed by
+  the upstream C API. `path`, `ping`, and connection endpoint metadata remain.
+- This package wraps TCP. The upstream C API also supports UDP.
 
-`tailcat-demo` is a small command line tool and the interop check
-against the Go CLI:
+## Tests and demo
+
+`make test` uses a Go test fixture to run a local DERP/STUN server for the Swift
+test process. It exercises the actual C archive, including half-close, deadlines,
+read/accept cancellation and reuse, partial writes, child ownership, keys, and
+address helpers, without relying on public relays. `swift test` alone runs the
+value/lifecycle tests and skips tests requiring the local relay fixture.
 
 ```sh
-swift run tailcat-demo serve 7777              # prints the address on stderr, echoes bytes back uppercased
-swift run tailcat-demo connect <address> 7777  # pings, prints latency and path, pipes stdin, prints the reply
+swift run tailcat-demo serve 7777
+swift run tailcat-demo connect <address> 7777
 swift run tailcat-demo parse <address>
 swift run tailcat-demo genkey
 ```
 
-Against the Go CLI, in the repository root:
+The demo prints a secret address for sharing when serving and secret key material
+for `genkey`; protect that output. Set `TAILCAT_VERBOSE=1` for Swift lifecycle logs.
+The demo interoperates with `go run ./cmd/tailcat <address> 7777` from the repo root.
+
+## iOS compilation
+
+From this directory:
 
 ```sh
-printf 'hi there\n' | go run ./cmd/tailcat <address> 7777    # prints HI THERE
-
-go run ./cmd/tailcat serve 8080                              # with a local server on 8080
-printf 'GET / HTTP/1.0\r\n\r\n' | swift run tailcat-demo connect <address> 8080
+xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS' -derivedDataPath build/device build CODE_SIGNING_ALLOWED=NO
+xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS Simulator' -derivedDataPath build/simulator build CODE_SIGNING_ALLOWED=NO
 ```
-
-Set `TAILCAT_VERBOSE=1` to see the Go side's logs.
-
-## iOS
-
-The package builds for iOS devices and the simulator:
-
-```sh
-xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS' -derivedDataPath build build CODE_SIGNING_ALLOWED=NO
-xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS Simulator' -derivedDataPath build build CODE_SIGNING_ALLOWED=NO
-```
-
-Keep `start()`, `ping` and friends off the main actor's critical path
-(they are async and run off-thread, but they take seconds), and treat
-`Identity.json` as a secret.

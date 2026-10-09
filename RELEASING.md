@@ -3,8 +3,9 @@
 Releases are cut by pushing a version tag. GitHub Actions
 (`.github/workflows/release.yml`) then runs
 [GoReleaser](https://goreleaser.com/) with the config in
-`.goreleaser.yaml`, which builds the artifacts and publishes a GitHub
-Release with a changelog generated from the commit log.
+`.goreleaser.yaml`, which builds the artifacts and creates a draft
+GitHub Release with a changelog generated from the commit log. The
+draft is invisible to watchers until published.
 
 ## Cutting a release
 
@@ -25,8 +26,12 @@ Release with a changelog generated from the commit log.
    ```
 
 4. Watch the Release workflow in the Actions tab. When it finishes,
-   the release with all artifacts appears on the
+   a draft release with all artifacts appears on the
    [Releases page](https://github.com/tailscale/tailcat/releases).
+
+5. Edit the draft: replace or top it with hand-written release notes,
+   then publish. Publishing is the step that notifies watchers, so
+   the notification carries the curated notes.
 
 ## Artifacts
 
