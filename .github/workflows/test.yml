@@ -47,6 +47,24 @@ jobs:
           lib /nologo /def:cmd\libtailcat\libtailcat.def /machine:x64 /out:build\libtailcat.lib || exit /b 1
           cl /nologo /W4 /WX /Icmd\libtailcat /Fobuild\ /Febuild\smoke-msvc.exe cmd\libtailcat\testdata\smoke.c /link build\libtailcat.lib || exit /b 1
           build\smoke-msvc.exe
+  swift:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: build XCFramework and run Swift tests with a local relay
+        run: make -C swift test
+      - name: build Swift release with warnings as errors
+        working-directory: swift
+        run: swift build -c release -Xswiftc -warnings-as-errors
+      - name: compile Swift for iOS devices and simulator
+        working-directory: swift
+        run: |
+          xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS' -derivedDataPath build/device build CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+          xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS Simulator' -derivedDataPath build/simulator build CODE_SIGNING_ALLOWED=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
   tidy:
     runs-on: ubuntu-latest
     steps:

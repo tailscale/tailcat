@@ -1,0 +1,4 @@
+module CTailcat {
+    header "tailcat.h"
+    export *
+}
