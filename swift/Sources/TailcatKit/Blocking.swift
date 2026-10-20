@@ -3,9 +3,10 @@
 
 import CTailcat
 import Dispatch
+import Foundation
 import os
 
-/// Keeps synchronous C calls, including resource teardown, off actor executors.
+/// Keeps synchronous C operations off actor executors.
 enum Blocking {
     static let queue = DispatchQueue(label: "dev.tailcat.blocking", qos: .userInitiated, attributes: .concurrent)
 
@@ -31,6 +32,47 @@ enum Blocking {
     }
 }
 
+/// A single teardown thread independent of the Dispatch worker pool. Idle C
+/// reads/accepts can occupy every Dispatch worker, so queuing close there would
+/// prevent the very operation that interrupts those calls from ever running.
+private final class Teardown: Sendable {
+    static let shared = Teardown()
+    private let pending = OSAllocatedUnfairLock(initialState: [@Sendable () -> Void]())
+    private let ready = DispatchSemaphore(value: 0)
+
+    private init() {
+        let pending = pending
+        let ready = ready
+        let thread = Thread {
+            while true {
+                ready.wait()
+                let jobs = pending.withLock { pending in
+                    let jobs = pending
+                    pending.removeAll(keepingCapacity: true)
+                    return jobs
+                }
+                for job in jobs { job() }
+            }
+        }
+        thread.name = "dev.tailcat.teardown"
+        thread.start()
+    }
+
+    func submit(_ body: @escaping @Sendable () -> Void) {
+        pending.withLock { $0.append(body) }
+        ready.signal()
+    }
+
+    func close(_ raw: UInt64) async {
+        await withCheckedContinuation { continuation in
+            submit {
+                _ = tc_close(raw, nil)
+                continuation.resume()
+            }
+        }
+    }
+}
+
 private final class CancellationToken: Sendable {
     let handle: UInt64
 
@@ -45,8 +87,8 @@ private final class CancellationToken: Sendable {
     deinit { _ = tc_close(handle, nil) }
 }
 
-/// Owns one never-reused C handle. Explicit close waits for teardown on a worker;
-/// deinit schedules it there without blocking an actor or the cooperative pool.
+/// Owns one never-reused C handle. Explicit close and deinit both use the
+/// teardown thread without blocking an actor or the cooperative pool.
 final class Handle: Sendable {
     private struct State: Sendable {
         var raw: UInt64
@@ -69,7 +111,7 @@ final class Handle: Sendable {
             let raw = state.raw
             state.raw = 0
             let closing = Task.detached {
-                _ = try? await Blocking.perform { tc_close(raw, nil) }
+                await Teardown.shared.close(raw)
             }
             state.closing = closing
             return closing
@@ -79,7 +121,7 @@ final class Handle: Sendable {
 
     deinit {
         let raw = state.withLock { $0.raw }
-        if raw != 0 { Blocking.queue.async { _ = tc_close(raw, nil) } }
+        if raw != 0 { Teardown.shared.submit { _ = tc_close(raw, nil) } }
     }
 }
 

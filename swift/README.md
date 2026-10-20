@@ -9,9 +9,8 @@ connections through opaque C handles, with Swift task cancellation and deadlines
 From this directory, with Go and Xcode (including the iOS SDK) installed:
 
 ```sh
-make xcframework
-swift build -c release -Xswiftc -warnings-as-errors
 make test
+swift build -c release -Xswiftc -warnings-as-errors
 ```
 
 The Makefile builds `../cmd/libtailcat` with `-buildmode=c-archive` and the release
@@ -69,10 +68,13 @@ await client.close()
 
 `listen(on: 0)` allocates a free port, exposed by `Listener.port`. Closing a
 listener leaves accepted connections alive. Closing a server or client retires
-all its child handles, interrupts active calls, and waits for teardown on a worker
-queue. `close()` is async and idempotent; deinitialization schedules fallback
-cleanup on a worker. Prefer explicit close when shutdown completion matters.
+all its child handles, interrupts active calls, and waits for teardown off-thread.
+`close()` is async and idempotent; deinitialization schedules fallback cleanup.
+Prefer explicit close when shutdown completion matters.
 `drain` waits for TCP shutdown traffic before the peer is closed.
+
+Explicit close and deinitialization use a dedicated teardown thread, so shutdown
+can interrupt idle I/O even when the Dispatch worker pool is fully occupied.
 
 ### Cancellation and I/O
 
@@ -142,11 +144,14 @@ Addresses and private/pre-shared keys are secrets. The wrapper never logs them.
 
 ## Tests and demo
 
-`make test` uses a Go test fixture to run a local DERP/STUN server for the Swift
-test process. It exercises the actual C archive, including half-close, deadlines,
-read/accept cancellation and reuse, partial writes, child ownership, keys, and
-address helpers, without relying on public relays. `swift test` alone runs the
-value/lifecycle tests and skips tests requiring the local relay fixture.
+`make test` rebuilds the XCFramework from current Go sources, then uses a Go test
+fixture to run a local DERP/STUN server for the Swift test process. It exercises
+the actual C archive, including half-close, deadlines, read/accept cancellation
+and reuse, partial writes, shutdown under load, child ownership, keys, and address
+helpers, without relying on public relays. `swift test` alone runs the
+value/lifecycle tests against the previously built XCFramework and skips tests
+requiring the local relay fixture. The macOS CI job runs `make test`, a Swift
+release build, and iOS device/simulator compilation on pull requests and main.
 
 ```sh
 swift run tailcat-demo serve 7777

@@ -63,7 +63,7 @@ xcframework: macos ios ios-sim ## Builds CTailcat.xcframework from the three arc
 		-output $(XCFRAMEWORK)
 
 .PHONY: test
-test: ## Runs Swift tests against a local DERP/STUN relay
+test: xcframework ## Rebuilds the native library and runs Swift tests against a local relay
 	cd .. && $(GO) test -v -count=1 -timeout 180s ./swift/testdata
 
 .PHONY: clean

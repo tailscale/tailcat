@@ -3,11 +3,14 @@
 
 import Foundation
 import Testing
+import os
 @testable import TailcatKit
 
 /// make test supplies a local DERP/STUN relay, so these tests need no public
 /// service. Running swift test directly still exercises all offline value tests.
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["TAILCAT_TEST_REGION"] != nil))
+// Serialize transport tests so the worker saturation regression cannot consume
+// the short deadlines used by other tests running alongside it.
+@Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["TAILCAT_TEST_REGION"] != nil))
 struct LocalRelayTests {
     static func server() throws -> TailcatServer {
         let json = ProcessInfo.processInfo.environment["TAILCAT_TEST_REGION"]!
@@ -110,6 +113,61 @@ struct LocalRelayTests {
             catch { #expect(error as? TailcatError == .closed) }
             await incoming.close(); await incoming.close()
         }
+    }
+
+    @Test(arguments: [false, true])
+    func shutdownWithManyIdleConnections(deinitializing: Bool) async throws {
+        var server: TailcatServer? = try Self.server()
+        var client: TailcatClient?
+        do {
+            let listener = try await server!.listen(on: 0)
+            let address = try await server!.start()
+            let peer = try TailcatClient(address: address, derpMapURL: URL(string: "none"))
+            client = peer
+            var incoming: [Connection] = []
+            var outgoing: [Connection] = []
+            for _ in 0..<96 {
+                outgoing.append(try await peer.connect(port: listener.port))
+                incoming.append(try await listener.accept(timeout: .seconds(5)))
+            }
+            let started = OSAllocatedUnfairLock(initialState: 0)
+            let reads = incoming.map { connection in
+                Task {
+                    started.withLock { $0 += 1 }
+                    do { _ = try await connection.receive(); return false }
+                    catch { return error as? TailcatError == .closed }
+                }
+            }
+            // Give the nil-deadline reads time to occupy the Dispatch workers.
+            while started.withLock({ $0 }) < reads.count { await Task.yield() }
+            try await Task.sleep(for: .milliseconds(300))
+            // Rescue the test if shutdown regresses; its reads must be woken
+            // by close, not by a deadline or this independent cancellation.
+            let watchdog = Task {
+                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                Issue.record("shutdown stalled behind idle reads")
+                for read in reads { read.cancel() }
+            }
+            defer { watchdog.cancel() }
+            if deinitializing {
+                server = nil
+            } else {
+                await server!.close()
+            }
+            var allClosed = true
+            for read in reads {
+                let closed = await read.value
+                allClosed = allClosed && closed
+            }
+            #expect(allClosed)
+            withExtendedLifetime(outgoing) {}
+        } catch {
+            await client?.close()
+            await server?.close()
+            throw error
+        }
+        await client?.close()
+        await server?.close()
     }
 
     @Test func acceptCancellationTimeoutAndReuse() async throws {
