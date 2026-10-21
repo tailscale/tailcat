@@ -731,7 +731,9 @@ without the control plane.
   implementation for encrypting all tunnel traffic. It doesn't use a kernel TUN/TAP device (nor does it configure any networking routes or DNS settings), so `root` isn't required.
 - **magicsock** -- Tailscale's transport layer that multiplexes traffic
   over direct UDP and DERP relays. It handles STUN-based endpoint
-  discovery and UDP hole-punching for NAT traversal.
+  discovery and UDP hole-punching for NAT traversal, and asks the
+  local router for a public port mapping (UPnP IGD, NAT-PMP, or PCP)
+  when the router offers one.
 - **Netstack** (gVisor) -- a userspace TCP/IP stack that terminates
   TCP connections inside the process. This is what lets Tailcat
   accept inbound connections and dial outbound ones without any OS
@@ -767,9 +769,15 @@ without the control plane.
    encrypted traffic can flow.
 
 5. **NAT traversal.** In parallel, each side advertises its UDP
-   endpoints (public IP:port learned via STUN, plus local interface
-   addresses) to the other in disco call-me-maybe messages over DERP,
-   re-advertising whenever they change. Both sides then run Tailscale's
+   endpoints (public IP:port learned via STUN, a port mapped on the
+   local router via UPnP IGD, NAT-PMP, or PCP when the router allows
+   it, plus local interface addresses) to the other in disco
+   call-me-maybe messages over DERP, re-advertising whenever they
+   change. A mapped port accepts packets from any source, so it gives
+   a direct path to a peer behind a NAT that allocates a new public
+   port per destination, where STUN endpoints alone fail. Set
+   `TS_DISABLE_PORTMAPPER=1` to skip port mapping, or
+   `TS_DISABLE_UPNP=1` to skip only UPnP. Both sides then run Tailscale's
    disco protocol and attempt UDP hole-punching. If
    successful, traffic upgrades from the DERP relay to a direct
    peer-to-peer path. If hole-punching fails, DERP continues as a
