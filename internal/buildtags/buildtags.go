@@ -54,8 +54,13 @@ var wasmKeep = []featuretags.FeatureTag{
 // without them magicsock is DERP-only, and direct paths between peers
 // are the whole point of tailcat. The wasm build omits both: a browser
 // has no UDP sockets, so all of its traffic is relayed over DERP
-// regardless. Note that featuretags.Requires pulls in ssh's c2n and
-// dbus dependencies too.
+// regardless. Native builds also keep portmapper (UPnP IGD, NAT-PMP,
+// and PCP), so a peer behind a home router asks it for a public port
+// mapping and advertises that endpoint; it is what lets a peer behind a
+// NAT that allocates a new public port per destination get a direct
+// path to it instead of staying on DERP. The wasm build omits it along
+// with udptransport. Note that featuretags.Requires pulls in ssh's c2n
+// and dbus dependencies too.
 var releaseKeep = []featuretags.FeatureTag{
 	"netstack",
 	"ssh",
@@ -63,6 +68,7 @@ var releaseKeep = []featuretags.FeatureTag{
 	"bakedroots",
 	"androidbin",
 	"nattraversal",
+	"portmapper",
 }
 
 // WasmTags returns the comma-joined -tags value for the wasm build,

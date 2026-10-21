@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Native builds now include Tailscale's port mapper: each side asks
+  its local router for a public UDP port mapping over UPnP IGD,
+  NAT-PMP, or PCP, and advertises that endpoint alongside its STUN and
+  local ones. A peer behind a NAT that allocates a new public port per
+  destination (common on hotel, office, and carrier networks) can now
+  get a direct path to a peer behind an ordinary home router, where it
+  previously stayed relayed over DERP for the whole connection. Set
+  `TS_DISABLE_PORTMAPPER=1` to turn it off, or `TS_DISABLE_UPNP=1` to
+  turn off only UPnP. The wasm build is unchanged. It adds about 350 KB
+  (1.9%) to the stripped linux/amd64 binary.
+  ([#143](https://github.com/tailscale/tailcat/issues/143))
 - **Breaking Go API change:** `Server.AllowedClients` and
   `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
   hook, a `func(key.NodePublic) bool` asked about each client as it
