@@ -999,8 +999,12 @@ func normalizeListenAddrPort(s string) string {
 		return net.JoinHostPort(host, port)
 	} else if port, err := strconv.ParseUint(s, 10, 16); err == nil {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	} else if _, err := netip.ParseAddr(s); err == nil {
+		// A bare IP address. JoinHostPort brackets an IPv6 address
+		// such as "::1", which appending ":0" would leave ambiguous.
+		return net.JoinHostPort(s, "0")
 	}
-	// Assume it's a hostname or IP without a port.
+	// Assume it's a hostname without a port.
 	return s + ":0"
 }
 
