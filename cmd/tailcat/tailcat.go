@@ -58,6 +58,7 @@ var (
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
+	flagHybrid            *bool
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
@@ -105,6 +106,7 @@ func newRootCommand() *ff.Command {
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
+	flagHybrid = serveFS.BoolLong("hybrid", "EXPERIMENTAL: use the hybrid post-quantum (ML-KEM-768) WireGuard handshake, which doesn't depend on the tailcat address staying secret for its post-quantum protection. The address is shorter, with a 128-bit pre-shared key, but only works with clients that support the hybrid handshake; older clients reject it.")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -1362,6 +1364,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		ci.PresharedKey = tailcat.PresharedKey{}
 	}
 	psk := ci.PresharedKey
+	if *flagHybrid {
+		psk = psk.ForHybrid()
+	}
 	if reg == nil {
 		// A key created with custom DERP hostnames (genkey --region=<host>)
 		// has pre-populated regions with no DERP map ID to reference, so its
@@ -1393,9 +1398,10 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	ci.ServerPublic = tailcat.NodePublic{NodePublic: priv.Public()}
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
+	ci.Hybrid = *flagHybrid
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Hybrid: *flagHybrid, Logf: logf, Region: reg}
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- New experimental `tailcat serve --hybrid` flag (and `Server.Hybrid`
+  in the Go API) uses wireguard-go's hybrid post-quantum (ML-KEM-768)
+  WireGuard handshake, whose post-quantum protection doesn't depend on
+  the tailcat address staying secret. Hybrid addresses say so, so
+  clients use the hybrid handshake too, and carry a shorter 128-bit
+  pre-shared key, so they're shorter. Older clients reject hybrid
+  addresses. ([#133](https://github.com/tailscale/tailcat/issues/133))
 - **Breaking Go API change:** `Server.AllowedClients` and
   `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
   hook, a `func(key.NodePublic) bool` asked about each client as it

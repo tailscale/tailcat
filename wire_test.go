@@ -23,6 +23,7 @@ var wireFieldNames = map[string]string{
 	"p": "ServerPublic",
 	"k": "ServerDiscoPublic",
 	"q": "PresharedKey",
+	"y": "Hybrid",
 	"r": "Region",
 	"i": "RegionID",
 	"c": "RegionCode",

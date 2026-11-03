@@ -4,6 +4,8 @@
 package tailcat
 
 import (
+	"encoding/hex"
+
 	"tailscale.com/tailcfg"
 )
 
@@ -26,9 +28,21 @@ import (
 type wireConnInfo struct {
 	ServerPublic      NodePublic    `cbor:"p" json:"ServerPublic"`
 	ServerDiscoPublic *DiscoPublic  `cbor:"k,omitempty" json:"ServerDiscoPublic,omitempty"`
-	PresharedKey      *PresharedKey `cbor:"q,omitempty" json:"PresharedKey,omitempty"`
+	PresharedKey      wirePSK       `cbor:"q,omitempty" json:"PresharedKey,omitempty"`
+	Hybrid            bool          `cbor:"y,omitempty" json:"Hybrid,omitempty"`
 	Region            []*wireRegion `cbor:"r,omitempty" json:"Region,omitempty"`
 	RegionID          int64         `cbor:"i,omitempty" json:"RegionID,omitempty"`
+}
+
+// wirePSK is the wire form of a [PresharedKey]: all 32 bytes normally, or
+// just the first 16 when the address uses the hybrid handshake (see
+// hybridPresharedKeyLen).
+type wirePSK []byte
+
+// MarshalText implements encoding.TextMarshaler for JSON display, in the
+// same "psk:" hex form as [PresharedKey.MarshalText].
+func (p wirePSK) MarshalText() ([]byte, error) {
+	return append([]byte("psk:"), hex.EncodeToString(p)...), nil
 }
 
 // wireRegion is the wire form of [tailcfg.DERPRegion].
