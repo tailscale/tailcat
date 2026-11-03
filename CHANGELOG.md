@@ -9,6 +9,13 @@
   still work from `adb shell` or a rooted shell.
   ([#184](https://github.com/tailscale/tailcat/issues/184); reported by
   [@jy1655](https://github.com/jy1655))
+- New experimental `tailcat serve --hybrid` flag (and `Server.Hybrid`
+  in the Go API) uses wireguard-go's hybrid post-quantum (ML-KEM-768)
+  WireGuard handshake, whose post-quantum protection doesn't depend on
+  the tailcat address staying secret. Hybrid addresses say so, so
+  clients use the hybrid handshake too, and carry a shorter 128-bit
+  pre-shared key, so they're shorter. Older clients reject hybrid
+  addresses that have a pre-shared key. ([#133](https://github.com/tailscale/tailcat/issues/133))
 - tailcat now works in restricted sandboxes such as ChatGPT Work's
   ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412)):
   - If a DERP relay's HTTP upgrade fails, tailcat retries by speaking
