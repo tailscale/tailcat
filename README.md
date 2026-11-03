@@ -434,6 +434,16 @@ compatibility with tailcat clients v0.5.0 and earlier, `--psk=false` on `serve`
 or `genkey` produces shorter addresses, but removes post-quantum protection and
 protection from public DERP operators that observe the peers' public keys.
 
+The pre-shared key's post-quantum protection only lasts while the address
+stays secret. The experimental `tailcat serve --hybrid` flag instead uses
+a hybrid post-quantum (ML-KEM-768) WireGuard handshake, which protects
+recorded traffic even when the address is public, such as in a DNS TXT
+record. A hybrid address still contains a pre-shared key by default, to
+keep out DERP operators, but a shorter 128-bit one, so the address is
+shorter too.
+Clients need a tailcat version with hybrid support; older clients reject
+hybrid addresses.
+
 ```sh
 $ tailcat genkey --key=default --region=nyc
 # prints the tailcat address; key saved to ~/.config/tailcat/keys/default.private.json
@@ -706,8 +716,10 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 - A separate path-discovery public key (Curve25519, 32 bytes)
 - By default, an independent WireGuard pre-shared key (256 random bits),
   which prevents a DERP operator that observes the peers' public keys from
-  joining the tunnel and provides post-quantum protection against recorded
-  traffic
+  joining the tunnel and, while the address stays secret, provides
+  post-quantum protection against recorded traffic
+- With `serve --hybrid` (experimental), a flag saying to use the hybrid
+  post-quantum WireGuard handshake, and only 128 bits of pre-shared key
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
   2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
