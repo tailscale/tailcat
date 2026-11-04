@@ -92,6 +92,37 @@ func TestServeWithoutPSK(t *testing.T) {
 	}
 }
 
+func TestServeHybrid(t *testing.T) {
+	for _, psk := range []bool{true, false} {
+		t.Run(fmt.Sprintf("psk=%v", psk), func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t)
+			port := startEchoListener(t)
+			_, addr, serverStderr := e.startServer("serve", "--hybrid", fmt.Sprintf("--psk=%v", psk), strconv.Itoa(int(port)))
+
+			ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ci.Hybrid {
+				t.Fatal("serve --hybrid produced a non-hybrid address")
+			}
+			if got := !ci.PresharedKey.IsZero(); got != psk {
+				t.Fatalf("address has PSK = %v; want %v", got, psk)
+			}
+
+			const payload = "echo over a hybrid handshake"
+			got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+			if err != nil {
+				t.Fatalf("client to hybrid server: %v", err)
+			}
+			if got != payload {
+				t.Errorf("server echoed %q; want %q", got, payload)
+			}
+		})
+	}
+}
+
 func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t)

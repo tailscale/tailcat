@@ -40,6 +40,7 @@ import (
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -1515,6 +1516,168 @@ func TestPeerConfigIncludesPresharedKey(t *testing.T) {
 	if conf.PresharedKey != device.NoisePresharedKey(psk) {
 		t.Fatalf("peerConfig pre-shared key = %x, want %x", conf.PresharedKey, psk)
 	}
+}
+
+func TestAddrHybrid(t *testing.T) {
+	priv := NewPrivateKey()
+	priv.Public.RegionID = 10
+	classic := priv.Public
+	hybrid := priv.Public
+	hybrid.Hybrid = true
+
+	got, err := ParseAddr(hybrid.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Hybrid {
+		t.Error("Hybrid lost in address round trip")
+	}
+	if want := classic.PresharedKey.ForHybrid(); !got.PresharedKey.Equal(want) {
+		t.Errorf("hybrid pre-shared key = %x; want %x", got.PresharedKey, want)
+	}
+	if got, err := ParseAddr(classic.Addr()); err != nil || got.Hybrid {
+		t.Errorf("classic address parsed as Hybrid=%v, %v; want false, nil", got.Hybrid, err)
+	}
+
+	noPSK := hybrid
+	noPSK.PresharedKey = PresharedKey{}
+	if got, err := ParseAddr(noPSK.Addr()); err != nil || !got.Hybrid || !got.PresharedKey.IsZero() {
+		t.Errorf("hybrid address without PSK parsed as Hybrid=%v, PSK %x, %v; want true, zero, nil", got.Hybrid, got.PresharedKey, err)
+	}
+
+	// The CBOR bool costs 2 bytes; the shorter key saves 16.
+	if got, want := len(hybrid.Addr()), len(classic.Addr())-18; got > want {
+		t.Errorf("hybrid address length = %d; want at most %d", got, want)
+	}
+}
+
+// TestOldClientsRejectHybridAddr verifies that tailcat clients from before
+// the hybrid handshake, which decoded the pre-shared key straight into a
+// [PresharedKey], fail to parse a hybrid address instead of trying a
+// classic handshake the server never answers.
+func TestOldClientsRejectHybridAddr(t *testing.T) {
+	type oldWireConnInfo struct {
+		ServerPublic      NodePublic    `cbor:"p"`
+		ServerDiscoPublic *DiscoPublic  `cbor:"k,omitempty"`
+		PresharedKey      *PresharedKey `cbor:"q,omitempty"`
+		RegionID          int64         `cbor:"i,omitempty"`
+	}
+	decodeOld := func(a Addr) error {
+		x, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(a), "tc"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cbor.Unmarshal(x, new(oldWireConnInfo))
+	}
+
+	priv := NewPrivateKey()
+	priv.Public.RegionID = 10
+	if err := decodeOld(priv.Public.Addr()); err != nil {
+		t.Fatalf("old decoder rejected classic address: %v", err)
+	}
+	priv.Public.Hybrid = true
+	if err := decodeOld(priv.Public.Addr()); err == nil {
+		t.Fatal("old decoder accepted hybrid address")
+	}
+}
+
+func TestParseAddrMalformedHybrid(t *testing.T) {
+	for name, fields := range map[string]map[string]any{
+		"long-psk":          {"y": true, "q": make([]byte, presharedKeyLen)},
+		"classic-short-psk": {"q": make([]byte, hybridPresharedKeyLen)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fields["p"] = key.NewNode().Public().AppendTo(nil)
+			raw, err := cbor.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := Addr("tc" + base64.RawURLEncoding.EncodeToString(raw))
+			if _, err := ParseAddr(addr); err == nil {
+				t.Fatal("ParseAddr unexpectedly accepted malformed hybrid address")
+			}
+		})
+	}
+}
+
+func TestPeerConfigHybrid(t *testing.T) {
+	server := key.NewNode().Public()
+	b := &locoBackend{serverPub: server, presharedKey: NewPresharedKey(), hybrid: true}
+	conf, ok := b.peerConfig(server)
+	if !ok {
+		t.Fatal("peerConfig did not find server peer")
+	}
+	if !conf.Hybrid {
+		t.Fatal("peerConfig Hybrid = false; want true")
+	}
+}
+
+// TestHybridTunnel verifies that a hybrid server and client complete a
+// hybrid WireGuard handshake, and that a client using the classic
+// handshake with the same keys cannot reach the server.
+func TestHybridTunnel(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	s := &Server{Logf: mkLogger(t, "server"), Region: dm.Regions[1], Hybrid: true}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return func(c net.Conn) {
+			io.WriteString(c, "hybrid hello")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ci, err := ParseAddr(s.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.Hybrid {
+		t.Fatal("hybrid server's address isn't hybrid")
+	}
+
+	classicInfo := ci
+	classicInfo.Hybrid = false
+	classic := &Client{Server: classicInfo.Addr(), Logf: mkLogger(t, "classic-client")}
+	PingForTest(t, s, classic) // the pre-WireGuard discovery handshake still works
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if conn, err := classic.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("classic-handshake client established a tunnel with a hybrid server")
+	}
+	cancel()
+	classic.Close()
+
+	before := hybridResponderHandshakes()
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := io.ReadAll(conn)
+	if string(all) != "hybrid hello" {
+		t.Fatalf("read %q, %v; want %q", all, err, "hybrid hello")
+	}
+	if after := hybridResponderHandshakes(); after <= before {
+		t.Errorf("hybrid responder handshakes = %d, unchanged from before the dial", after)
+	}
+}
+
+// hybridResponderHandshakes returns wireguard-go's process-wide count of
+// completed hybrid handshakes in which it was the responder.
+func hybridResponderHandshakes() int64 {
+	for _, m := range clientmetric.Metrics() {
+		if m.Name() == "wireguard_handshake_hybrid_responder_completed" {
+			return m.Value()
+		}
+	}
+	return 0
 }
 
 // TestFetchDERPMapMemoryCache verifies the default in-memory DERP map
