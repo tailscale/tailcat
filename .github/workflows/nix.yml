@@ -18,9 +18,9 @@ jobs:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
-      # Cache the Nix store so the Go 1.27.1 toolchain that flake.nix
-      # builds from source is reused across runs instead of rebuilt
-      # every time. The key includes go.sum so the vendored Go module
+      # Cache the Nix store so the Go toolchain and other nixpkgs
+      # dependencies are reused across runs instead of refetched every
+      # time. The key includes go.sum so the vendored Go module
       # derivation is cached too; the restore prefix lets a run with a
       # changed key still reuse the toolchain from an older cache.
       - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
