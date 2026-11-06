@@ -296,6 +296,11 @@ func makePromise(f func() (any, error)) js.Value {
 		}()
 		return nil
 	})
+	// The Promise constructor calls handler before returning and
+	// never again, so release it. Otherwise it stays registered
+	// forever, along with f and everything f captures, such as the
+	// bytes of every write.
+	defer handler.Release()
 	return js.Global().Get("Promise").New(handler)
 }
 
