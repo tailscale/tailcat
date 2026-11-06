@@ -65,7 +65,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	for _, want := range []string{
 		"serve", "recv", "ping", "perf", "socks", "ssh", "cp", "parse", "resolve",
 		"forward", "genkey", "printpub", "version", "readme",
-		"--serve", "--key", "--derpmap-url",
+		"--serve", "--key", "--derpmap-url", "--listen-port",
 	} {
 		if !strings.Contains(help, want) {
 			t.Errorf("root help is missing %q", want)
@@ -267,8 +267,8 @@ func TestSocksTrailingArgs(t *testing.T) {
 // it (via flag set parenting).
 func TestGlobalFlagPlacement(t *testing.T) {
 	for _, args := range [][]string{
-		{"--key=new", "--derpmap-url=http://d/", "ping", "--timeout=5s", "tcaddr"},
-		{"ping", "--key=new", "--derpmap-url=http://d/", "--timeout=5s", "tcaddr"},
+		{"--key=new", "--derpmap-url=http://d/", "--listen-port=41641", "ping", "--timeout=5s", "tcaddr"},
+		{"ping", "--key=new", "--derpmap-url=http://d/", "--listen-port=41641", "--timeout=5s", "tcaddr"},
 	} {
 		if _, err := parseCLI(t, args...); err != nil {
 			t.Fatalf("parse %q: %v", args, err)
@@ -278,6 +278,9 @@ func TestGlobalFlagPlacement(t *testing.T) {
 		}
 		if *flagDERPMapURL != "http://d/" {
 			t.Errorf("parse %q: --derpmap-url = %q; want http://d/", args, *flagDERPMapURL)
+		}
+		if *flagListenPort != 41641 {
+			t.Errorf("parse %q: --listen-port = %d; want 41641", args, *flagListenPort)
 		}
 	}
 }

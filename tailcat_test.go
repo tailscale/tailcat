@@ -844,6 +844,17 @@ func TestServerRejectsNegativeUDPIdleTimeout(t *testing.T) {
 	}
 }
 
+func TestListenPortRange(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		if err := (&Server{ListenPort: port}).Start(); err == nil || !strings.Contains(err.Error(), "ListenPort") {
+			t.Errorf("Server.Start with ListenPort %d: error = %v; want range error", port, err)
+		}
+		if err := (&Client{ListenPort: port}).initLocked(); err == nil || !strings.Contains(err.Error(), "ListenPort") {
+			t.Errorf("Client.initLocked with ListenPort %d: error = %v; want range error", port, err)
+		}
+	}
+}
+
 func TestUDPIdleTimeoutDefault(t *testing.T) {
 	if got := (&Server{}).udpIdleTimeout(); got != DefaultUDPIdleTimeout {
 		t.Fatalf("zero UDPIdleTimeout = %v; want DefaultUDPIdleTimeout %v", got, DefaultUDPIdleTimeout)

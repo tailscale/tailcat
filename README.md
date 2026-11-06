@@ -454,6 +454,17 @@ ephemeral key anyway, `--key=<name>` to use a different saved key, or
 `tailcat genkey --delete --key=default` to remove the saved default key.
 `tailcat genkey --list` lists your saved keys.
 
+For manual router port forwarding, set `--listen-port` to a fixed local UDP
+port on the server (and forward that UDP port on the router):
+
+```sh
+$ tailcat serve --listen-port=41641 8080
+```
+
+The flag also works in client modes. By default, each process uses an
+OS-assigned local UDP port. `--listen-port` does not change the service port
+(`8080` above) inside the tunnel.
+
 Tailcat addresses can also be published as DNS TXT records and looked up by name;
 a DNS name works anywhere the CLI takes a tailcat address:
 
