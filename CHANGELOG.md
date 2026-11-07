@@ -29,6 +29,15 @@
   shared DERP relay mostly measures its rate limit; `--via-derp`
   allows relayed tests through your own relay, never through
   Tailscale's shared ones.
+- `tailcat socks` has a new `--dns` flag (or `TAILCAT_SOCKS_DNS`
+  environment variable) listing DNS servers to resolve exit-node
+  destination hostnames with, queried over TCP through the exit node,
+  so names resolve as they do on the exit node's network. Previously
+  they were always resolved locally, which can't find names that
+  exist only behind the exit node and fails on hosts whose DNS
+  returns fake IPs. Servers are tried in order. Without the flag,
+  hostnames still resolve locally.
+  (by [@imcom](https://github.com/imcom))
 
 ## v0.7.0 (2026-09-19)
 
