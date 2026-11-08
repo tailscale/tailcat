@@ -98,6 +98,10 @@ $
 
 Or you can serve a local TCP port, forwarded to localhost:
 
+Pass `--verbose` before `serve` to log each accepted TCP connection and UDP
+flow to stderr, including its source address, authenticated peer key, and
+destination. These logs can reveal client and service addresses.
+
 ```sh
 $ tailcat serve 8080,8443 # or: tailcat serve all
 # 🐈 Server listening with new address: tcXXXXXXXXX

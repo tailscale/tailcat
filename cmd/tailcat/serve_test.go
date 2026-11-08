@@ -90,6 +90,9 @@ func TestServeWithoutPSK(t *testing.T) {
 	if got != payload {
 		t.Errorf("server echoed %q; want %q", got, payload)
 	}
+	if strings.Contains(serverStderr.String(), "incoming TCP from ") {
+		t.Errorf("server logged a connection without --verbose: %s", serverStderr.String())
+	}
 }
 
 func TestServeRemembersSavedKeyWithoutPSK(t *testing.T) {
@@ -196,6 +199,11 @@ func TestServePorts(t *testing.T) {
 	}
 	if got != payload {
 		t.Errorf("served port echoed %q; want %q", got, payload)
+	}
+	if logs := serverStderr.String(); !strings.Contains(logs, "incoming TCP from ") ||
+		!strings.Contains(logs, "(peer key ") ||
+		!strings.Contains(logs, fmt.Sprintf(":%d (server key ", port)) {
+		t.Errorf("verbose server did not log the accepted connection and its peer/destination: %s", logs)
 	}
 
 	// The packet filter silently drops SYNs to unserved ports (no
