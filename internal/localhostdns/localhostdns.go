@@ -150,6 +150,13 @@ func answer(query []byte) ([]byte, error) {
 // isLocalhost reports whether the absolute, possibly mixed-case DNS
 // name is "localhost" or a subdomain of it.
 func isLocalhost(name dnsmessage.Name) bool {
-	n := strings.ToLower(name.String())
-	return n == "localhost." || strings.HasSuffix(n, ".localhost.")
+	return IsLocalhost(name.String())
+}
+
+// IsLocalhost reports whether host, a possibly mixed-case DNS name
+// with or without a trailing period, is "localhost" or a subdomain of
+// it: the names [Resolver] answers with the loopback addresses.
+func IsLocalhost(host string) bool {
+	n := strings.ToLower(strings.TrimSuffix(host, "."))
+	return n == "localhost" || strings.HasSuffix(n, ".localhost")
 }

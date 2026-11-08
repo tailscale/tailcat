@@ -1433,12 +1433,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		s.AllowClient = allow.Contains
 	}
 
-	// localDialer dials the local services that incoming connections
-	// are proxied to. Its resolver answers "localhost" itself with
-	// both loopback addresses; see the localhostdns package comment
-	// for why the OS resolver can't be trusted to (issue #108).
-	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
-
 	// tcpTarget returns the host:port a served TCP port is proxied
 	// to: its mapping's target if the serve spec gave one, else the
 	// same port on localhost.
@@ -1446,14 +1440,18 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if t, ok := targets[port]; ok {
 			return t
 		}
-		return fmt.Sprintf("localhost:%v", port)
+		return net.JoinHostPort("localhost", strconv.Itoa(int(port)))
 	}
 
-	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
+	// tcpForwardTo returns a handler that proxies a connection to
+	// hostPort. That is an IP:port for exit node traffic, but a served
+	// port's target (see tcpTarget) is "localhost:port" or a mapping's
+	// host:port, whose host can be a name such as "android.lan".
+	tcpForwardTo := func(hostPort string) func(net.Conn) {
 		return func(c net.Conn) {
-			localConn, err := localDialer.Dial("tcp", ipPortStr)
+			localConn, err := targetDialer(hostPort).Dial("tcp", hostPort)
 			if err != nil {
-				logf("error proxying to %v: %v", ipPortStr, err)
+				logf("error proxying to %v: %v", hostPort, err)
 				c.Close()
 				return
 			}
@@ -1549,7 +1547,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1578,7 +1576,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if !portSet.Contains(port) {
 			return nil // RST
 		}
-		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
 	}
 
 	if err := s.Start(); err != nil {
@@ -1644,6 +1642,23 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}()
 	}
 	select {}
+}
+
+// localDialer dials the local services that incoming connections are
+// proxied to. Its resolver answers "localhost" itself with both
+// loopback addresses; see the localhostdns package comment for why
+// the OS resolver can't be trusted to (issue #108).
+var localDialer = &net.Dialer{Resolver: localhostdns.Resolver}
+
+// targetDialer returns the dialer for proxying to target, a host:port.
+// Localhost names go through localDialer. Any other host, such as a
+// port mapping's "android.lan", needs the system resolver:
+// localhostdns.Resolver answers every name but localhost with NXDOMAIN.
+func targetDialer(target string) *net.Dialer {
+	if host, _, err := net.SplitHostPort(target); err == nil && localhostdns.IsLocalhost(host) {
+		return localDialer
+	}
+	return new(net.Dialer)
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
