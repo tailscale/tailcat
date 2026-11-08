@@ -10,8 +10,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"testing"
@@ -97,6 +100,56 @@ func (e *testSSHEnv) dialSSHClient(t *testing.T, config *gossh.ClientConfig) (*g
 		return nil, err
 	}
 	return gossh.NewClient(sshConn, chans, reqs), nil
+}
+
+func TestSSHLocalTCPForwarding(t *testing.T) {
+	t.Parallel()
+	const payload = "forwarded over SSH"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, payload)
+	}))
+	defer target.Close()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(target.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name, host string
+		opts       tailcat.SSHOptions
+		allow      bool
+	}{
+		{"Loopback", "127.0.0.1", tailcat.SSHOptions{Shell: true}, true},
+		{"Localhost", "localhost", tailcat.SSHOptions{Shell: true}, false},
+		{"RemoteIP", "192.0.2.1", tailcat.SSHOptions{Shell: true}, false},
+		{"Hostname", "example.invalid", tailcat.SSHOptions{Shell: true}, false},
+		{"FilesOnly", "127.0.0.1", tailcat.SSHOptions{Files: &tailcat.FileService{Dir: t.TempDir(), Mode: tailcat.FileServeRO}}, false},
+		{"ForcedCommand", "127.0.0.1", tailcat.SSHOptions{Shell: true, Exec: []string{"unused-command"}}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := setupSSHEnv(t, tt.opts).sshClient(t)
+			transport := &http.Transport{DialContext: c.DialContext}
+			defer transport.CloseIdleConnections()
+			client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+			res, err := client.Get("http://" + net.JoinHostPort(tt.host, port))
+			if err == nil {
+				defer res.Body.Close()
+			}
+			if !tt.allow {
+				var openErr *gossh.OpenChannelError
+				if !errors.As(err, &openErr) || openErr.Reason != gossh.Prohibited {
+					t.Fatalf("forwarding error = %v; want administratively prohibited", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(res.Body)
+			if err != nil || string(got) != payload {
+				t.Fatalf("forwarded response = %q, %v; want %q", got, err, payload)
+			}
+		})
+	}
 }
 
 func TestSSHPublicKeyAuthentication(t *testing.T) {

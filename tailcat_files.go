@@ -45,7 +45,8 @@ type FileService struct {
 // SSHOptions configures the SSH server returned by
 // [Server.SSHConnHandler].
 type SSHOptions struct {
-	// Shell enables shell and exec sessions.
+	// Shell enables shell and exec sessions, plus local TCP forwarding to
+	// loopback IP addresses on the server.
 	Shell bool
 
 	// Exec, if non-empty, is a command (program and arguments) that
