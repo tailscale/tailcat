@@ -1905,7 +1905,7 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	// call-me-maybe messages that advertise our UDP endpoints (see
 	// locoBackend.advertiseEndpoints).
 	conf.ForceDiscoKey = discoPrivateForNode(lb.priv)
-	netns.SetEnabled(false)
+	configureNetNS()
 	e, err := wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
 		logf("wgengine.NewUserspaceEngine(tun %q) error: %v", "userspace-networking", err)
@@ -1914,6 +1914,26 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	sys.Set(e)
 	sys.NetstackRouter.Set(true)
 	return nil
+}
+
+// configureNetNS sets the process-wide netns policy before tailcat opens
+// any sockets.
+//
+// On macOS netns stays on. It binds tailcat's UDP sockets and DERP
+// connections to the default physical interface, as tailscaled does, so
+// a co-located VPN that takes the default route, such as the Tailscale
+// app with an exit node selected, does not carry tailcat's WireGuard
+// packets inside its own tunnel. Loopback traffic still works from
+// sockets bound this way.
+//
+// Other platforms turn netns off. On Linux, netns's unprivileged fallback
+// (SO_BINDTODEVICE to the default interface) blackholes loopback UDP,
+// making every netcheck against a loopback DERP map burn the full
+// 3-second STUN timeout before falling back to HTTPS probes.
+func configureNetNS() {
+	if runtime.GOOS != "darwin" {
+		netns.SetEnabled(false)
+	}
 }
 
 // Client connects to a [Server] over a WireGuard tunnel relayed through DERP.
