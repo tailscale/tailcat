@@ -711,7 +711,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 			if s.OnTCP == nil {
 				return nil, true // send RST
 			}
-			return s.OnTCP(dst.Port()), true
+			return recoverConnHandler(logf, s.OnTCP(dst.Port())), true
 		}
 		if s.OnTCPForward == nil {
 			return nil, true // send RST
@@ -722,7 +722,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 			copy(a4[:], d6[12:16])
 			dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
 		}
-		return s.OnTCPForward(dst), true
+		return recoverConnHandler(logf, s.OnTCPForward(dst)), true
 	}
 	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
 		var h func(ConnPacketConn)
@@ -2432,6 +2432,27 @@ func ProxyConns(a, b net.Conn) {
 }
 
 const proxyConnDrainTimeout = 5 * time.Second
+
+// recoverConnHandler wraps h so that, as with net/http, a panic while
+// serving one connection is logged and closes that connection instead
+// of crashing the whole server. A nil h stays nil, which resets the
+// connection.
+func recoverConnHandler(logf logger.Logf, h func(net.Conn)) func(net.Conn) {
+	if h == nil {
+		return nil
+	}
+	return func(c net.Conn) {
+		defer func() {
+			if err := recover(); err != nil {
+				buf := make([]byte, 64<<10)
+				buf = buf[:runtime.Stack(buf, false)]
+				logf("panic serving TCP connection: %v\n%s", err, buf)
+				c.Close()
+			}
+		}()
+		h(c)
+	}
+}
 
 // closeProxyConn waits up to proxyConnDrainTimeout for a gVisor TCP connection
 // whose peer has already closed to acknowledge our FIN, then closes it.

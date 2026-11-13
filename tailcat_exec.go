@@ -25,8 +25,16 @@ import (
 // command has exited.
 func (s *Server) ExecConnHandler(argv []string) func(net.Conn) {
 	return func(c net.Conn) {
+		// netstack reports no addresses once a connection is no longer
+		// connected: the client reset it before it got here.
+		local, remote := c.LocalAddr(), c.RemoteAddr()
+		if local == nil || remote == nil {
+			s.lb.logf("exec %v: connection closed before it was served", argv[0])
+			c.Close()
+			return
+		}
 		cmd := exec.Command(argv[0], argv[1:]...)
-		cmd.Env = append(os.Environ(), s.PeerEnv(c.LocalAddr(), c.RemoteAddr())...)
+		cmd.Env = append(os.Environ(), s.PeerEnv(local, remote)...)
 		cmd.Stderr = os.Stderr
 		if err := runConnCommand(c, cmd); err != nil {
 			s.lb.logf("exec %v: %v", argv[0], err)
@@ -44,10 +52,15 @@ func (s *Server) ExecConnHandler(argv []string) func(net.Conn) {
 //     talking to.
 //   - TAILCAT_REMOTE_ADDR: the peer's tailcat IP:port.
 //   - TAILCAT_LOCAL_ADDR: the server's own IP:port the peer connected to.
+//
+// A nil address, as a closed connection reports, is left out.
 func (s *Server) PeerEnv(local, remote net.Addr) []string {
-	env := []string{
-		"TAILCAT_REMOTE_ADDR=" + remote.String(),
-		"TAILCAT_LOCAL_ADDR=" + local.String(),
+	var env []string
+	if remote != nil {
+		env = append(env, "TAILCAT_REMOTE_ADDR="+remote.String())
+	}
+	if local != nil {
+		env = append(env, "TAILCAT_LOCAL_ADDR="+local.String())
 	}
 	if k, ok := s.PeerKey(remote); ok {
 		env = append(env, "TAILCAT_PEER_KEY="+k.String())
