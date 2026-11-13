@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
@@ -1680,5 +1683,23 @@ func TestPeerKey(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Errorf("timeout waiting for the %s handler", tt.proto)
 		}
+	}
+}
+
+// TestNetNSPolicy checks the netns policy that configureNetNS sets when a
+// Server starts. On macOS netns stays on, so tailcat's sockets bind to the
+// default physical interface instead of following a co-located VPN's
+// default route. Elsewhere it is off.
+func TestNetNSPolicy(t *testing.T) {
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: dm.Regions[1]}
+	t.Cleanup(func() { s.Close() })
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	bound := netns.Listener(t.Logf, netmon.NewStatic()).Control != nil
+	if want := runtime.GOOS == "darwin"; bound != want {
+		t.Errorf("on %s after Server.Start, netns binds sockets = %v; want %v", runtime.GOOS, bound, want)
 	}
 }
