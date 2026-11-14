@@ -396,6 +396,12 @@ func Read(id, token Handle, data []byte) (n int, err error) {
 			return err
 		}
 		return withDeadline(ctx, c.readGate, c.conn.SetReadDeadline, func() error {
+			if len(data) == 0 {
+				// Consume one datagram without passing an empty buffer to netstack.
+				var buf [1]byte
+				_, err := c.conn.Read(buf[:])
+				return err
+			}
 			var err error
 			n, err = c.conn.Read(data)
 			return err

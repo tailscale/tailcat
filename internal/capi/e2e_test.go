@@ -189,6 +189,42 @@ func TestE2EUDPRoundTripAndDeadline(t *testing.T) {
 	}
 }
 
+func TestE2EUDPZeroCapacityRead(t *testing.T) {
+	x := newE2E(t)
+	_, dialed, accepted := x.connect(UDP)
+	buf := make([]byte, 64)
+	if n, err := Read(accepted, x.token(), buf); err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("first datagram = %q, %v", buf[:n], err)
+	}
+	for _, tt := range []struct {
+		name           string
+		reader, writer Handle
+	}{
+		{"server", accepted, dialed},
+		{"client", dialed, accepted},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, payload := range []string{"hello", ""} {
+				if _, err := Write(tt.writer, x.token(), []byte(payload)); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := Read(tt.reader, x.token(), nil); err != nil || n != 0 {
+					t.Fatalf("zero-capacity read of %q = %d, %v", payload, n, err)
+				}
+				if _, err := Write(tt.writer, x.token(), []byte("next")); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := Read(tt.reader, x.token(), buf); err != nil || string(buf[:n]) != "next" {
+					t.Fatalf("next datagram = %q, %v", buf[:n], err)
+				}
+			}
+			if n, err := Read(tt.reader, testToken(t, 50*time.Millisecond), nil); n != 0 || ErrorCode(err) != Timeout {
+				t.Fatalf("idle zero-capacity read = %d, %v, want timeout", n, err)
+			}
+		})
+	}
+}
+
 func TestE2EClientPingAndInfo(t *testing.T) {
 	x := newE2E(t)
 	if err := Drain(x.client, x.token()); err != nil {
