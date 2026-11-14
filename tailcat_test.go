@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,7 @@ import (
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -1680,5 +1682,56 @@ func TestPeerKey(t *testing.T) {
 		case <-time.After(30 * time.Second):
 			t.Errorf("timeout waiting for the %s handler", tt.proto)
 		}
+	}
+}
+
+func TestOnEngineStatusFiltersTailscaleEndpoints(t *testing.T) {
+	// Magicsock reports every local interface address as a UDP
+	// endpoint, including the addresses of a tailscaled tunnel
+	// interface when the machine also runs Tailscale. Advertising
+	// one of those invites the peer to run our WireGuard inside
+	// Tailscale's WireGuard, through a 1280-byte-MTU tun, and on
+	// Linux the batched (GSO) sends on that path mostly never
+	// arrive (#168). Only the non-Tailscale endpoints may be
+	// advertised.
+	b := &locoBackend{}
+	b.onEngineStatus(&wgengine.Status{LocalAddrs: []tailcfg.Endpoint{
+		{Addr: netip.MustParseAddrPort("192.168.1.2:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("100.64.1.2:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("203.0.113.5:1234"), Type: tailcfg.EndpointSTUN},
+		{Addr: netip.MustParseAddrPort("[2001:db8::1]:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("100.127.255.255:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("100.128.0.1:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("[fd7a:115c:a1e1::1]:1234"), Type: tailcfg.EndpointLocal},
+	}}, nil)
+	b.mu.Lock()
+	got := append([]netip.AddrPort(nil), b.eps...)
+	b.mu.Unlock()
+	want := []netip.AddrPort{
+		netip.MustParseAddrPort("100.128.0.1:1234"),
+		netip.MustParseAddrPort("192.168.1.2:1234"),
+		netip.MustParseAddrPort("203.0.113.5:1234"),
+		netip.MustParseAddrPort("[2001:db8::1]:1234"),
+		// Just outside the Tailscale ULA range (fd7a:115c:a1e0::/48
+		// covers a1e0, not a1e1), so it stays advertised.
+		netip.MustParseAddrPort("[fd7a:115c:a1e1::1]:1234"),
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("advertised endpoints = %v; want %v", got, want)
+	}
+
+	// If every endpoint is a Tailscale address, nothing is
+	// advertised and no direct path is attempted; DERP remains.
+	b = &locoBackend{}
+	b.onEngineStatus(&wgengine.Status{LocalAddrs: []tailcfg.Endpoint{
+		{Addr: netip.MustParseAddrPort("100.64.1.2:1234"), Type: tailcfg.EndpointLocal},
+		{Addr: netip.MustParseAddrPort("[fd7a:115c:a1e0::1]:1234"), Type: tailcfg.EndpointLocal},
+	}}, nil)
+	b.mu.Lock()
+	got = append([]netip.AddrPort(nil), b.eps...)
+	b.mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("advertised endpoints = %v; want none", got)
 	}
 }
