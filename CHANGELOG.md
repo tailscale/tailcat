@@ -29,6 +29,16 @@
   shared DERP relay mostly measures its rate limit; `--via-derp`
   allows relayed tests through your own relay, never through
   Tailscale's shared ones.
+- Direct paths no longer go through a peer's Tailscale address:
+  tailcat used to offer its Tailscale addresses (100.64.0.0/10 or
+  fd7a:115c:a1e0::/48) as direct UDP endpoints, so two machines on the
+  same LAN that both run Tailscale could end up sending WireGuard
+  inside Tailscale's WireGuard, through a 1280-byte-MTU tunnel. On
+  Linux the batched (GSO) sends on that path mostly never arrived and
+  throughput from Linux collapsed to tens of KB/s. Those addresses
+  are no longer advertised; the plain LAN address is used instead,
+  and DERP remains the fallback where no direct path exists.
+  ([#168](https://github.com/tailscale/tailcat/issues/168))
 
 ## v0.7.0 (2026-09-19)
 

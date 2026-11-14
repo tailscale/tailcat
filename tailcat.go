@@ -1547,12 +1547,24 @@ func (b *locoBackend) peerForIP(ip netip.Addr) (_ wgengine.PeerForIP, ok bool) {
 // has no control plane distributing endpoints, and magicsock never
 // attempts a direct path to a peer with no known endpoints, so these
 // advertisements are what make direct connections possible at all.
+//
+// Endpoints on a Tailscale address (100.64.0.0/10 or
+// fd7a:115c:a1e0::/48) are left out: advertising one invites the peer
+// to run our WireGuard inside Tailscale's WireGuard, through a tun
+// device with a 1280-byte MTU, and on Linux the batched (GSO) sends
+// on that path mostly never arrive, so throughput from Linux collapses
+// to tens of KB/s (#168). A peer on the same LAN always has a plain
+// LAN address to use instead, and where no direct path exists at all
+// DERP remains the fallback.
 func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 	if err != nil || st == nil {
 		return
 	}
 	var eps []netip.AddrPort
 	for _, ep := range st.LocalAddrs {
+		if tsaddr.IsTailscaleIP(ep.Addr.Addr()) {
+			continue
+		}
 		eps = append(eps, ep.Addr)
 	}
 	slices.SortFunc(eps, func(a, b netip.AddrPort) int { return a.Compare(b) })
