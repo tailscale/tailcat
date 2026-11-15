@@ -1124,9 +1124,21 @@ func (a Addr) Resolve(ctx context.Context, opts ...any) (Addr, error) {
 	if err := ci.Expand(ctx, opts...); err != nil {
 		return "", err
 	}
-	// Keep the address short: two relay nodes suffice.
+	// Keep the address short: two relay nodes suffice. STUN-only nodes
+	// are dropped by wireRegionOf when the address is encoded, so take
+	// the first two usable nodes here rather than a raw prefix of the
+	// region's node list, which STUN-only nodes may fill.
 	for _, r := range ci.Region {
-		r.Nodes = r.Nodes[:min(2, len(r.Nodes))]
+		var nodes []*tailcfg.DERPNode
+		for _, n := range r.Nodes {
+			if !n.STUNOnly {
+				nodes = append(nodes, n)
+				if len(nodes) == 2 {
+					break
+				}
+			}
+		}
+		r.Nodes = nodes
 	}
 	ci.RegionID = 0
 	return ci.Addr(), nil
