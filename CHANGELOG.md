@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- tailcat now works in restricted sandboxes such as ChatGPT Work's
+  ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412)):
+  - If a DERP relay's HTTP upgrade fails, tailcat retries by speaking
+    DERP inside WebSockets, as browsers do. This gets through proxies
+    that intercept TLS and allow WebSocket upgrades but block others.
+  - If tailcat can't monitor the OS network state (such as without
+    netlink access), it continues without reacting to network changes
+    instead of failing to start.
+  - Connections to DERP relays now go through the HTTP proxy named by
+    `HTTPS_PROXY` (or the OS proxy settings, on Windows), or a SOCKS5
+    `ALL_PROXY`. Release binaries had compiled proxy support out.
 - **Breaking Go API change:** `Server.AllowedClients` and
   `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
   hook, a `func(key.NodePublic) bool` asked about each client as it

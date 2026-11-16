@@ -35,11 +35,14 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -397,6 +400,53 @@ func TestStatusReportsPeers(t *testing.T) {
 		}
 	}
 	t.Logf("peer %v: CurAddr=%q Relay=%q", c.PublicKey(), ps.CurAddr, ps.Relay)
+}
+
+// TestNetmonFallback checks that a Server and Client still work when the
+// OS network state can't be monitored, as in sandboxes without netlink.
+//
+// It isn't parallel because it replaces netmonNew for the whole package.
+func TestNetmonFallback(t *testing.T) {
+	var failed atomic.Int32
+	tstest.Replace(t, &netmonNew, func(*eventbus.Bus, logger.Logf) (*netmon.Monitor, error) {
+		failed.Add(1)
+		return nil, errors.New("netlink unavailable")
+	})
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: dm.Regions[1]}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return func(c net.Conn) {
+			io.WriteString(c, "Hello without netmon\n")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	if got := failed.Load(); got != 2 {
+		t.Errorf("netmonNew called %d times; want 2 (server and client)", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatalf("DialTCPPort: %v", err)
+	}
+	defer conn.Close()
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := "Hello without netmon\n"; string(got) != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
 }
 
 // pingRejectedForTest checks that the server never acknowledges c's
