@@ -40,6 +40,9 @@
   shared DERP relay mostly measures its rate limit; `--via-derp`
   allows relayed tests through your own relay, never through
   Tailscale's shared ones.
+- `tailcat ssh` and `tailcat cp` take `-i <identity-file>` to log in
+  to a `tailcat serve ssh` server with a specific private key, without
+  an ssh config entry.
 
 ## v0.7.0 (2026-09-19)
 

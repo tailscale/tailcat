@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -28,7 +29,7 @@ func TestSSHRejectsInvalidAddr(t *testing.T) {
 		{"invalid CBOR", "tc" + base64.RawURLEncoding.EncodeToString([]byte("not CBOR")), "CBOR unmarshal"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			err := clientSSHMode("22", false, []string{tt.addr})
+			err := clientSSHMode("22", "", false, []string{tt.addr})
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("clientSSHMode(%q) error = %v; want an error containing %q", tt.addr, err, tt.wantErr)
 			}
@@ -133,6 +134,46 @@ func TestProxyCommandJoinWindows(t *testing.T) {
 		if _, err := proxyCommandJoinWindows([]string{arg}); err == nil {
 			t.Errorf("proxyCommandJoinWindows accepted unsafe argument %q", arg)
 		}
+	}
+}
+
+func TestSSHArgv(t *testing.T) {
+	base := []string{
+		"/usr/bin/ssh",
+		"-o", "UpdateHostKeys no",
+		"-o", "StrictHostKeyChecking no",
+		"-o", "UserKnownHostsFile " + os.DevNull,
+		"-o", "LogLevel ERROR",
+		"-o", "ProxyCommand=proxy",
+	}
+	join := func(parts ...[]string) []string {
+		var out []string
+		for _, p := range parts {
+			out = append(out, p...)
+		}
+		return out
+	}
+	for _, tt := range []struct {
+		name         string
+		identityFile string
+		cmdArgs      []string
+		want         []string
+	}{
+		{"no identity", "", nil,
+			join(base, []string{"--", "dst"})},
+		{"identity", "/home/me/.ssh/id_work", nil,
+			join(base, []string{"-i", "/home/me/.ssh/id_work", "-o", "IdentitiesOnly yes", "--", "dst"})},
+		{"identity and remote command", "key", []string{"ls", "-la"},
+			join(base, []string{"-i", "key", "-o", "IdentitiesOnly yes", "--", "dst", "ls", "-la"})},
+		{"identity starting with dash", "-oProxyCommand=evil", nil,
+			join(base, []string{"-i", "-oProxyCommand=evil", "-o", "IdentitiesOnly yes", "--", "dst"})},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := sshArgv("/usr/bin/ssh", "proxy", tt.identityFile, "dst", tt.cmdArgs)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("sshArgv =\n%q\nwant\n%q", got, tt.want)
+			}
+		})
 	}
 }
 
