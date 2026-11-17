@@ -654,14 +654,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 	sys.Set(bus)
 	sys.Set(health.NewTracker(bus))
 
-	netMon, err := netmon.New(bus, func(format string, args ...any) {
-		logf(format, args...)
-	})
-	if err != nil {
-		lb.Close() // closes the subsystems started so far
-		return fmt.Errorf("netmon.New: %w", err)
-	}
-	sys.Set(netMon)
+	sys.Set(newNetMon(bus, logf))
 
 	dialer := &tsdial.Dialer{Logf: logf} // mutated below (before used)
 	sys.Set(dialer)
@@ -1893,6 +1886,22 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 	)
 }
 
+// netmonNew is netmon.New, replaced in tests.
+var netmonNew = netmon.New
+
+// newNetMon returns a network monitor for bus. If the OS network state
+// can't be monitored, such as in sandboxes without netlink access, it
+// returns a static monitor instead. Tailcat's userspace network stack
+// works without one; it just can't react to network changes.
+func newNetMon(bus *eventbus.Bus, logf logger.Logf) *netmon.Monitor {
+	netMon, err := netmonNew(bus, logf)
+	if err != nil {
+		logf("can't monitor network changes, continuing without: %v", err)
+		return netmon.NewStatic()
+	}
+	return netMon
+}
+
 // createEngine creates the wgengine.Engine with userspace networking.
 func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	sys := &lb.sys
@@ -2025,14 +2034,7 @@ func (c *Client) initLocked() error {
 	sys.Set(bus)
 	sys.Set(health.NewTracker(bus))
 
-	netMon, err := netmon.New(bus, func(format string, args ...any) {
-		logf(format, args...)
-	})
-	if err != nil {
-		lb.Close() // closes the subsystems started so far
-		return fmt.Errorf("netmon.New: %w", err)
-	}
-	sys.Set(netMon)
+	sys.Set(newNetMon(bus, logf))
 
 	dialer := &tsdial.Dialer{Logf: logf} // mutated below (before used)
 	sys.Set(dialer)
