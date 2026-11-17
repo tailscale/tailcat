@@ -38,6 +38,7 @@ const sshLongHelp = `Examples:
 	tailcat ssh example.com
 	tailcat ssh -p 2222 <tc-addr>
 	tailcat ssh -p 10.0.0.1:22 <tc-addr>
+	tailcat ssh -i ~/.ssh/id_work <tc-addr>
 
 This execs the system ssh client with a ProxyCommand that runs
 tailcat itself, so ssh sees a normal (if oddly named) destination
@@ -57,27 +58,32 @@ anyway or to save the probe's round trips.
 
 The -p flag is the server port to connect to (default 22), or, if
 the server is an exit node (--serve=exit-node), an ip:port on the
-server's network to reach through it; a bare IP means its port 22.`
+server's network to reach through it; a bare IP means its port 22.
+
+The -i flag names the private key file to log in with. It is passed
+to ssh as -i, with IdentitiesOnly set so that ssh offers only that
+key, not the keys in ssh-agent or the default ~/.ssh files.`
 
 // sshCommand returns the "tailcat ssh" subcommand, with parent as the
 // parent flag set for the global flags.
 func sshCommand(parent *ff.FlagSet) *ff.Command {
 	fs := ff.NewFlagSet("ssh").SetParent(parent)
 	port := fs.StringShort('p', "22", "port number, or ip:port to reach via the server's exit node; a bare IP means port 22 on it")
+	identityFile := fs.StringShort('i', "", "private key file to authenticate with; ssh offers only this key")
 	skipDNSCheck := fs.BoolLong("skip-dns-safety-check", "don't probe a DNS-named destination for whether its server gives SSH access to strangers (anyone who reads its public TXT record); skipping also saves the probe's round trips")
 	return &ff.Command{
 		Name:      "ssh",
-		Usage:     "tailcat ssh [-p <port|ip:port>] [user@]<tc-addr> [<command> [args...]]",
+		Usage:     "tailcat ssh [-p <port|ip:port>] [-i <identity-file>] [user@]<tc-addr> [<command> [args...]]",
 		ShortHelp: "connect the system ssh client through a tailcat server",
 		LongHelp:  sshLongHelp,
 		Flags:     fs,
 		Exec: func(ctx context.Context, args []string) error {
-			return clientSSHMode(*port, *skipDNSCheck, args)
+			return clientSSHMode(*port, *identityFile, *skipDNSCheck, args)
 		},
 	}
 }
 
-func clientSSHMode(portOrIPPort string, skipDNSCheck bool, args []string) error {
+func clientSSHMode(portOrIPPort, identityFile string, skipDNSCheck bool, args []string) error {
 	if len(args) == 0 {
 		return usagef("ssh requires a [user@]<tc-addr> destination argument")
 	}
@@ -117,6 +123,13 @@ func clientSSHMode(portOrIPPort string, skipDNSCheck bool, args []string) error 
 	if err != nil {
 		return err
 	}
+	argv := sshArgv(sshExe, proxyCommand, identityFile, sshDst, cmdArgs)
+	err = execSSH(sshExe, argv)
+	log.Fatalf("failed to run ssh: %v", err)
+	return nil
+}
+
+func sshArgv(sshExe, proxyCommand, identityFile, sshDst string, cmdArgs []string) []string {
 	argv := []string{
 		sshExe,
 		"-o", "UpdateHostKeys no",
@@ -124,13 +137,17 @@ func clientSSHMode(portOrIPPort string, skipDNSCheck bool, args []string) error 
 		"-o", "UserKnownHostsFile " + os.DevNull,
 		"-o", "LogLevel ERROR",
 		"-o", "ProxyCommand=" + proxyCommand,
-		"--",
-		sshDst,
 	}
-	argv = append(argv, cmdArgs...)
-	err = execSSH(sshExe, argv)
-	log.Fatalf("failed to run ssh: %v", err)
-	return nil
+	argv = append(argv, identityArgs(identityFile)...)
+	argv = append(argv, "--", sshDst)
+	return append(argv, cmdArgs...)
+}
+
+func identityArgs(identityFile string) []string {
+	if identityFile == "" {
+		return nil
+	}
+	return []string{"-i", identityFile, "-o", "IdentitiesOnly yes"}
 }
 
 // validatedSSHPort validates and canonicalizes the port or IP:port passed to
