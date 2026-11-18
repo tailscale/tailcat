@@ -64,6 +64,7 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	go4mem "go4.org/mem"
 	"go4.org/netipx"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -1894,8 +1895,20 @@ func tcAddrForKey(k key.NodePublic) netip.Addr {
 	return netip.AddrFrom16(a)
 }
 
+// tcpTimeWaitTimeout is how long a closed TCP connection in the
+// netstack stays in TIME-WAIT, replacing gVisor's 60 second default.
+//
+// Each netstack carries only its own WireGuard tunnel to a single
+// peer, so a delayed duplicate segment arriving long after a close is
+// very unlikely. Meanwhile, TIME-WAIT endpoints cost memory, and while
+// one exists, gVisor's TCP forwarder drops a new SYN for the same
+// 4-tuple (gvisor/gvisor#15013), stalling dials that reuse a recent
+// ephemeral port. Five seconds still covers a few retransmissions of
+// the peer's FIN if our final ACK is lost.
+const tcpTimeWaitTimeout = 5 * time.Second
+
 func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
-	return netstack.Create(logf,
+	ns, err := netstack.Create(logf,
 		sys.Tun.Get(),
 		sys.Engine.Get(),
 		sys.MagicSock.Get(),
@@ -1903,6 +1916,15 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 		sys.DNSManager.Get(),
 		sys.ProxyMapper(),
 	)
+	if err != nil {
+		return nil, err
+	}
+	opt := tcpip.TCPTimeWaitTimeoutOption(tcpTimeWaitTimeout)
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		ns.Close()
+		return nil, fmt.Errorf("setting TCP TIME-WAIT timeout: %v", err)
+	}
+	return ns, nil
 }
 
 // netmonNew is netmon.New, replaced in tests.

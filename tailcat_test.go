@@ -1271,6 +1271,19 @@ func TestCloseWithManyTimeWaitEndpoints(t *testing.T) {
 	PingForTest(t, s, c)
 
 	st := tcpipStackOf(s.lb.ns)
+	var got tcpip.TCPTimeWaitTimeoutOption
+	if err := st.TransportProtocolOption(tcp.ProtocolNumber, &got); err != nil {
+		t.Fatalf("getting TIME-WAIT timeout: %v", err)
+	}
+	if time.Duration(got) != tcpTimeWaitTimeout {
+		t.Errorf("TIME-WAIT timeout = %v; want %v", time.Duration(got), tcpTimeWaitTimeout)
+	}
+	// Restore gVisor's default for this test so no endpoint leaves
+	// TIME-WAIT before Close, however slowly the dials below go.
+	long := tcpip.TCPTimeWaitTimeoutOption(tcp.DefaultTCPTimeWaitTimeout)
+	if err := s.lb.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &long); err != nil {
+		t.Fatalf("setting TIME-WAIT timeout: %v", err)
+	}
 
 	const numConns = 600 // more than netstack's 512-packet outbound queue
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
