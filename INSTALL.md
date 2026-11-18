@@ -8,8 +8,22 @@ tailcat is and how to use it, see the [README](./README.md).
 Prebuilt binaries are on the
 [Releases page](https://github.com/tailscale/tailcat/releases): static
 Linux binaries (tar.gz) plus Debian (.deb) and RPM (.rpm) packages for
-amd64, arm64, and armv7, and Windows binaries (zip) for amd64 and
-arm64.
+amd64, arm64, and armv7, Windows binaries (zip) for amd64 and
+arm64, and an Android binary (tar.gz) for arm64.
+
+## Android (Termux)
+
+On Android, use the `android_arm64` tar.gz from the
+[Releases page](https://github.com/tailscale/tailcat/releases), not
+the `linux_arm64` one. Termux on Android 10 and newer runs programs
+through Android's dynamic linker, which refuses the static Linux
+binaries with `has unexpected e_type: 2`. The Linux binaries do still
+run from `adb shell` or a rooted shell, which execute them directly.
+
+```sh
+$ tar -xzf tailcat_*_android_arm64.tar.gz tailcat
+$ mv tailcat $PREFIX/bin/
+```
 
 ## Homebrew (macOS)
 
