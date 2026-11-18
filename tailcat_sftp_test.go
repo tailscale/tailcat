@@ -6,6 +6,7 @@
 package tailcat_test
 
 import (
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -333,5 +334,70 @@ func TestSFTPWriteOnlyPlus(t *testing.T) {
 	}
 	if got, err := readFile(c, "drop.txt"); err == nil {
 		t.Errorf("read drop.txt succeeded, got %q", got)
+	}
+}
+
+// TestSFTPSetstatTruncatedAttrs checks that a SETSTAT whose flags claim
+// more attribute bytes than the packet contains gets a BAD_MESSAGE
+// status rather than crashing the server. pkg/sftp's Request.Attributes
+// returns nil for such packets, which setstat once dereferenced.
+// sftp.Client can't send a malformed packet, so this writes raw
+// SFTP v3 packets.
+func TestSFTPSetstatTruncatedAttrs(t *testing.T) {
+	srvConn, cliConn := net.Pipe()
+	defer cliConn.Close()
+	go tailcat.ServeRootedSFTPForTest(srvConn, &tailcat.FileService{Dir: newServeDir(t), Mode: tailcat.FileServeRW})
+
+	const (
+		fxpInit      = 1
+		fxpVersion   = 2
+		fxpSetstat   = 9
+		fxpStatus    = 101
+		attrPerms    = 0x4 // SSH_FILEXFER_ATTR_PERMISSIONS
+		fxBadMessage = 5   // SSH_FX_BAD_MESSAGE
+		reqID        = 42
+	)
+	sendPacket := func(payload []byte) {
+		t.Helper()
+		pkt := binary.BigEndian.AppendUint32(nil, uint32(len(payload)))
+		if _, err := cliConn.Write(append(pkt, payload...)); err != nil {
+			t.Fatalf("write packet: %v", err)
+		}
+	}
+	readPacket := func() []byte {
+		t.Helper()
+		var hdr [4]byte
+		if _, err := io.ReadFull(cliConn, hdr[:]); err != nil {
+			t.Fatalf("read packet length: %v", err)
+		}
+		payload := make([]byte, binary.BigEndian.Uint32(hdr[:]))
+		if _, err := io.ReadFull(cliConn, payload); err != nil {
+			t.Fatalf("read packet: %v", err)
+		}
+		return payload
+	}
+
+	sendPacket(binary.BigEndian.AppendUint32([]byte{fxpInit}, 3))
+	if p := readPacket(); len(p) == 0 || p[0] != fxpVersion {
+		t.Fatalf("got packet %x, want VERSION", p)
+	}
+
+	// The flags claim permissions follow, but the packet ends there.
+	const path = "existing.txt"
+	setstat := binary.BigEndian.AppendUint32([]byte{fxpSetstat}, reqID)
+	setstat = binary.BigEndian.AppendUint32(setstat, uint32(len(path)))
+	setstat = append(setstat, path...)
+	setstat = binary.BigEndian.AppendUint32(setstat, attrPerms)
+	sendPacket(setstat)
+
+	p := readPacket()
+	if len(p) < 9 || p[0] != fxpStatus {
+		t.Fatalf("got packet %x, want STATUS", p)
+	}
+	if id := binary.BigEndian.Uint32(p[1:]); id != reqID {
+		t.Errorf("status id = %d, want %d", id, reqID)
+	}
+	if code := binary.BigEndian.Uint32(p[5:]); code != fxBadMessage {
+		t.Errorf("status code = %d, want %d (BAD_MESSAGE)", code, fxBadMessage)
 	}
 }

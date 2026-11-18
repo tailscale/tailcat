@@ -293,6 +293,9 @@ func (h *rootedFiles) Filecmd(r *sftp.Request) error {
 func (h *rootedFiles) setstat(r *sftp.Request, p string) error {
 	attrs := r.Attributes()
 	if attrs == nil {
+		// Attributes returns nil if the packet is shorter than its
+		// attribute flags claim. Without this check, a malformed
+		// request from the client would crash the server.
 		return sftp.ErrSSHFxBadMessage
 	}
 	flags := r.AttrFlags()
