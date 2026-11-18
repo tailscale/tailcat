@@ -1783,6 +1783,9 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 		if hi < lo {
 			hi, lo = lo, hi
 		}
+		if lo == 0 {
+			return nil, nil, nil, fmt.Errorf("%q includes port 0, which is not a valid port", r)
+		}
 		for i := lo; i <= hi; i++ {
 			ret.Add(uint16(i))
 		}
@@ -1800,6 +1803,10 @@ func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
 		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", portStr, portStr+":"+targetStr)
 	}
 	if numRx.MatchString(targetStr) {
+		p, err := strconv.ParseUint(targetStr, 10, 16)
+		if err != nil || p == 0 {
+			return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetStr, portStr+":"+targetStr)
+		}
 		return uint16(port), net.JoinHostPort("localhost", targetStr), nil
 	}
 	host, targetPort, err := net.SplitHostPort(targetStr)
