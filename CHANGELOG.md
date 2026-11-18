@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Releases now include an `android_arm64` binary for Termux. The
+  v0.7.0 notes said the linux binaries work under Termux, but on
+  Android 10 and newer Termux runs programs through Android's dynamic
+  linker, which rejects them with `has unexpected e_type: 2`. They
+  still work from `adb shell` or a rooted shell.
+  ([#184](https://github.com/tailscale/tailcat/issues/184); reported by
+  [@jy1655](https://github.com/jy1655))
 - tailcat now works in restricted sandboxes such as ChatGPT Work's
   ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412)):
   - If a DERP relay's HTTP upgrade fails, tailcat retries by speaking
