@@ -1403,6 +1403,25 @@ func (ci *ConnInfo) Expand(ctx context.Context, opts ...any) error {
 			return fmt.Errorf("fetching DERPMap for region %v: %w", ci.RegionID, err)
 		}
 	}
+	// A DERP map may come from an untrusted source (a provided map or a
+	// fetched URL). JSON nulls decode to nil pointers, which the region
+	// lookups and shuffles below dereference. Work on a copy that drops
+	// them, leaving the caller's map untouched.
+	cleaned := make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion, len(dm.Regions))
+	for rid, r := range dm.Regions {
+		if r == nil {
+			continue
+		}
+		c := *r
+		c.Nodes = nil
+		for _, n := range r.Nodes {
+			if n != nil {
+				c.Nodes = append(c.Nodes, n)
+			}
+		}
+		cleaned[rid] = &c
+	}
+	dm = &tailcfg.DERPMap{Regions: cleaned}
 	if ci.RegionID == -1 {
 		// Shuffle each DERP region's nodes.
 		for _, r := range dm.Regions {
