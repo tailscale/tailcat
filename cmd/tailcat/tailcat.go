@@ -115,6 +115,7 @@ func newRootCommand() *ff.Command {
 
 	socksFS := ff.NewFlagSet("socks").SetParent(rootFS)
 	socksListen := socksFS.StringLong("listen", "127.0.0.1:0", "SOCKS5 proxy listen [address]:port; a bare port means localhost, a bare address means an OS-assigned port")
+	socksDNS := socksFS.StringLong("dns", os.Getenv("TAILCAT_SOCKS_DNS"), "comma-separated DNS server IPs (each with an optional :port, default 53) to resolve exit-node destination hostnames with, queried over TCP through the <tc-addr> exit node instead of with the local resolver; tried in order. Its default can also be set with the TAILCAT_SOCKS_DNS environment variable")
 
 	keysDir := "$CONFIG/tailcat/keys"
 	if confDir, err := os.UserConfigDir(); err == nil {
@@ -170,12 +171,12 @@ func newRootCommand() *ff.Command {
 			perfCommand(rootFS),
 			{
 				Name:      "socks",
-				Usage:     "tailcat socks [--listen=<addr:port>] [<tc-addr>] [<cmd> [args...]]",
+				Usage:     "tailcat socks [--listen=<addr:port>] [--dns=<ip[:port],...>] [<tc-addr>] [<cmd> [args...]]",
 				ShortHelp: "run a SOCKS5 proxy that dials tailcat servers",
 				LongHelp:  socksLongHelp,
 				Flags:     socksFS,
 				Exec: func(ctx context.Context, args []string) error {
-					return clientSOCKSMode(getLogf(), *socksListen, args)
+					return clientSOCKSMode(getLogf(), *socksListen, *socksDNS, args)
 				},
 			},
 			{
@@ -594,7 +595,18 @@ The magic hostname "server.tailcat" means the server named by the
 
 Any other hostname or IP is reached through the <tc-addr> server
 acting as an exit node, which works only if the server runs with
---serve=exit-node.
+--serve=exit-node. Such hostnames are resolved locally by default.
+With --dns (or TAILCAT_SOCKS_DNS), they are instead resolved by the
+listed DNS servers, queried over TCP through the exit node, so names
+resolve as they do on the exit node's network. That reaches names
+that exist only there (such as on a private network the exit node
+is on) and helps when local DNS can't be used (such as on hosts
+whose resolver returns fake IPs for a transparent proxy). The
+servers are tried in order, moving on when one can't be reached or
+fails to answer; the local hosts file still applies first, and
+"localhost" always means loopback:
+
+	tailcat socks --dns=10.0.0.53,1.1.1.1 <tc-addr> curl http://intranet.example/
 
 The --listen flag sets the proxy's listen address: a bare port means
 localhost on that port, a bare address means an OS-assigned port,
@@ -1004,7 +1016,7 @@ func normalizeListenAddrPort(s string) string {
 	return s + ":0"
 }
 
-func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
+func clientSOCKSMode(logf logger.Logf, listen, dnsFlag string, args []string) error {
 	listenAddrPort := normalizeListenAddrPort(listen)
 
 	// The tailcat address argument is optional: destination hostnames that
@@ -1026,6 +1038,11 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 		}
 	}
 	progArgs := args
+
+	dnsServers, err := parseSOCKSDNSFlag(dnsFlag, addr)
+	if err != nil {
+		return usagef("%v", err)
+	}
 
 	// Resolve the client key once so every server dialed by this
 	// proxy sees the same identity, matching the other client modes.
@@ -1057,6 +1074,12 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 		return c
 	}
 
+	lookup := lookupNetIP
+	if len(dnsServers) > 0 {
+		lookup = remoteLookupNetIP(logf, cl.DialTCP, dnsServers, socksRemoteDNSTimeout)
+		logf("resolving exit-node destination hostnames with DNS servers %v through the exit node", dnsServers)
+	}
+
 	socksLn, err := net.Listen("tcp", listenAddrPort)
 	if err != nil {
 		log.Fatal(err)
@@ -1071,7 +1094,7 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 			// package's deadline and use a more generous one.
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			defer cancel()
-			dst, err := classifySOCKSAddr(ctx, lookupNetIP, addr)
+			dst, err := classifySOCKSAddr(ctx, lookup, addr)
 			if err != nil {
 				return nil, err
 			}
