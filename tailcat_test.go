@@ -1581,6 +1581,7 @@ func TestClientAcceptsAddrWithoutPresharedKey(t *testing.T) {
 		RegionID:          10,
 	}).Addr()
 	c := NewClient(addr)
+	c.Logf = mkLogger(t, "client")
 	c.startMu.Lock()
 	err := c.initLocked()
 	c.startMu.Unlock()
