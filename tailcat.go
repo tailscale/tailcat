@@ -2150,12 +2150,16 @@ func (c *Client) DERPRegion() *tailcfg.DERPRegion {
 
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
 func (c *Client) Close() error {
+	// Don't hold startMu while closing the backend, so a slow
+	// netstack shutdown can't block other uses of c. The backend's
+	// Close is idempotent and safe to call concurrently.
 	c.startMu.Lock()
-	defer c.startMu.Unlock()
-	if c.lb == nil {
+	lb := c.lb
+	c.startMu.Unlock()
+	if lb == nil {
 		return nil // never used
 	}
-	return c.lb.Close()
+	return lb.Close()
 }
 
 // PingResult is the result of a successful [Client.Ping] call.
