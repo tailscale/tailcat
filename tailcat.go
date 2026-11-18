@@ -430,6 +430,10 @@ type Server struct {
 	// If nil, log.Printf is used.
 	Logf logger.Logf
 
+	// ListenPort is the local UDP port used for direct WireGuard connections.
+	// Zero (the default) lets the OS choose a port. Set it before Start or Listen.
+	ListenPort int
+
 	// Region, if non-nil, is the DERP region to use as the bootstrap
 	// relay, without fetching any DERP map.
 	Region *tailcfg.DERPRegion
@@ -607,6 +611,9 @@ func (s *Server) startLocked(ctx context.Context) error {
 	if s.lb != nil {
 		return errors.New("tailcat: Server.Start called twice")
 	}
+	if s.ListenPort < 0 || s.ListenPort > 65535 {
+		return errors.New("tailcat: Server.ListenPort must be between 0 and 65535")
+	}
 	if s.UDPIdleTimeout < 0 {
 		return errors.New("tailcat: Server.UDPIdleTimeout must not be negative")
 	}
@@ -685,7 +692,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 		return false
 	}
 
-	if err := createEngine(logf, lb); err != nil {
+	if err := createEngine(logf, lb, s.ListenPort); err != nil {
 		lb.Close()
 		return fmt.Errorf("createEngine: %w", err)
 	}
@@ -1891,10 +1898,10 @@ func newNetMon(bus *eventbus.Bus, logf logger.Logf) *netmon.Monitor {
 }
 
 // createEngine creates the wgengine.Engine with userspace networking.
-func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
+func createEngine(logf logger.Logf, lb *locoBackend, listenPort int) (err error) {
 	sys := &lb.sys
 	conf := wgengine.Config{
-		ListenPort:    0,
+		ListenPort:    uint16(listenPort),
 		NetMon:        sys.NetMon.Get(),
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
@@ -1945,6 +1952,10 @@ type Client struct {
 	// Logf is the logger used for debug messages. If nil, log.Printf
 	// is used. If set, it must be set before the client's first use.
 	Logf logger.Logf
+
+	// ListenPort is the local UDP port used for direct WireGuard connections.
+	// Zero (the default) lets the OS choose a port. Set it before first use.
+	ListenPort int
 
 	// DERPMapURL, if non-empty, is an alternate URL to fetch the DERP
 	// map from when the address doesn't embed the relay details.
@@ -2000,6 +2011,9 @@ func (c *Client) initLocked() error {
 	if c.lb != nil {
 		return nil
 	}
+	if c.ListenPort < 0 || c.ListenPort > 65535 {
+		return errors.New("tailcat: Client.ListenPort must be between 0 and 65535")
+	}
 	logf := c.Logf
 	if logf == nil {
 		logf = log.Printf
@@ -2048,7 +2062,7 @@ func (c *Client) initLocked() error {
 		return true // client ignores MeowPing
 	}
 
-	if err := createEngine(logf, lb); err != nil {
+	if err := createEngine(logf, lb, c.ListenPort); err != nil {
 		lb.Close()
 		return fmt.Errorf("createEngine: %w", err)
 	}

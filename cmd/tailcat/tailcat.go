@@ -62,6 +62,7 @@ var (
 	flagFullAddress       *bool
 	flagJSON              *bool
 	flagDERPMapURL        *string
+	flagListenPort        *int
 )
 
 var serveFS *ff.FlagSet
@@ -98,6 +99,7 @@ func newRootCommand() *ff.Command {
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout; with perf, write the results as JSON")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
+	flagListenPort = rootFS.IntLong("listen-port", 0, "local UDP port for direct connections (0 lets the OS choose; useful with manual port forwarding)")
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
@@ -824,6 +826,7 @@ func newClient(logf logger.Logf, addr tailcat.Addr, priv key.NodePrivate) *tailc
 		Key:          priv,
 		Logf:         logf,
 		DERPMapURL:   *flagDERPMapURL,
+		ListenPort:   *flagListenPort,
 		DERPMapCache: derpMapCache{},
 	}
 }
@@ -1395,7 +1398,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg, ListenPort: *flagListenPort}
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
