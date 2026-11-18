@@ -597,7 +597,7 @@ func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
 // TestParsePortSetTargets covers the "port:target" serve mappings:
 // a bare port target means that port on localhost, a host:port
 // target is kept as given (IPv6 in brackets), and conflicting
-// mappings of one port are rejected.
+// mappings of one port are rejected, as is port 0 anywhere.
 func TestParsePortSetTargets(t *testing.T) {
 	for _, tt := range []struct {
 		spec        string
@@ -637,6 +637,12 @@ func TestParsePortSetTargets(t *testing.T) {
 		{spec: "5555:10.2.200.213:99999", wantErr: "not a valid port"},
 		{spec: "5555::5555", wantErr: "not a port or host:port"},
 		{spec: "http:10.2.200.213:5555", wantErr: "not a valid port"},
+		{spec: "0", wantErr: "not a valid port"},
+		{spec: "0-100", wantErr: "not a valid port"},
+		{spec: "100-0", wantErr: "not a valid port"},
+		{spec: "5555:0", wantErr: "not a valid port"},
+		{spec: "5555:65536", wantErr: "not a valid port"},
+		{spec: "5555:99999", wantErr: "not a valid port"},
 	} {
 		ports, _, targets, err := parsePortSet(tt.spec)
 		if tt.wantErr != "" {
