@@ -240,7 +240,7 @@ func NewServer(config string) (Handle, error) {
 			return 0, fmt.Errorf("%w: invalid pre-shared key", ErrArgument)
 		}
 	}
-	if cfg.UDPIdleTimeout < 0 || cfg.UDPIdleTimeout > float64(int64(^uint64(0)>>1))/float64(time.Second) {
+	if cfg.UDPIdleTimeout < 0 || cfg.UDPIdleTimeout >= float64(int64(^uint64(0)>>1))/float64(time.Second) {
 		return 0, fmt.Errorf("%w: invalid UDP idle timeout", ErrArgument)
 	}
 	s := &tailcat.Server{Key: k, PresharedKey: psk, Region: cfg.Region, RegionID: cfg.RegionID, DERPMapURL: cfg.DERPMapURL, Logf: logger.Discard, UDPIdleTimeout: time.Duration(cfg.UDPIdleTimeout * float64(time.Second))}
