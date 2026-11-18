@@ -22,14 +22,15 @@ func cpCommand(parent *ff.FlagSet) *ff.Command {
 	recursive := fs.BoolShort('r', "recursively copy directories")
 	preserve := fs.BoolShort('p', "preserve modification times and modes")
 	port := fs.StringShort('P', "22", "port number of the server's SSH (file service) port")
+	identityFile := fs.StringShort('i', "", "private key file to authenticate with; scp offers only this key")
 	return &ff.Command{
 		Name:      "cp",
-		Usage:     "tailcat cp [-r] [-p] <source>... <target>",
+		Usage:     "tailcat cp [-r] [-p] [-i <identity-file>] <source>... <target>",
 		ShortHelp: "copy files to or from a tailcat server, using the system scp",
 		LongHelp:  cpLongHelp,
 		Flags:     fs,
 		Exec: func(ctx context.Context, args []string) error {
-			return clientCPMode(*recursive, *preserve, *port, args)
+			return clientCPMode(*recursive, *preserve, *port, *identityFile, args)
 		},
 	}
 }
@@ -54,7 +55,7 @@ routed through tailcat, so scp's progress display applies.`
 
 // clientCPMode runs the system scp with all remote arguments routed
 // through one tailcat server.
-func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) error {
+func clientCPMode(recursive, preserve bool, portOrIPPort, identityFile string, args []string) error {
 	if len(args) < 2 {
 		return usagef("cp requires at least one source and a target")
 	}
@@ -119,6 +120,7 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 		"-o", "LogLevel ERROR",
 		"-o", "ProxyCommand="+proxyCommand,
 	)
+	argv = append(argv, identityArgs(identityFile)...)
 	if recursive {
 		argv = append(argv, "-r")
 	}

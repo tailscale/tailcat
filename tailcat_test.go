@@ -1235,6 +1235,121 @@ func TestServerCloseClosesActiveConnections(t *testing.T) {
 	}
 }
 
+// TestCloseWithManyTimeWaitEndpoints checks that Server.Close and
+// Client.Close return promptly when the netstack holds more TCP
+// endpoints in TIME-WAIT than its 512-packet outbound queue. Before
+// tailscale/tailscale#21668, netstack.Impl.Close blocked forever
+// there (tailscale/tailcat#151).
+func TestCloseWithManyTimeWaitEndpoints(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	clientKey := key.NewNode()
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		AllowClient:    func(k key.NodePublic) bool { return k == clientKey.Public() },
+		ServedTCPPorts: []filter.PortRange{{First: 80, Last: 80}},
+		OnTCP: func(port uint16) func(net.Conn) {
+			if port != 80 {
+				return nil
+			}
+			// Closing first puts the server's endpoint in TIME-WAIT.
+			return func(conn net.Conn) { conn.Close() }
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	c := &Client{Server: s.TailcatAddr(), Key: clientKey, Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+
+	st := tcpipStackOf(s.lb.ns)
+	var got tcpip.TCPTimeWaitTimeoutOption
+	if err := st.TransportProtocolOption(tcp.ProtocolNumber, &got); err != nil {
+		t.Fatalf("getting TIME-WAIT timeout: %v", err)
+	}
+	if time.Duration(got) != tcpTimeWaitTimeout {
+		t.Errorf("TIME-WAIT timeout = %v; want %v", time.Duration(got), tcpTimeWaitTimeout)
+	}
+	// Restore gVisor's default for this test so no endpoint leaves
+	// TIME-WAIT before Close, however slowly the dials below go.
+	long := tcpip.TCPTimeWaitTimeoutOption(tcp.DefaultTCPTimeWaitTimeout)
+	if err := s.lb.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &long); err != nil {
+		t.Fatalf("setting TIME-WAIT timeout: %v", err)
+	}
+
+	const numConns = 600 // more than netstack's 512-packet outbound queue
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// A dial whose ephemeral port matches a server endpoint still in
+	// TIME-WAIT has its SYN dropped (gvisor/gvisor#15013), so bound each
+	// dial and retry on failure until numConns connections complete.
+	var completed atomic.Int64
+	var wg sync.WaitGroup
+	for range 32 { // dial concurrency
+		wg.Go(func() {
+			for completed.Load() < numConns && ctx.Err() == nil {
+				dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
+				conn, err := c.DialTCPPort(dctx, 80)
+				dcancel()
+				if err != nil {
+					continue
+				}
+				// Wait for the server's FIN so the server closed first.
+				_, err = io.Copy(io.Discard, conn)
+				conn.Close()
+				if err == nil {
+					completed.Add(1)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if n := completed.Load(); n < numConns {
+		t.Fatalf("completed %d connections; want %d", n, numConns)
+	}
+
+	timeWait := func() (n int) {
+		for _, ep := range st.RegisteredEndpoints() {
+			if se, ok := ep.(interface{ State() uint32 }); ok && tcp.EndpointState(se.State()) == tcp.StateTimeWait {
+				n++
+			}
+		}
+		return n
+	}
+	// The server endpoints enter TIME-WAIT once they process the
+	// client's FIN, which may lag the client's Close.
+	for timeWait() < numConns {
+		if ctx.Err() != nil {
+			t.Fatalf("got %d server endpoints in TIME-WAIT; want %d", timeWait(), numConns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closed := make(chan error, 2)
+	go func() { closed <- s.Close() }()
+	go func() { closed <- c.Close() }()
+	for range 2 {
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Close hung with many TCP endpoints in TIME-WAIT")
+		}
+	}
+}
+
 func TestAddr(t *testing.T) {
 	akey := func(a [32]byte) NodePublic {
 		return NodePublic{key.NodePublicFromRaw32(mem.B(a[:]))}

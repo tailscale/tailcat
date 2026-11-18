@@ -64,6 +64,7 @@ import (
 	"github.com/tailscale/wireguard-go/device"
 	go4mem "go4.org/mem"
 	"go4.org/netipx"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -1117,9 +1118,21 @@ func (a Addr) Resolve(ctx context.Context, opts ...any) (Addr, error) {
 	if err := ci.Expand(ctx, opts...); err != nil {
 		return "", err
 	}
-	// Keep the address short: two relay nodes suffice.
+	// Keep the address short: two relay nodes suffice. STUN-only nodes
+	// are dropped by wireRegionOf when the address is encoded, so take
+	// the first two usable nodes here rather than a raw prefix of the
+	// region's node list, which STUN-only nodes may fill.
 	for _, r := range ci.Region {
-		r.Nodes = r.Nodes[:min(2, len(r.Nodes))]
+		var nodes []*tailcfg.DERPNode
+		for _, n := range r.Nodes {
+			if !n.STUNOnly {
+				nodes = append(nodes, n)
+				if len(nodes) == 2 {
+					break
+				}
+			}
+		}
+		r.Nodes = nodes
 	}
 	ci.RegionID = 0
 	return ci.Addr(), nil
@@ -1403,6 +1416,25 @@ func (ci *ConnInfo) Expand(ctx context.Context, opts ...any) error {
 			return fmt.Errorf("fetching DERPMap for region %v: %w", ci.RegionID, err)
 		}
 	}
+	// A DERP map may come from an untrusted source (a provided map or a
+	// fetched URL). JSON nulls decode to nil pointers, which the region
+	// lookups and shuffles below dereference. Work on a copy that drops
+	// them, leaving the caller's map untouched.
+	cleaned := make(map[tailcfg.DERPRegionID]*tailcfg.DERPRegion, len(dm.Regions))
+	for rid, r := range dm.Regions {
+		if r == nil {
+			continue
+		}
+		c := *r
+		c.Nodes = nil
+		for _, n := range r.Nodes {
+			if n != nil {
+				c.Nodes = append(c.Nodes, n)
+			}
+		}
+		cleaned[rid] = &c
+	}
+	dm = &tailcfg.DERPMap{Regions: cleaned}
 	if ci.RegionID == -1 {
 		// Shuffle each DERP region's nodes.
 		for _, r := range dm.Regions {
@@ -1875,8 +1907,20 @@ func tcAddrForKey(k key.NodePublic) netip.Addr {
 	return netip.AddrFrom16(a)
 }
 
+// tcpTimeWaitTimeout is how long a closed TCP connection in the
+// netstack stays in TIME-WAIT, replacing gVisor's 60 second default.
+//
+// Each netstack carries only its own WireGuard tunnel to a single
+// peer, so a delayed duplicate segment arriving long after a close is
+// very unlikely. Meanwhile, TIME-WAIT endpoints cost memory, and while
+// one exists, gVisor's TCP forwarder drops a new SYN for the same
+// 4-tuple (gvisor/gvisor#15013), stalling dials that reuse a recent
+// ephemeral port. Five seconds still covers a few retransmissions of
+// the peer's FIN if our final ACK is lost.
+const tcpTimeWaitTimeout = 5 * time.Second
+
 func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
-	return netstack.Create(logf,
+	ns, err := netstack.Create(logf,
 		sys.Tun.Get(),
 		sys.Engine.Get(),
 		sys.MagicSock.Get(),
@@ -1884,6 +1928,15 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 		sys.DNSManager.Get(),
 		sys.ProxyMapper(),
 	)
+	if err != nil {
+		return nil, err
+	}
+	opt := tcpip.TCPTimeWaitTimeoutOption(tcpTimeWaitTimeout)
+	if err := ns.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		ns.Close()
+		return nil, fmt.Errorf("setting TCP TIME-WAIT timeout: %v", err)
+	}
+	return ns, nil
 }
 
 // netmonNew is netmon.New, replaced in tests.
@@ -2131,12 +2184,16 @@ func (c *Client) DERPRegion() *tailcfg.DERPRegion {
 
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
 func (c *Client) Close() error {
+	// Don't hold startMu while closing the backend, so a slow
+	// netstack shutdown can't block other uses of c. The backend's
+	// Close is idempotent and safe to call concurrently.
 	c.startMu.Lock()
-	defer c.startMu.Unlock()
-	if c.lb == nil {
+	lb := c.lb
+	c.startMu.Unlock()
+	if lb == nil {
 		return nil // never used
 	}
-	return c.lb.Close()
+	return lb.Close()
 }
 
 // PingResult is the result of a successful [Client.Ping] call.
