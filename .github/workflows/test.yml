@@ -60,6 +60,9 @@ jobs:
       - name: build Swift release with warnings as errors
         working-directory: swift
         run: swift build -c release -Xswiftc -warnings-as-errors
+      - name: list Xcode schemes
+        working-directory: swift
+        run: xcodebuild -list
       - name: compile Swift for iOS devices and simulator
         working-directory: swift
         run: |
