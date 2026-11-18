@@ -5,9 +5,12 @@ package tailcat
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -63,5 +66,43 @@ func TestExecConnHandlerResetBeforeServed(t *testing.T) {
 	s.ExecConnHandler([]string{"/bin/sh", "-c", "touch " + ran})(server)
 	if _, err := os.Stat(ran); err == nil {
 		t.Error("the command ran for a connection that was already reset")
+	}
+}
+
+// TestRunConnCommandInteractive covers a command that reads a line from
+// the connection, replies, and exits while the client keeps its sending
+// side open. The client's input must reach the command before the
+// command exits, and runConnCommand must return once it has exited
+// rather than waiting for the client to half-close.
+func TestRunConnCommandInteractive(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs /bin/sh")
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- runConnCommand(server, exec.Command("/bin/sh", "-c", "read line; echo got $line"))
+	}()
+
+	client.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.WriteString(client, "hi\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "got hi\n" {
+		t.Errorf("got %q; want %q", got, "got hi\n")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runConnCommand: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runConnCommand didn't return after the command exited")
 	}
 }
