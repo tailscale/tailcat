@@ -653,6 +653,40 @@ func TestParsePortSetTargets(t *testing.T) {
 		}
 		if !maps.Equal(targets, tt.wantTargets) {
 			t.Errorf("parsePortSet(%q) targets = %v; want %v", tt.spec, targets, tt.wantTargets)
+
+		}
+	}
+}
+
+func TestParseUnixSocketFlag(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in         string
+		wantSocket string
+		wantPort   uint16
+		wantErr    bool
+	}{
+		{"", "", 1, false},
+		{"/run/x/socket", "/run/x/socket", 1, false},
+		{"/run/x/socket,8080", "/run/x/socket", 8080, false},
+		{",8022", "", 0, true},
+		{"/run/x/socket,0", "", 0, true},
+		{"/run/x/socket,notaport", "", 0, true},
+	}
+	for _, tt := range tests {
+		socket, port, err := parseUnixSocketFlag(tt.in)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseUnixSocketFlag(%q) = %q, %d, nil; want error", tt.in, socket, port)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseUnixSocketFlag(%q) error: %v", tt.in, err)
+			continue
+		}
+		if socket != tt.wantSocket || port != tt.wantPort {
+			t.Errorf("parseUnixSocketFlag(%q) = %q, %d; want %q, %d", tt.in, socket, port, tt.wantSocket, tt.wantPort)
 		}
 	}
 }
