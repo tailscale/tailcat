@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"sync"
 )
 
 // ExecConnHandler returns a handler that runs argv for each incoming
@@ -87,27 +86,25 @@ func runConnCommand(c net.Conn, cmd *exec.Cmd) error {
 		c.Close()
 		return err
 	}
-	var wg sync.WaitGroup
-	wg.Add(2)
+	stdinDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(stdinDone)
 		io.Copy(stdin, c)
 		stdin.Close()
 	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(c, stdout)
-		if cw, ok := c.(closeWriter); ok {
-			cw.CloseWrite()
-		}
-	}()
 	// Wait closes the stdout pipe once the process exits, so the copy
 	// out of it must finish first or a fast-exiting command's output
-	// can be lost. The stdin copy finishes on its own: once the process
-	// is gone, writes to its stdin fail.
-	wg.Wait()
+	// can be lost.
+	io.Copy(c, stdout)
+	if cw, ok := c.(closeWriter); ok {
+		cw.CloseWrite()
+	}
 	err = cmd.Wait()
+	// The stdin copy may still be blocked reading from a client that
+	// hasn't sent anything since the command stopped reading and hasn't
+	// half-closed either. Closing the connection unblocks it.
 	closeProxyConn(c)
+	<-stdinDone
 	if err != nil {
 		return fmt.Errorf("%v exited: %w", cmd.Path, err)
 	}
