@@ -12,7 +12,7 @@ require (
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pkg/sftp v1.13.11
 	github.com/tailscale/gliderssh v0.3.4-0.20261026144310-31f7cf365d3a
-	github.com/tailscale/wireguard-go v0.0.0-20261116233941-c90940ef3f06
+	github.com/tailscale/wireguard-go v0.0.0-20261117232807-a1800e9c5305
 	github.com/toqueteos/webbrowser v1.2.1
 	github.com/u-root/u-root v0.16.0
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
@@ -21,8 +21,8 @@ require (
 	golang.org/x/exp v0.0.0-20260908205506-85c1c2202aba
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.50.0
-	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
-	tailscale.com v1.105.0-pre.0.20261117025509-46ad4538b701
+	gvisor.dev/gvisor v0.0.0-20261117040555-0303b2605d5e
+	tailscale.com v1.105.0-pre.0.20261118173401-6a92f86aceb2
 )
 
 require (
@@ -74,7 +74,6 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
-	github.com/illarion/gonotify/v3 v3.0.2 // indirect
 	github.com/insomniacslk/dhcp v0.0.0-20260901064844-234b97448fae // indirect
 	github.com/jellydator/ttlcache/v3 v3.4.1 // indirect
 	github.com/jsimonetti/rtnetlink v1.4.2 // indirect
