@@ -629,6 +629,23 @@ region ID, code, or name substring ("list" prints the choices), or
 one or more comma-separated DERP server hostnames to use relays that
 aren't in the DERP map at all.`
 
+// firstRelayNodes returns at most two nodes that can relay DERP traffic.
+// STUN-only nodes are dropped by wireRegionOf when the address is encoded,
+// so a raw prefix of the region's node list can leave an embedded address
+// with no usable relays.
+func firstRelayNodes(nodes []*tailcfg.DERPNode) []*tailcfg.DERPNode {
+	var relays []*tailcfg.DERPNode
+	for _, n := range nodes {
+		if !n.STUNOnly {
+			relays = append(relays, n)
+			if len(relays) == 2 {
+				break
+			}
+		}
+	}
+	return relays
+}
+
 // version is set via -ldflags by GoReleaser at release time.
 // It is empty for go-install and plain go-build builds.
 var version string
@@ -2050,7 +2067,7 @@ func genKey(args []string) error {
 		if reg == nil {
 			log.Fatalf("no DERP region %d in the DERP map; can't embed its nodes", ci.RegionID)
 		}
-		reg.Nodes = reg.Nodes[:min(2, len(reg.Nodes))]
+		reg.Nodes = firstRelayNodes(reg.Nodes)
 		for _, n := range reg.Nodes {
 			n.IPv6 = ""
 		}
