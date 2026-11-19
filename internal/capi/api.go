@@ -75,6 +75,8 @@ type listener struct {
 
 type connection struct {
 	conn       net.Conn
+	localAddr  string // captured at accept/dial time; net.Conn drops addresses after close
+	remoteAddr string
 	readGate   gate
 	writeGate  gate
 	network    int
@@ -119,6 +121,12 @@ func (c *connection) release() {
 func newConnection(conn net.Conn, network int) *connection {
 	c := &connection{conn: conn, readGate: newGate(), writeGate: newGate(), network: network,
 		stopped: make(chan struct{}), pumpDone: make(chan struct{})}
+	if la := conn.LocalAddr(); la != nil {
+		c.localAddr = la.String()
+	}
+	if ra := conn.RemoteAddr(); ra != nil {
+		c.remoteAddr = ra.String()
+	}
 	if network == TCP {
 		c.reads = make(chan readResult, 1)
 		go c.receive()
@@ -480,7 +488,7 @@ func Info(id, token Handle) (out string, err error) {
 		case *listener:
 			info = map[string]any{"local_address": v.ln.Addr().String(), "network": v.network}
 		case *connection:
-			info = map[string]any{"local_address": v.conn.LocalAddr().String(), "remote_address": v.conn.RemoteAddr().String(), "network": v.network}
+			info = map[string]any{"local_address": v.localAddr, "remote_address": v.remoteAddr, "network": v.network}
 		default:
 			return ErrType
 		}
