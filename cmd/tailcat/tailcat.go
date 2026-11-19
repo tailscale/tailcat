@@ -1458,8 +1458,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	// port's target (see tcpTarget) is "localhost:port" or a mapping's
 	// host:port, whose host can be a name such as "android.lan".
 	tcpForwardTo := func(hostPort string) func(net.Conn) {
+		d := targetDialer(hostPort)
 		return func(c net.Conn) {
-			localConn, err := targetDialer(hostPort).Dial("tcp", hostPort)
+			localConn, err := d.Dial("tcp", hostPort)
 			if err != nil {
 				logf("error proxying to %v: %v", hostPort, err)
 				c.Close()
@@ -1660,15 +1661,21 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 // the OS resolver can't be trusted to (issue #108).
 var localDialer = &net.Dialer{Resolver: localhostdns.Resolver}
 
+// systemDialer dials proxy targets that aren't localhost names, using
+// the system resolver.
+var systemDialer = new(net.Dialer)
+
 // targetDialer returns the dialer for proxying to target, a host:port.
 // Localhost names go through localDialer. Any other host, such as a
 // port mapping's "android.lan", needs the system resolver:
 // localhostdns.Resolver answers every name but localhost with NXDOMAIN.
+// A target that doesn't parse as a host:port also gets systemDialer,
+// whose Dial then fails with the parse error.
 func targetDialer(target string) *net.Dialer {
 	if host, _, err := net.SplitHostPort(target); err == nil && localhostdns.IsLocalhost(host) {
 		return localDialer
 	}
-	return new(net.Dialer)
+	return systemDialer
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
