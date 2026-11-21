@@ -332,6 +332,36 @@ everyone else. `--via-derp` allows a relayed test through [a relay you
 run yourself](#bring-your-own-derp-relay); Tailscale's shared relays
 are always refused. `tailcat --json perf` prints the results as JSON.
 
+### Log incoming connections
+
+By default a server prints its address and then stays quiet. `--log`
+adds an access log on stderr: one line when a client is allowed in,
+and one when each of its TCP connections opens and closes.
+
+```sh
+$ tailcat serve --log 8000
+# 🐈 Server listening with new address: tcXXXXXXXXX
+2026/01/30 11:04:02 [peer] allowed key=nodekey:abc123...
+2026/01/30 11:04:02 [conn] open peer=nodekey:abc123... port=8000 service=forward via=derp:sfo
+2026/01/30 11:04:11 [conn] close peer=nodekey:abc123... port=8000 service=forward duration=8.104s
+```
+
+Clients are identified by public key, the same value `--allow` takes.
+A client's tailcat address is derived from its key, so it isn't
+logged. The `via` field is the only one with a real network address,
+and only once a direct path has replaced the DERP relay.
+
+With `--allow` set, clients that aren't on the list are logged too,
+once per key:
+
+```
+2026/01/30 11:07:30 [peer] refused key=nodekey:def456... reason=not-in-allow
+```
+
+This is separate from `--verbose`, which turns on the underlying
+library's debug logging. Both can be set at once, and the `[peer]` and
+`[conn]` tags stay greppable either way.
+
 ### Misc commands 
 
 Ping to test connectivity; each pong reports whether it arrived via a
