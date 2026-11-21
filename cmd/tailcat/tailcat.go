@@ -59,6 +59,7 @@ var (
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
 	flagHybrid            *bool
+	flagLog               *bool
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
@@ -107,6 +108,7 @@ func newRootCommand() *ff.Command {
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 	flagHybrid = serveFS.BoolLong("hybrid", "EXPERIMENTAL: use the hybrid post-quantum (ML-KEM-768) WireGuard handshake, which doesn't depend on the tailcat address staying secret for its post-quantum protection. The address is shorter, with a 128-bit pre-shared key, but only works with clients that support the hybrid handshake; older clients reject it.")
+	flagLog = serveFS.BoolLong("log", "log an access record to stderr for each client that connects or is refused and each TCP connection it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -526,6 +528,16 @@ recursive write-only drop box:
 Serve with a saved key (see genkey) and restrict clients:
 
 	tailcat serve --key=default --allow=nodekey:... 22
+
+Keep an access log of who connects and what they reach:
+
+	tailcat serve --log 22,80
+
+which writes lines like these to stderr, independent of --verbose:
+
+	[peer] allowed key=nodekey:abc...
+	[conn] open peer=nodekey:abc... port=22 service=forward via=derp:sfo
+	[conn] close peer=nodekey:abc... port=22 service=forward duration=8.104s
 
 Environment:
 
@@ -1542,23 +1554,38 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		fmt.Fprintf(os.Stderr, "# Proxying port %d to %v\n", port, targets[port])
 	}
 
-	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+	// sshServiceName names the services behind sshHandler, which
+	// several can share on port 22.
+	var sshServiceName string
+	if sshServices {
+		var names []string
+		for _, n := range []string{"ssh", "no-auth-ssh", "files"} {
+			if services.Contains(n) {
+				names = append(names, n)
+			}
+		}
+		sshServiceName = strings.Join(names, "+")
+	}
+
+	// tcpHandler returns the handler for a connection to port, and
+	// the name of the service it reaches, for --log.
+	tcpHandler := func(port uint16) (handler func(net.Conn), service string) {
 		if port == 22 && sshHandler != nil {
-			return sshHandler
+			return sshHandler, sshServiceName
 		}
 		if port == perf.Port && perfSrv != nil {
-			return perfSrv.HandleTCP
+			return perfSrv.HandleTCP, "perf"
 		}
 		if portSet.Contains(port) {
-			return tcpForwardTo(tcpTarget(port))
+			return tcpForwardTo(tcpTarget(port)), "forward"
 		}
 		if execHandler != nil {
-			return execHandler
+			return execHandler, "exec"
 		}
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
+			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "exit-node"
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1582,12 +1609,34 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 				defer cancel()
 				s.DrainTCP(ctx)
 				os.Exit(0)
-			}
+			}, "stdout"
 		}
 		if !portSet.Contains(port) {
-			return nil // RST
+			return nil, "" // RST
 		}
-		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port))))
+		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "forward"
+	}
+
+	var clog *connLog // nil unless --log
+	if *flagLog {
+		clog = newConnLog()
+		clog.attach(s)
+		if next := s.OnTCPForward; next != nil {
+			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
+				return clog.wrapTCP("forward="+dst.String(), next(dst))
+			}
+		}
+	}
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		h, service := tcpHandler(port)
+		if clog != nil {
+			dst := fmt.Sprintf("port=%d", port)
+			if service != "" {
+				dst += " service=" + service
+			}
+			return clog.wrapTCP(dst, h)
+		}
+		return h
 	}
 
 	if err := s.Start(); err != nil {
