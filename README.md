@@ -124,6 +124,32 @@ $ tailcat serve 5555:10.2.200.213:5555
 
 Then on the client, `tailcat forward tcXXXXXXXXX 5555` followed by `adb connect 127.0.0.1:5555`. Write IPv6 targets in brackets: `5555:[fd7a::1]:5555`.
 
+### Expose a local Unix-domain socket
+
+A serve argument starting with `/` (or `unix:`, which also allows a
+relative path) proxies connections to a local Unix-domain stream
+socket. Without a port, the socket gets every port not otherwise
+served, so a client needs no port number:
+
+```sh
+$ tailcat serve /run/git-annex/socket
+# Proxying all other ports to unix:/run/git-annex/socket
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat tcXXXXXXXXX
+```
+
+Each client connection gets its own connection to the socket. tailcat
+doesn't create the socket or change its permissions, and refuses to
+start if it doesn't exist. To serve several sockets, or a socket
+alongside other services, give each one a port with a mapping:
+
+```sh
+$ tailcat serve 22,8022:/run/app.sock
+```
+
 ### Show the address as a QR code
 
 Pass `--qr` to `serve` to also print the tailcat address as a QR code,
