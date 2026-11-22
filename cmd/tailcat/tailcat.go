@@ -1652,10 +1652,21 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "forward"
 	}
 
-	var clog *connLog // nil unless --log
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		h, _ := tcpHandler(port)
+		return h
+	}
 	if *flagLog {
-		clog = newConnLog()
+		clog := newConnLog()
 		clog.attach(s)
+		s.OnTCP = func(port uint16) func(net.Conn) {
+			h, service := tcpHandler(port)
+			dst := fmt.Sprintf("port=%d", port)
+			if service != "" {
+				dst += " service=" + service
+			}
+			return clog.wrapTCP(dst, h)
+		}
 		if next := s.OnTCPForward; next != nil {
 			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
 				return clog.wrapTCP("forward="+dst.String(), next(dst))
@@ -1672,17 +1683,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 				return clog.wrapUDP(fmt.Sprintf("port=%d service=perf", port), next(port))
 			}
 		}
-	}
-	s.OnTCP = func(port uint16) func(net.Conn) {
-		h, service := tcpHandler(port)
-		if clog != nil {
-			dst := fmt.Sprintf("port=%d", port)
-			if service != "" {
-				dst += " service=" + service
-			}
-			return clog.wrapTCP(dst, h)
-		}
-		return h
 	}
 
 	if err := s.Start(); err != nil {
