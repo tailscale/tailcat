@@ -172,3 +172,10 @@ From this directory:
 xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS' -derivedDataPath build/device build CODE_SIGNING_ALLOWED=NO
 xcodebuild -scheme TailcatKit -destination 'generic/platform=iOS Simulator' -derivedDataPath build/simulator build CODE_SIGNING_ALLOWED=NO
 ```
+
+The `TailcatKit` scheme these commands and CI build with is committed at
+`.swiftpm/xcode/xcshareddata/xcschemes/TailcatKit.xcscheme`. xcodebuild
+auto-generates schemes for Swift packages on demand, but that generation fails
+intermittently on CI runners ("The workspace ... does not contain a scheme named
+TailcatKit"), so the scheme is committed instead. The rest of `.swiftpm` remains
+ignored.

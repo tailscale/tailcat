@@ -260,7 +260,7 @@ func TestServeSSHAuthorizedKeysFlag(t *testing.T) {
 	if len(args) != 1 || args[0] != "ssh" {
 		t.Errorf("serve args = %q; want [ssh]", args)
 	}
-	_, services, _, err := parsePortSet("ssh")
+	_, services, _, _, err := parsePortSet("ssh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,14 +646,17 @@ func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
 
 // TestParsePortSetTargets covers the "port:target" serve mappings:
 // a bare port target means that port on localhost, a host:port
-// target is kept as given (IPv6 in brackets), and conflicting
-// mappings of one port are rejected, as is port 0 anywhere.
+// target is kept as given (IPv6 in brackets), a socket target is
+// canonicalized to "unix:" and its path, and conflicting mappings of
+// one port are rejected, as is port 0 anywhere. It also covers
+// catch-all Unix sockets, given without a port.
 func TestParsePortSetTargets(t *testing.T) {
 	for _, tt := range []struct {
-		spec        string
-		wantPorts   []uint16
-		wantTargets map[uint16]string
-		wantErr     string
+		spec         string
+		wantPorts    []uint16
+		wantTargets  map[uint16]string
+		wantCatchAll string
+		wantErr      string
 	}{
 		{
 			spec:        "5555:10.2.200.213:5555",
@@ -693,8 +696,56 @@ func TestParsePortSetTargets(t *testing.T) {
 		{spec: "5555:0", wantErr: "not a valid port"},
 		{spec: "5555:65536", wantErr: "not a valid port"},
 		{spec: "5555:99999", wantErr: "not a valid port"},
+		{
+			spec:        "8022:/run/annex.sock",
+			wantPorts:   []uint16{8022},
+			wantTargets: map[uint16]string{8022: "unix:/run/annex.sock"},
+		},
+		{
+			// A path may contain colons; only the first one splits.
+			spec:        "8022:/run/a:b.sock",
+			wantPorts:   []uint16{8022},
+			wantTargets: map[uint16]string{8022: "unix:/run/a:b.sock"},
+		},
+		{
+			spec:        "8022:unix:rel.sock",
+			wantPorts:   []uint16{8022},
+			wantTargets: map[uint16]string{8022: "unix:rel.sock"},
+		},
+		{
+			// Any target starting with "unix:" is a socket, even
+			// one that looks like a host named "unix" and a port.
+			spec:        "8022:unix:80",
+			wantPorts:   []uint16{8022},
+			wantTargets: map[uint16]string{8022: "unix:80"},
+		},
+		{
+			spec:         "/run/annex.sock",
+			wantPorts:    []uint16{},
+			wantTargets:  map[uint16]string{},
+			wantCatchAll: "unix:/run/annex.sock",
+		},
+		{
+			spec:         "unix:rel.sock",
+			wantPorts:    []uint16{},
+			wantTargets:  map[uint16]string{},
+			wantCatchAll: "unix:rel.sock",
+		},
+		{
+			spec:         "22, /run/a:b.sock ,8080:80",
+			wantPorts:    []uint16{22, 8080},
+			wantTargets:  map[uint16]string{8080: "localhost:80"},
+			wantCatchAll: "unix:/run/a:b.sock",
+		},
+		{spec: "unix:", wantErr: "no Unix socket path"},
+		{spec: "8022:unix:", wantErr: "no Unix socket path"},
+		{spec: "/a.sock,/b.sock", wantErr: "more than one Unix socket"},
+		{spec: "/a.sock,exec", wantErr: "exec service"},
+		{spec: "exit-node,/a.sock", wantErr: "exit-node service"},
+		{spec: "all,/a.sock", wantErr: `"all"`},
+		{spec: "run/a.sock", wantErr: "is not a port"},
 	} {
-		ports, _, targets, err := parsePortSet(tt.spec)
+		ports, _, targets, catchAll, err := parsePortSet(tt.spec)
 		if tt.wantErr != "" {
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("parsePortSet(%q) error = %v; want one containing %q", tt.spec, err, tt.wantErr)
@@ -710,6 +761,9 @@ func TestParsePortSetTargets(t *testing.T) {
 		}
 		if !maps.Equal(targets, tt.wantTargets) {
 			t.Errorf("parsePortSet(%q) targets = %v; want %v", tt.spec, targets, tt.wantTargets)
+		}
+		if catchAll != tt.wantCatchAll {
+			t.Errorf("parsePortSet(%q) catch-all = %q; want %q", tt.spec, catchAll, tt.wantCatchAll)
 		}
 	}
 }
