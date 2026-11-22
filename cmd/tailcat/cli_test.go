@@ -19,6 +19,7 @@ import (
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/internal/localhostdns"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 )
@@ -79,7 +80,7 @@ func TestHelpListsCommandTree(t *testing.T) {
 	// Server-only flags live on the serve subcommand, not the root.
 	// (The long help prose may still mention them; only reject them
 	// as rendered flag entries.)
-	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk", "\n  --ssh-authorized-keys"} {
+	for _, notWant := range []string{"\n  --allow", "\n  --full-address", "\n  --psk", "\n  --hybrid", "\n  --ssh-authorized-keys"} {
 		if strings.Contains(help, notWant) {
 			t.Errorf("root help lists server-only flag %q", strings.TrimSpace(notWant))
 		}
@@ -101,7 +102,7 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 		t.Fatal("no serve subcommand")
 	}
 	help := ffhelp.Command(serve).String()
-	for _, want := range []string{"--allow", "--allow-list", "--full-address", "--key", "--psk", "--ssh-authorized-keys"} {
+	for _, want := range []string{"--allow", "--allow-list", "--full-address", "--hybrid", "--key", "--psk", "--ssh-authorized-keys"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
 		}
@@ -646,7 +647,7 @@ func TestGenkeyEmbedDERPMapUnknownRegion(t *testing.T) {
 // TestParsePortSetTargets covers the "port:target" serve mappings:
 // a bare port target means that port on localhost, a host:port
 // target is kept as given (IPv6 in brackets), and conflicting
-// mappings of one port are rejected.
+// mappings of one port are rejected, as is port 0 anywhere.
 func TestParsePortSetTargets(t *testing.T) {
 	for _, tt := range []struct {
 		spec        string
@@ -686,6 +687,12 @@ func TestParsePortSetTargets(t *testing.T) {
 		{spec: "5555:10.2.200.213:99999", wantErr: "not a valid port"},
 		{spec: "5555::5555", wantErr: "not a port or host:port"},
 		{spec: "http:10.2.200.213:5555", wantErr: "not a valid port"},
+		{spec: "0", wantErr: "not a valid port"},
+		{spec: "0-100", wantErr: "not a valid port"},
+		{spec: "100-0", wantErr: "not a valid port"},
+		{spec: "5555:0", wantErr: "not a valid port"},
+		{spec: "5555:65536", wantErr: "not a valid port"},
+		{spec: "5555:99999", wantErr: "not a valid port"},
 	} {
 		ports, _, targets, err := parsePortSet(tt.spec)
 		if tt.wantErr != "" {
@@ -703,6 +710,29 @@ func TestParsePortSetTargets(t *testing.T) {
 		}
 		if !maps.Equal(targets, tt.wantTargets) {
 			t.Errorf("parsePortSet(%q) targets = %v; want %v", tt.spec, targets, tt.wantTargets)
+		}
+	}
+}
+
+// TestTargetDialer checks that only localhost targets are dialed
+// through localhostdns.Resolver. It answers every other name with
+// NXDOMAIN, so a mapping to a LAN hostname like "5555:android.lan:5555"
+// could never connect through it.
+func TestTargetDialer(t *testing.T) {
+	for _, tt := range []struct {
+		target    string
+		wantLocal bool
+	}{
+		{"localhost:80", true},
+		{"LocalHost.:80", true},
+		{"app.localhost:80", true},
+		{"android.lan:5555", false},
+		{"db.example.com:5432", false},
+		{"notlocalhost:80", false},
+	} {
+		d := targetDialer(tt.target)
+		if gotLocal := d.Resolver == localhostdns.Resolver; gotLocal != tt.wantLocal {
+			t.Errorf("targetDialer(%q) uses localhostdns.Resolver = %v; want %v", tt.target, gotLocal, tt.wantLocal)
 		}
 	}
 }

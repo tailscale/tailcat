@@ -54,8 +54,14 @@ var wasmKeep = []featuretags.FeatureTag{
 // without them magicsock is DERP-only, and direct paths between peers
 // are the whole point of tailcat. The wasm build omits both: a browser
 // has no UDP sockets, so all of its traffic is relayed over DERP
-// regardless. Note that featuretags.Requires pulls in ssh's c2n and
-// dbus dependencies too.
+// regardless. They keep useproxy too, so connections to DERP relays can
+// go through an HTTP proxy (HTTPS_PROXY, which tailcat's import of
+// tailscale.com/feature/useproxy enables) or a SOCKS5 ALL_PROXY, the
+// only way out of some sandboxes, such as ChatGPT Work's
+// (tailscale/tailscale#22412). They also keep qrcodes, for the
+// serve subcommand's --qr flag, which prints the server's tailcat
+// address as a terminal QR code. Note that featuretags.Requires pulls
+// in ssh's c2n and dbus dependencies too.
 var releaseKeep = []featuretags.FeatureTag{
 	"netstack",
 	"ssh",
@@ -63,6 +69,8 @@ var releaseKeep = []featuretags.FeatureTag{
 	"bakedroots",
 	"androidbin",
 	"nattraversal",
+	"useproxy",
+	"qrcodes",
 }
 
 // WasmTags returns the comma-joined -tags value for the wasm build,

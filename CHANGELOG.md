@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Releases now include an `android_arm64` binary for Termux. The
+  v0.7.0 notes said the linux binaries work under Termux, but on
+  Android 10 and newer Termux runs programs through Android's dynamic
+  linker, which rejects them with `has unexpected e_type: 2`. They
+  still work from `adb shell` or a rooted shell.
+  ([#184](https://github.com/tailscale/tailcat/issues/184); reported by
+  [@jy1655](https://github.com/jy1655))
+- New experimental `tailcat serve --hybrid` flag (and `Server.Hybrid`
+  in the Go API) uses wireguard-go's hybrid post-quantum (ML-KEM-768)
+  WireGuard handshake, whose post-quantum protection doesn't depend on
+  the tailcat address staying secret. Hybrid addresses say so, so
+  clients use the hybrid handshake too, and carry a shorter 128-bit
+  pre-shared key, so they're shorter. Older clients reject hybrid
+  addresses that have a pre-shared key. ([#133](https://github.com/tailscale/tailcat/issues/133))
+- tailcat now works in restricted sandboxes such as ChatGPT Work's
+  ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412)):
+  - If a DERP relay's HTTP upgrade fails, tailcat retries by speaking
+    DERP inside WebSockets, as browsers do. This gets through proxies
+    that intercept TLS and allow WebSocket upgrades but block others.
+  - If tailcat can't monitor the OS network state (such as without
+    netlink access), it continues without reacting to network changes
+    instead of failing to start.
+  - Connections to DERP relays now go through the HTTP proxy named by
+    `HTTPS_PROXY` (or the OS proxy settings, on Windows), or a SOCKS5
+    `ALL_PROXY`. Release binaries had compiled proxy support out.
 - **Breaking Go API change:** `Server.AllowedClients` and
   `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
   hook, a `func(key.NodePublic) bool` asked about each client as it
@@ -29,6 +54,9 @@
   shared DERP relay mostly measures its rate limit; `--via-derp`
   allows relayed tests through your own relay, never through
   Tailscale's shared ones.
+- `tailcat ssh` and `tailcat cp` take `-i <identity-file>` to log in
+  to a `tailcat serve ssh` server with a specific private key, without
+  an ssh config entry.
 
 ## v0.7.0 (2026-09-19)
 

@@ -4,11 +4,14 @@
 // updateflakes regenerates flakehashes.json, the file that records
 // the Nix SRI hash of the Go module vendor tree for flake.nix.
 //
-// The file is content-addressed: it records the go.mod/go.sum
-// fingerprint that produced the SRI, and updateflakes only
-// regenerates the hash when the current fingerprint differs from the
-// recorded one. As a result, repeat runs with no input changes are
-// no-ops.
+// It always runs `go mod vendor` and hashes the result, which takes
+// about half a second with a warm module cache. It used to skip that
+// when go.mod and go.sum were unchanged, but the vendor tree also
+// depends on which packages the module imports: a new import of a
+// package from an already-required module changes it without touching
+// either file, which left a stale hash that failed the nix build.
+// It only rewrites files whose contents change, so repeat runs with no
+// input changes are no-ops.
 //
 // Run from the repo root:
 //
@@ -17,12 +20,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -32,8 +31,6 @@ import (
 
 const (
 	hashesFile      = "flakehashes.json"
-	goModFile       = "go.mod"
-	goSumFile       = "go.sum"
 	flakeNixFile    = "flake.nix"
 	cacheBustPrefix = "# nix-direnv cache busting line:"
 )
@@ -45,11 +42,9 @@ type FlakeHashes struct {
 	Vendor VendorHash `json:"vendor"`
 }
 
-// VendorHash records the SRI of `go mod vendor` output. GoModSum is a
-// fingerprint of go.mod and go.sum that produced SRI.
+// VendorHash records the SRI of `go mod vendor` output.
 type VendorHash struct {
-	GoModSum string `json:"goModSum"`
-	SRI      string `json:"sri"`
+	SRI string `json:"sri"`
 }
 
 func main() {
@@ -59,73 +54,32 @@ func main() {
 }
 
 func run() error {
-	have, err := loadHashes()
+	sri, err := hashVendor()
 	if err != nil {
 		return err
 	}
-	want := have
-
-	goModSum, err := goModFingerprint()
-	if err != nil {
+	if err := writeHashes(FlakeHashes{Vendor: VendorHash{SRI: sri}}); err != nil {
 		return err
-	}
-	if have.Vendor.GoModSum != goModSum || have.Vendor.SRI == "" {
-		sri, err := hashVendor()
-		if err != nil {
-			return err
-		}
-		want.Vendor = VendorHash{GoModSum: goModSum, SRI: sri}
-	}
-
-	if want != have {
-		if err := writeHashes(want); err != nil {
-			return err
-		}
 	}
 
 	// nix-direnv only watches the top-level nix files for changes,
 	// so when a referenced hash changes we must also tickle
 	// flake.nix to force re-evaluation.
-	return updateCacheBust(flakeNixFile, want.Vendor.SRI)
+	return updateCacheBust(flakeNixFile, sri)
 }
 
-func loadHashes() (FlakeHashes, error) {
-	var h FlakeHashes
-	data, err := os.ReadFile(hashesFile)
-	if errors.Is(err, fs.ErrNotExist) {
-		return h, nil
-	}
-	if err != nil {
-		return h, err
-	}
-	if err := json.Unmarshal(data, &h); err != nil {
-		return h, fmt.Errorf("parse %s: %w", hashesFile, err)
-	}
-	return h, nil
-}
-
+// writeHashes writes h to flakehashes.json, unless the file already
+// has exactly those contents.
 func writeHashes(h FlakeHashes) error {
 	b, err := json.MarshalIndent(h, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	return os.WriteFile(hashesFile, b, 0644)
-}
-
-// goModFingerprint returns a content fingerprint of go.mod and go.sum
-// that changes whenever either file changes.
-func goModFingerprint() (string, error) {
-	h := sha256.New()
-	for _, f := range []string{goModFile, goSumFile} {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(h, "%s %d\n", f, len(b))
-		h.Write(b)
+	if old, err := os.ReadFile(hashesFile); err == nil && bytes.Equal(old, b) {
+		return nil
 	}
-	return "sha256-" + base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+	return os.WriteFile(hashesFile, b, 0644)
 }
 
 func hashVendor() (string, error) {

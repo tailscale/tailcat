@@ -122,6 +122,53 @@ func TestServeSSHRequiresAuthorizedKeys(t *testing.T) {
 	}
 }
 
+func TestSSHIdentityFile(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skipf("no ssh in $PATH: %v", err)
+	}
+	sshKeygen, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		t.Skipf("no ssh-keygen in $PATH: %v", err)
+	}
+	e := newTestEnv(t)
+
+	dir := t.TempDir()
+	trusted := filepath.Join(dir, "id_trusted")
+	untrusted := filepath.Join(dir, "id_untrusted")
+	for _, k := range []string{trusted, untrusted} {
+		if out, err := exec.Command(sshKeygen, "-q", "-t", "ed25519", "-N", "", "-f", k).CombinedOutput(); err != nil {
+			t.Fatalf("ssh-keygen: %v\n%s", err, out)
+		}
+	}
+	_, addr, _ := e.startServer("serve", "--ssh-authorized-keys="+trusted+".pub", "ssh")
+
+	run := func(keyPath string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		client := exec.CommandContext(ctx, e.bin, "--key=new", "--derpmap-url="+e.derpMapURL,
+			"ssh", "-i", keyPath, addr, "echo", "authenticated")
+		client.Env = e.env
+		return client.CombinedOutput()
+	}
+
+	out, err := run(trusted)
+	if err != nil {
+		t.Fatalf("tailcat ssh -i trusted key: %v\n%s", err, out)
+	}
+	if got, want := strings.TrimSpace(string(out)), "authenticated"; got != want {
+		t.Errorf("tailcat ssh -i trusted key output = %q; want %q", got, want)
+	}
+
+	out, err = run(untrusted)
+	if err == nil {
+		t.Fatalf("tailcat ssh -i untrusted key succeeded; want rejection\n%s", out)
+	}
+	if !strings.Contains(string(out), "Permission denied") {
+		t.Errorf("tailcat ssh -i untrusted key output = %q; want a permission denied error", out)
+	}
+}
+
 func TestServeSSHInteractive(t *testing.T) {
 	t.Parallel()
 	sshExe, err := exec.LookPath("ssh")

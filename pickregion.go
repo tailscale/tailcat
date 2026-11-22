@@ -39,11 +39,17 @@ func PickBestRegion(ctx context.Context, dm *tailcfg.DERPMap) (regionID tailcfg.
 	if Verbose {
 		nc.Logf = log.Printf
 	}
-	if err := nc.Standalone(ctx, ":0"); err != nil {
+	// Standalone's STUN sockets and their reader goroutines live
+	// until the context it's given is done. Callers' contexts often
+	// outlive this call (some are context.Background), so give it one
+	// that ends when we return.
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := nc.Standalone(probeCtx, ":0"); err != nil {
 		return 0, fmt.Errorf("netcheck.Standalone: %w", err)
 	}
 	t0 := time.Now()
-	nr, err := nc.GetReport(ctx, dm, &netcheck.GetReportOpts{})
+	nr, err := nc.GetReport(probeCtx, dm, &netcheck.GetReportOpts{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to get netcheck report: %w", err)
 	}

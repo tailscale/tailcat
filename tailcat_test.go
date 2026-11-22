@@ -35,11 +35,15 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"tailscale.com/envknob"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/eventbus"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -397,6 +401,53 @@ func TestStatusReportsPeers(t *testing.T) {
 		}
 	}
 	t.Logf("peer %v: CurAddr=%q Relay=%q", c.PublicKey(), ps.CurAddr, ps.Relay)
+}
+
+// TestNetmonFallback checks that a Server and Client still work when the
+// OS network state can't be monitored, as in sandboxes without netlink.
+//
+// It isn't parallel because it replaces netmonNew for the whole package.
+func TestNetmonFallback(t *testing.T) {
+	var failed atomic.Int32
+	tstest.Replace(t, &netmonNew, func(*eventbus.Bus, logger.Logf) (*netmon.Monitor, error) {
+		failed.Add(1)
+		return nil, errors.New("netlink unavailable")
+	})
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: dm.Regions[1]}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return func(c net.Conn) {
+			io.WriteString(c, "Hello without netmon\n")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	if got := failed.Load(); got != 2 {
+		t.Errorf("netmonNew called %d times; want 2 (server and client)", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatalf("DialTCPPort: %v", err)
+	}
+	defer conn.Close()
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if want := "Hello without netmon\n"; string(got) != want {
+		t.Errorf("got %q; want %q", got, want)
+	}
 }
 
 // pingRejectedForTest checks that the server never acknowledges c's
@@ -1183,6 +1234,121 @@ func TestServerCloseClosesActiveConnections(t *testing.T) {
 	}
 }
 
+// TestCloseWithManyTimeWaitEndpoints checks that Server.Close and
+// Client.Close return promptly when the netstack holds more TCP
+// endpoints in TIME-WAIT than its 512-packet outbound queue. Before
+// tailscale/tailscale#21668, netstack.Impl.Close blocked forever
+// there (tailscale/tailcat#151).
+func TestCloseWithManyTimeWaitEndpoints(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	clientKey := key.NewNode()
+	s := &Server{
+		Logf:           mkLogger(t, "server"),
+		Region:         reg,
+		AllowClient:    func(k key.NodePublic) bool { return k == clientKey.Public() },
+		ServedTCPPorts: []filter.PortRange{{First: 80, Last: 80}},
+		OnTCP: func(port uint16) func(net.Conn) {
+			if port != 80 {
+				return nil
+			}
+			// Closing first puts the server's endpoint in TIME-WAIT.
+			return func(conn net.Conn) { conn.Close() }
+		},
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	c := &Client{Server: s.TailcatAddr(), Key: clientKey, Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+
+	st := tcpipStackOf(s.lb.ns)
+	var got tcpip.TCPTimeWaitTimeoutOption
+	if err := st.TransportProtocolOption(tcp.ProtocolNumber, &got); err != nil {
+		t.Fatalf("getting TIME-WAIT timeout: %v", err)
+	}
+	if time.Duration(got) != tcpTimeWaitTimeout {
+		t.Errorf("TIME-WAIT timeout = %v; want %v", time.Duration(got), tcpTimeWaitTimeout)
+	}
+	// Restore gVisor's default for this test so no endpoint leaves
+	// TIME-WAIT before Close, however slowly the dials below go.
+	long := tcpip.TCPTimeWaitTimeoutOption(tcp.DefaultTCPTimeWaitTimeout)
+	if err := s.lb.ns.SetTransportProtocolOption(tcp.ProtocolNumber, &long); err != nil {
+		t.Fatalf("setting TIME-WAIT timeout: %v", err)
+	}
+
+	const numConns = 600 // more than netstack's 512-packet outbound queue
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// A dial whose ephemeral port matches a server endpoint still in
+	// TIME-WAIT has its SYN dropped (gvisor/gvisor#15013), so bound each
+	// dial and retry on failure until numConns connections complete.
+	var completed atomic.Int64
+	var wg sync.WaitGroup
+	for range 32 { // dial concurrency
+		wg.Go(func() {
+			for completed.Load() < numConns && ctx.Err() == nil {
+				dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
+				conn, err := c.DialTCPPort(dctx, 80)
+				dcancel()
+				if err != nil {
+					continue
+				}
+				// Wait for the server's FIN so the server closed first.
+				_, err = io.Copy(io.Discard, conn)
+				conn.Close()
+				if err == nil {
+					completed.Add(1)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if n := completed.Load(); n < numConns {
+		t.Fatalf("completed %d connections; want %d", n, numConns)
+	}
+
+	timeWait := func() (n int) {
+		for _, ep := range st.RegisteredEndpoints() {
+			if se, ok := ep.(interface{ State() uint32 }); ok && tcp.EndpointState(se.State()) == tcp.StateTimeWait {
+				n++
+			}
+		}
+		return n
+	}
+	// The server endpoints enter TIME-WAIT once they process the
+	// client's FIN, which may lag the client's Close.
+	for timeWait() < numConns {
+		if ctx.Err() != nil {
+			t.Fatalf("got %d server endpoints in TIME-WAIT; want %d", timeWait(), numConns)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closed := make(chan error, 2)
+	go func() { closed <- s.Close() }()
+	go func() { closed <- c.Close() }()
+	for range 2 {
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Close hung with many TCP endpoints in TIME-WAIT")
+		}
+	}
+}
+
 func TestAddr(t *testing.T) {
 	akey := func(a [32]byte) NodePublic {
 		return NodePublic{key.NodePublicFromRaw32(mem.B(a[:]))}
@@ -1416,6 +1582,7 @@ func TestClientAcceptsAddrWithoutPresharedKey(t *testing.T) {
 		RegionID:          10,
 	}).Addr()
 	c := NewClient(addr)
+	c.Logf = mkLogger(t, "client")
 	c.startMu.Lock()
 	err := c.initLocked()
 	c.startMu.Unlock()
@@ -1515,6 +1682,168 @@ func TestPeerConfigIncludesPresharedKey(t *testing.T) {
 	if conf.PresharedKey != device.NoisePresharedKey(psk) {
 		t.Fatalf("peerConfig pre-shared key = %x, want %x", conf.PresharedKey, psk)
 	}
+}
+
+func TestAddrHybrid(t *testing.T) {
+	priv := NewPrivateKey()
+	priv.Public.RegionID = 10
+	classic := priv.Public
+	hybrid := priv.Public
+	hybrid.Hybrid = true
+
+	got, err := ParseAddr(hybrid.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Hybrid {
+		t.Error("Hybrid lost in address round trip")
+	}
+	if want := classic.PresharedKey.ForHybrid(); !got.PresharedKey.Equal(want) {
+		t.Errorf("hybrid pre-shared key = %x; want %x", got.PresharedKey, want)
+	}
+	if got, err := ParseAddr(classic.Addr()); err != nil || got.Hybrid {
+		t.Errorf("classic address parsed as Hybrid=%v, %v; want false, nil", got.Hybrid, err)
+	}
+
+	noPSK := hybrid
+	noPSK.PresharedKey = PresharedKey{}
+	if got, err := ParseAddr(noPSK.Addr()); err != nil || !got.Hybrid || !got.PresharedKey.IsZero() {
+		t.Errorf("hybrid address without PSK parsed as Hybrid=%v, PSK %x, %v; want true, zero, nil", got.Hybrid, got.PresharedKey, err)
+	}
+
+	// The CBOR bool costs 2 bytes; the shorter key saves 16.
+	if got, want := len(hybrid.Addr()), len(classic.Addr())-18; got > want {
+		t.Errorf("hybrid address length = %d; want at most %d", got, want)
+	}
+}
+
+// TestOldClientsRejectHybridAddr verifies that tailcat clients from before
+// the hybrid handshake, which decoded the pre-shared key straight into a
+// [PresharedKey], fail to parse a hybrid address instead of trying a
+// classic handshake the server never answers.
+func TestOldClientsRejectHybridAddr(t *testing.T) {
+	type oldWireConnInfo struct {
+		ServerPublic      NodePublic    `cbor:"p"`
+		ServerDiscoPublic *DiscoPublic  `cbor:"k,omitempty"`
+		PresharedKey      *PresharedKey `cbor:"q,omitempty"`
+		RegionID          int64         `cbor:"i,omitempty"`
+	}
+	decodeOld := func(a Addr) error {
+		x, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(string(a), "tc"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cbor.Unmarshal(x, new(oldWireConnInfo))
+	}
+
+	priv := NewPrivateKey()
+	priv.Public.RegionID = 10
+	if err := decodeOld(priv.Public.Addr()); err != nil {
+		t.Fatalf("old decoder rejected classic address: %v", err)
+	}
+	priv.Public.Hybrid = true
+	if err := decodeOld(priv.Public.Addr()); err == nil {
+		t.Fatal("old decoder accepted hybrid address")
+	}
+}
+
+func TestParseAddrMalformedHybrid(t *testing.T) {
+	for name, fields := range map[string]map[string]any{
+		"long-psk":          {"y": true, "q": make([]byte, presharedKeyLen)},
+		"classic-short-psk": {"q": make([]byte, hybridPresharedKeyLen)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fields["p"] = key.NewNode().Public().AppendTo(nil)
+			raw, err := cbor.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := Addr("tc" + base64.RawURLEncoding.EncodeToString(raw))
+			if _, err := ParseAddr(addr); err == nil {
+				t.Fatal("ParseAddr unexpectedly accepted malformed hybrid address")
+			}
+		})
+	}
+}
+
+func TestPeerConfigHybrid(t *testing.T) {
+	server := key.NewNode().Public()
+	b := &locoBackend{serverPub: server, presharedKey: NewPresharedKey(), hybrid: true}
+	conf, ok := b.peerConfig(server)
+	if !ok {
+		t.Fatal("peerConfig did not find server peer")
+	}
+	if !conf.Hybrid {
+		t.Fatal("peerConfig Hybrid = false; want true")
+	}
+}
+
+// TestHybridTunnel verifies that a hybrid server and client complete a
+// hybrid WireGuard handshake, and that a client using the classic
+// handshake with the same keys cannot reach the server.
+func TestHybridTunnel(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	s := &Server{Logf: mkLogger(t, "server"), Region: dm.Regions[1], Hybrid: true}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+		return func(c net.Conn) {
+			io.WriteString(c, "hybrid hello")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ci, err := ParseAddr(s.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ci.Hybrid {
+		t.Fatal("hybrid server's address isn't hybrid")
+	}
+
+	classicInfo := ci
+	classicInfo.Hybrid = false
+	classic := &Client{Server: classicInfo.Addr(), Logf: mkLogger(t, "classic-client")}
+	PingForTest(t, s, classic) // the pre-WireGuard discovery handshake still works
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if conn, err := classic.DialTCPPort(ctx, 80); err == nil {
+		conn.Close()
+		t.Fatal("classic-handshake client established a tunnel with a hybrid server")
+	}
+	cancel()
+	classic.Close()
+
+	before := hybridResponderHandshakes()
+	c := &Client{Server: s.TailcatAddr(), Logf: mkLogger(t, "client")}
+	t.Cleanup(func() { c.Close() })
+	PingForTest(t, s, c)
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialTCPPort(ctx, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := io.ReadAll(conn)
+	if string(all) != "hybrid hello" {
+		t.Fatalf("read %q, %v; want %q", all, err, "hybrid hello")
+	}
+	if after := hybridResponderHandshakes(); after <= before {
+		t.Errorf("hybrid responder handshakes = %d, unchanged from before the dial", after)
+	}
+}
+
+// hybridResponderHandshakes returns wireguard-go's process-wide count of
+// completed hybrid handshakes in which it was the responder.
+func hybridResponderHandshakes() int64 {
+	for _, m := range clientmetric.Metrics() {
+		if m.Name() == "wireguard_handshake_hybrid_responder_completed" {
+			return m.Value()
+		}
+	}
+	return 0
 }
 
 // TestFetchDERPMapMemoryCache verifies the default in-memory DERP map

@@ -187,3 +187,11 @@ func TestAllowClientKeepsAllowlistSemantics(t *testing.T) {
 		t.Errorf("added k3 not admitted")
 	}
 }
+
+func TestNewServerRejectsOverflowingUDPIdleTimeout(t *testing.T) {
+	tooBig := float64(int64(^uint64(0)>>1)) / float64(time.Second)
+	cfg := fmt.Sprintf(`{"udp_idle_timeout":%v}`, tooBig)
+	if _, err := NewServer(cfg); !errors.Is(err, ErrArgument) {
+		t.Fatalf("NewServer(%s) err = %v, want ErrArgument", cfg, err)
+	}
+}

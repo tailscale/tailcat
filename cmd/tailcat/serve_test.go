@@ -67,6 +67,33 @@ func startUDPEcho(t *testing.T) uint16 {
 	return uint16(pc.LocalAddr().(*net.UDPAddr).Port)
 }
 
+// qrModuleRun matches a run of QR code module characters, which
+// qrcodes renders as either half/full block characters (the UTF-8
+// formats) or '#' (the ASCII fallback), depending on the terminal it
+// detects.
+var qrModuleRun = regexp.MustCompile(`[█▀▄#]{20,}`)
+
+// TestServeQR checks that serve --qr prints the address as a QR code
+// alongside the usual address line.
+func TestServeQR(t *testing.T) {
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	_, addr, serverStderr := e.startServer("serve", "--qr", strconv.Itoa(int(port)))
+
+	// Stderr is copied by a goroutine and can trail the address
+	// file, so poll for the QR code rather than checking once.
+	deadline := time.Now().Add(30 * time.Second)
+	for !qrModuleRun.MatchString(serverStderr.String()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("server stderr lacks a QR code:\n%s", serverStderr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stderr := serverStderr.String(); !strings.Contains(stderr, addr) {
+		t.Errorf("server stderr lacks the tailcat address:\n%s", stderr)
+	}
+}
+
 func TestServeWithoutPSK(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t)
@@ -89,6 +116,37 @@ func TestServeWithoutPSK(t *testing.T) {
 	}
 	if got != payload {
 		t.Errorf("server echoed %q; want %q", got, payload)
+	}
+}
+
+func TestServeHybrid(t *testing.T) {
+	for _, psk := range []bool{true, false} {
+		t.Run(fmt.Sprintf("psk=%v", psk), func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t)
+			port := startEchoListener(t)
+			_, addr, serverStderr := e.startServer("serve", "--hybrid", fmt.Sprintf("--psk=%v", psk), strconv.Itoa(int(port)))
+
+			ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ci.Hybrid {
+				t.Fatal("serve --hybrid produced a non-hybrid address")
+			}
+			if got := !ci.PresharedKey.IsZero(); got != psk {
+				t.Fatalf("address has PSK = %v; want %v", got, psk)
+			}
+
+			const payload = "echo over a hybrid handshake"
+			got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+			if err != nil {
+				t.Fatalf("client to hybrid server: %v", err)
+			}
+			if got != payload {
+				t.Errorf("server echoed %q; want %q", got, payload)
+			}
+		})
 	}
 }
 

@@ -45,6 +45,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/qrcodes"
 	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
@@ -59,10 +60,13 @@ var (
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
+	flagHybrid            *bool
+	flagLog               *bool
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
 	flagDERPMapURL        *string
+	flagQR                *bool
 )
 
 var serveFS *ff.FlagSet
@@ -104,9 +108,12 @@ func newRootCommand() *ff.Command {
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagAllowList = serveFS.StringLong("allow-list", "", "path to a text file with one public key per line to allow access to the server")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
+	flagQR = serveFS.BoolLong("qr", "display the tailcat address as a scannable QR code")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
+	flagHybrid = serveFS.BoolLong("hybrid", "EXPERIMENTAL: use the hybrid post-quantum (ML-KEM-768) WireGuard handshake, which doesn't depend on the tailcat address staying secret for its post-quantum protection. The address is shorter, with a 128-bit pre-shared key, but only works with clients that support the hybrid handshake; older clients reject it.")
+	flagLog = serveFS.BoolLong("log", "log an access record to stderr for each client that connects or is refused and each TCP connection it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -523,9 +530,23 @@ recursive write-only drop box:
 	tailcat serve --files=/inbox:wo files
 	tailcat serve --files=/tree-inbox:wo+ files
 
+Serve a port and also print the address as a scannable QR code:
+
+	tailcat serve --qr 8080
+
 Serve with a saved key (see genkey) and restrict clients:
 
 	tailcat serve --key=default --allow=nodekey:... 22
+
+Keep an access log of who connects and what they reach:
+
+	tailcat serve --log 22,80
+
+which writes lines like these to stderr, independent of --verbose:
+
+	[peer] allowed key=nodekey:abc...
+	[conn] open peer=nodekey:abc... port=22 service=forward via=derp:sfo
+	[conn] close peer=nodekey:abc... port=22 service=forward duration=8.104s
 
 Environment:
 
@@ -1001,8 +1022,12 @@ func normalizeListenAddrPort(s string) string {
 		return net.JoinHostPort(host, port)
 	} else if port, err := strconv.ParseUint(s, 10, 16); err == nil {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	} else if _, err := netip.ParseAddr(s); err == nil {
+		// A bare IP address. JoinHostPort brackets an IPv6 address
+		// such as "::1", which appending ":0" would leave ambiguous.
+		return net.JoinHostPort(s, "0")
 	}
-	// Assume it's a hostname or IP without a port.
+	// Assume it's a hostname without a port.
 	return s + ":0"
 }
 
@@ -1364,6 +1389,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		ci.PresharedKey = tailcat.PresharedKey{}
 	}
 	psk := ci.PresharedKey
+	if *flagHybrid {
+		psk = psk.ForHybrid()
+	}
 	if reg == nil {
 		// A key created with custom DERP hostnames (genkey --region=<host>)
 		// has pre-populated regions with no DERP map ID to reference, so its
@@ -1395,9 +1423,10 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	ci.ServerPublic = tailcat.NodePublic{NodePublic: priv.Public()}
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
+	ci.Hybrid = *flagHybrid
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Hybrid: *flagHybrid, Logf: logf, Region: reg}
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
@@ -1433,12 +1462,6 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		s.AllowClient = allow.Contains
 	}
 
-	// localDialer dials the local services that incoming connections
-	// are proxied to. Its resolver answers "localhost" itself with
-	// both loopback addresses; see the localhostdns package comment
-	// for why the OS resolver can't be trusted to (issue #108).
-	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
-
 	// tcpTarget returns the host:port a served TCP port is proxied
 	// to: its mapping's target if the serve spec gave one, else the
 	// same port on localhost.
@@ -1446,14 +1469,19 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if t, ok := targets[port]; ok {
 			return t
 		}
-		return fmt.Sprintf("localhost:%v", port)
+		return net.JoinHostPort("localhost", strconv.Itoa(int(port)))
 	}
 
-	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
+	// tcpForwardTo returns a handler that proxies a connection to
+	// hostPort. That is an IP:port for exit node traffic, but a served
+	// port's target (see tcpTarget) is "localhost:port" or a mapping's
+	// host:port, whose host can be a name such as "android.lan".
+	tcpForwardTo := func(hostPort string) func(net.Conn) {
+		d := targetDialer(hostPort)
 		return func(c net.Conn) {
-			localConn, err := localDialer.Dial("tcp", ipPortStr)
+			localConn, err := d.Dial("tcp", hostPort)
 			if err != nil {
-				logf("error proxying to %v: %v", ipPortStr, err)
+				logf("error proxying to %v: %v", hostPort, err)
 				c.Close()
 				return
 			}
@@ -1533,23 +1561,38 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		fmt.Fprintf(os.Stderr, "# Proxying port %d to %v\n", port, targets[port])
 	}
 
-	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+	// sshServiceName names the services behind sshHandler, which
+	// several can share on port 22.
+	var sshServiceName string
+	if sshServices {
+		var names []string
+		for _, n := range []string{"ssh", "no-auth-ssh", "files"} {
+			if services.Contains(n) {
+				names = append(names, n)
+			}
+		}
+		sshServiceName = strings.Join(names, "+")
+	}
+
+	// tcpHandler returns the handler for a connection to port, and
+	// the name of the service it reaches, for --log.
+	tcpHandler := func(port uint16) (handler func(net.Conn), service string) {
 		if port == 22 && sshHandler != nil {
-			return sshHandler
+			return sshHandler, sshServiceName
 		}
 		if port == perf.Port && perfSrv != nil {
-			return perfSrv.HandleTCP
+			return perfSrv.HandleTCP, "perf"
 		}
 		if portSet.Contains(port) {
-			return tcpForwardTo(tcpTarget(port))
+			return tcpForwardTo(tcpTarget(port)), "forward"
 		}
 		if execHandler != nil {
-			return execHandler
+			return execHandler, "exec"
 		}
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "exit-node"
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1573,12 +1616,34 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 				defer cancel()
 				s.DrainTCP(ctx)
 				os.Exit(0)
-			}
+			}, "stdout"
 		}
 		if !portSet.Contains(port) {
-			return nil // RST
+			return nil, "" // RST
 		}
-		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "forward"
+	}
+
+	var clog *connLog // nil unless --log
+	if *flagLog {
+		clog = newConnLog()
+		clog.attach(s)
+		if next := s.OnTCPForward; next != nil {
+			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
+				return clog.wrapTCP("forward="+dst.String(), next(dst))
+			}
+		}
+	}
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		h, service := tcpHandler(port)
+		if clog != nil {
+			dst := fmt.Sprintf("port=%d", port)
+			if service != "" {
+				dst += " service=" + service
+			}
+			return clog.wrapTCP(dst, h)
+		}
+		return h
 	}
 
 	if err := s.Start(); err != nil {
@@ -1616,6 +1681,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with new address: %v\n", connStr)
 	} else {
 		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with saved key %q: %v\n", *flagKey, connStr)
+	}
+	if *flagQR {
+		if _, err := qrcodes.Fprintln(os.Stderr, qrcodes.FormatAuto, string(connStr)); err != nil {
+			log.Fatalf("failed to render QR code: %v", err)
+		}
 	}
 	if *flagJSON {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(connStr)})
@@ -1684,6 +1754,29 @@ func addAllowedKeysFromFile(allow *tailcat.KeySet, path string) error {
 		}
 	}
 	return nil
+}
+
+// localDialer dials the local services that incoming connections are
+// proxied to. Its resolver answers "localhost" itself with both
+// loopback addresses; see the localhostdns package comment for why
+// the OS resolver can't be trusted to (issue #108).
+var localDialer = &net.Dialer{Resolver: localhostdns.Resolver}
+
+// systemDialer dials proxy targets that aren't localhost names, using
+// the system resolver.
+var systemDialer = new(net.Dialer)
+
+// targetDialer returns the dialer for proxying to target, a host:port.
+// Localhost names go through localDialer. Any other host, such as a
+// port mapping's "android.lan", needs the system resolver:
+// localhostdns.Resolver answers every name but localhost with NXDOMAIN.
+// A target that doesn't parse as a host:port also gets systemDialer,
+// whose Dial then fails with the parse error.
+func targetDialer(target string) *net.Dialer {
+	if host, _, err := net.SplitHostPort(target); err == nil && localhostdns.IsLocalhost(host) {
+		return localDialer
+	}
+	return systemDialer
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
@@ -1791,6 +1884,9 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 		if hi < lo {
 			hi, lo = lo, hi
 		}
+		if lo == 0 {
+			return nil, nil, nil, fmt.Errorf("%q includes port 0, which is not a valid port", r)
+		}
 		for i := lo; i <= hi; i++ {
 			ret.Add(uint16(i))
 		}
@@ -1808,6 +1904,10 @@ func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
 		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", portStr, portStr+":"+targetStr)
 	}
 	if numRx.MatchString(targetStr) {
+		p, err := strconv.ParseUint(targetStr, 10, 16)
+		if err != nil || p == 0 {
+			return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetStr, portStr+":"+targetStr)
+		}
 		return uint16(port), net.JoinHostPort("localhost", targetStr), nil
 	}
 	host, targetPort, err := net.SplitHostPort(targetStr)

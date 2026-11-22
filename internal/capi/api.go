@@ -74,7 +74,15 @@ type listener struct {
 }
 
 type connection struct {
-	conn       net.Conn
+	conn net.Conn
+
+	// localAddr and remoteAddr are recorded when the connection is
+	// published. A netstack TCP connection reports a nil RemoteAddr once
+	// its endpoint reaches CLOSED, which happens while the handle is still
+	// open if both directions are shut down, so Info must not ask conn.
+	localAddr  string
+	remoteAddr string
+
 	readGate   gate
 	writeGate  gate
 	network    int
@@ -119,6 +127,12 @@ func (c *connection) release() {
 func newConnection(conn net.Conn, network int) *connection {
 	c := &connection{conn: conn, readGate: newGate(), writeGate: newGate(), network: network,
 		stopped: make(chan struct{}), pumpDone: make(chan struct{})}
+	if la := conn.LocalAddr(); la != nil {
+		c.localAddr = la.String()
+	}
+	if ra := conn.RemoteAddr(); ra != nil {
+		c.remoteAddr = ra.String()
+	}
 	if network == TCP {
 		c.reads = make(chan readResult, 1)
 		go c.receive()
@@ -240,7 +254,7 @@ func NewServer(config string) (Handle, error) {
 			return 0, fmt.Errorf("%w: invalid pre-shared key", ErrArgument)
 		}
 	}
-	if cfg.UDPIdleTimeout < 0 || cfg.UDPIdleTimeout > float64(int64(^uint64(0)>>1))/float64(time.Second) {
+	if cfg.UDPIdleTimeout < 0 || cfg.UDPIdleTimeout >= float64(int64(^uint64(0)>>1))/float64(time.Second) {
 		return 0, fmt.Errorf("%w: invalid UDP idle timeout", ErrArgument)
 	}
 	s := &tailcat.Server{Key: k, PresharedKey: psk, Region: cfg.Region, RegionID: cfg.RegionID, DERPMapURL: cfg.DERPMapURL, Logf: logger.Discard, UDPIdleTimeout: time.Duration(cfg.UDPIdleTimeout * float64(time.Second))}
@@ -396,6 +410,12 @@ func Read(id, token Handle, data []byte) (n int, err error) {
 			return err
 		}
 		return withDeadline(ctx, c.readGate, c.conn.SetReadDeadline, func() error {
+			if len(data) == 0 {
+				// Consume one datagram without passing an empty buffer to netstack.
+				var buf [1]byte
+				_, err := c.conn.Read(buf[:])
+				return err
+			}
 			var err error
 			n, err = c.conn.Read(data)
 			return err
@@ -480,7 +500,7 @@ func Info(id, token Handle) (out string, err error) {
 		case *listener:
 			info = map[string]any{"local_address": v.ln.Addr().String(), "network": v.network}
 		case *connection:
-			info = map[string]any{"local_address": v.conn.LocalAddr().String(), "remote_address": v.conn.RemoteAddr().String(), "network": v.network}
+			info = map[string]any{"local_address": v.localAddr, "remote_address": v.remoteAddr, "network": v.network}
 		default:
 			return ErrType
 		}

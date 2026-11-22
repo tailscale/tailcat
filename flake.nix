@@ -13,7 +13,19 @@
         # flakehashes.json is maintained by `make tidy`
         # (tool/updateflakes); do not edit it by hand.
         flakeHashes = builtins.fromJSON (builtins.readFile ./flakehashes.json);
-        buildGoModule = pkgs.buildGo127Module;
+        # go.mod requires Go 1.27.4 (via tailscale.com), but as of
+        # 2026-11-17 nixpkgs-unstable ships go_1_27 = 1.27.3, so build
+        # 1.27.4 from source. Remove this override and go back to
+        # pkgs.buildGo127Module and pkgs.go_1_27 once nixpkgs-unstable
+        # has 1.27.4.
+        go = pkgs.go_1_27.overrideAttrs (old: {
+          version = "1.27.4";
+          src = pkgs.fetchurl {
+            url = "https://go.dev/dl/go1.27.4.src.tar.gz";
+            hash = "sha256-c8+4VxrsDAEXdofbhxY9Rqog6XeWcncokaoXZU2aYJk=";
+          };
+        });
+        buildGoModule = pkgs.buildGoModule.override { inherit go; };
       in
       {
         packages.default = buildGoModule {
@@ -31,8 +43,8 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = [ pkgs.go_1_27 ];
+          packages = [ go ];
         };
       });
 }
-# nix-direnv cache busting line: sha256-cY7ex5QFcJuePvoq3h0O1A+5TgYA00js//mc7I+vD48=
+# nix-direnv cache busting line: sha256-KBk5C52OoLe6sWisAuYaoYZF4mPuddEBqSOLaMegL4E=

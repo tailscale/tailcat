@@ -61,7 +61,7 @@ func TestCPUsageErrors(t *testing.T) {
 }
 
 func TestCPRejectsInvalidAddr(t *testing.T) {
-	err := clientCPMode(false, false, "22", []string{"local.txt", "tc%:remote.txt"})
+	err := clientCPMode(false, false, "22", "", []string{"local.txt", "tc%:remote.txt"})
 	if err == nil || !strings.Contains(err.Error(), "base64 decode") {
 		t.Fatalf("clientCPMode error = %v; want an invalid base64 error", err)
 	}
