@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tailscale/tailcat"
+	"tailscale.com/types/key"
 )
 
 // clientIdentity generates a saved client key and returns its path and
@@ -53,7 +57,7 @@ func TestServeLog(t *testing.T) {
 		t.Errorf("server echoed %q; want %q", got, payload)
 	}
 
-	wantOpen := fmt.Sprintf("[conn] open peer=%v port=%d service=forward via=", cpub, port)
+	wantOpen := fmt.Sprintf("[conn] open peer=%v proto=tcp port=%d service=forward via=", cpub, port)
 	waitForLog(t, serverStderr, wantOpen)
 	logs := serverStderr.String()
 
@@ -69,7 +73,7 @@ func TestServeLog(t *testing.T) {
 		t.Errorf("server stderr lacks %q:\n%s", want, logs)
 	}
 	// The close line carries a duration, so match its shape.
-	wantClose := regexp.MustCompile(fmt.Sprintf(`\[conn\] close peer=%v port=%d service=forward duration=\S+`, regexp.QuoteMeta(cpub), port))
+	wantClose := regexp.MustCompile(fmt.Sprintf(`\[conn\] close peer=%v proto=tcp port=%d service=forward duration=\S+`, regexp.QuoteMeta(cpub), port))
 	waitForLog(t, serverStderr, "[conn] close peer="+cpub)
 	logs = serverStderr.String()
 	if !wantClose.MatchString(logs) {
@@ -132,7 +136,7 @@ func TestServeLogExitNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := fmt.Sprintf("[conn] open peer=%v forward=%v via=", cpub, dst)
+	want := fmt.Sprintf("[conn] open peer=%v proto=tcp forward=%v via=", cpub, dst)
 	waitForLog(t, serverStderr, want)
 }
 
@@ -195,4 +199,44 @@ func TestServeWithoutLog(t *testing.T) {
 	if logs := serverStderr.String(); strings.Contains(logs, "[conn]") || strings.Contains(logs, "[peer]") {
 		t.Errorf("server logged connections without --log:\n%s", logs)
 	}
+}
+
+// TestServeLogUDP verifies that --log records UDP flows an exit node
+// relays, tagged proto=udp, with the client's key and the address
+// they were relayed to.
+func TestServeLogUDP(t *testing.T) {
+	t.Parallel()
+	e := newTestEnv(t)
+	port := startUDPEcho(t)
+	dst := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+
+	_, addr, serverStderr := e.startServer("serve", "--log", "exit-node")
+
+	clientKey := key.NewNode()
+	cl := &tailcat.Client{
+		Server:     tailcat.Addr(addr),
+		Key:        clientKey,
+		DERPMapURL: e.derpMapURL,
+		Logf:       testLogger(t, "client"),
+	}
+	t.Cleanup(func() { cl.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := cl.DialUDP(ctx, dst)
+	if err != nil {
+		t.Fatalf("DialUDP %v: %v", dst, err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("logged udp")); err != nil {
+		t.Fatalf("udp write: %v", err)
+	}
+	buf := make([]byte, 64<<10)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("udp read: %v\nserver log:\n%s", err, serverStderr.String())
+	}
+
+	want := fmt.Sprintf("[conn] open peer=%v proto=udp forward=%v via=", clientKey.Public(), dst)
+	waitForLog(t, serverStderr, want)
 }
