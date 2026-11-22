@@ -112,7 +112,7 @@ func newRootCommand() *ff.Command {
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
 	flagHybrid = serveFS.BoolLong("hybrid", "EXPERIMENTAL: use the hybrid post-quantum (ML-KEM-768) WireGuard handshake, which doesn't depend on the tailcat address staying secret for its post-quantum protection. The address is shorter, with a 128-bit pre-shared key, but only works with clients that support the hybrid handshake; older clients reject it.")
-	flagLog = serveFS.BoolLong("log", "log an access record to stderr for each client that connects or is refused and each TCP connection it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
+	flagLog = serveFS.BoolLong("log", "log an access record to stderr for each client that connects or is refused and each TCP connection or UDP flow it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -551,8 +551,8 @@ Keep an access log of who connects and what they reach:
 which writes lines like these to stderr, independent of --verbose:
 
 	[peer] allowed key=nodekey:abc...
-	[conn] open peer=nodekey:abc... port=22 service=forward via=derp:sfo
-	[conn] close peer=nodekey:abc... port=22 service=forward duration=8.104s
+	[conn] open peer=nodekey:abc... proto=tcp port=22 service=forward via=derp:sfo
+	[conn] close peer=nodekey:abc... proto=tcp port=22 service=forward duration=8.104s
 
 Environment:
 
@@ -1659,6 +1659,17 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		if next := s.OnTCPForward; next != nil {
 			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
 				return clog.wrapTCP("forward="+dst.String(), next(dst))
+			}
+		}
+		if next := s.OnUDPForward; next != nil {
+			s.OnUDPForward = func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+				return clog.wrapUDP("forward="+dst.String(), next(dst))
+			}
+		}
+		// The perf service is the only one served over UDP.
+		if next := s.OnUDP; next != nil {
+			s.OnUDP = func(port uint16) func(tailcat.ConnPacketConn) {
+				return clog.wrapUDP(fmt.Sprintf("port=%d service=perf", port), next(port))
 			}
 		}
 	}

@@ -375,14 +375,15 @@ are always refused. `tailcat --json perf` prints the results as JSON.
 
 By default a server prints its address and then stays quiet. `--log`
 adds an access log on stderr: one line when a client is allowed in,
-and one when each of its TCP connections opens and closes.
+and one when each of its TCP connections or UDP flows opens and
+closes. A UDP flow closes after two minutes without traffic.
 
 ```sh
 $ tailcat serve --log 8000
 # 🐈 Server listening with new address: tcXXXXXXXXX
 2026/01/30 11:04:02 [peer] allowed key=nodekey:abc123...
-2026/01/30 11:04:02 [conn] open peer=nodekey:abc123... port=8000 service=forward via=derp:sfo
-2026/01/30 11:04:11 [conn] close peer=nodekey:abc123... port=8000 service=forward duration=8.104s
+2026/01/30 11:04:02 [conn] open peer=nodekey:abc123... proto=tcp port=8000 service=forward via=derp:sfo
+2026/01/30 11:04:11 [conn] close peer=nodekey:abc123... proto=tcp port=8000 service=forward duration=8.104s
 ```
 
 Clients are identified by public key, the same value `--allow` takes.

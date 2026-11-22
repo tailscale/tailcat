@@ -16,8 +16,8 @@ import (
 
 // connLog writes the server-mode access log enabled by
 // --log: one line per client admitted or refused and per
-// incoming connection, naming the client key the tunnel authenticated
-// and the port or service it reached.
+// incoming TCP connection or UDP flow, naming the client key the
+// tunnel authenticated and the port or service it reached.
 //
 // It is deliberately separate from --verbose, which turns on the
 // library's debug logging. An operator who wants a record of who
@@ -94,24 +94,47 @@ func (l *connLog) firstRefusal(k key.NodePublic) bool {
 // [tailcat.ProxyConns] needs to shut a tunnel connection down without
 // losing its FIN.
 func (l *connLog) wrapTCP(dst string, next func(net.Conn)) func(net.Conn) {
+	dst = "proto=tcp " + dst
 	if next == nil {
 		l.logf("[conn] refused %v", dst)
 		return nil
 	}
 	return func(c net.Conn) {
-		peer := "unknown"
-		via := "unknown"
-		if k, ok := l.srv.PeerKey(c.RemoteAddr()); ok {
-			peer = k.String()
-			via = l.path(k)
-		}
-		l.logf("[conn] open peer=%v %v via=%v", peer, dst, via)
-		start := time.Now()
-		defer func() {
-			l.logf("[conn] close peer=%v %v duration=%v", peer, dst, time.Since(start).Round(time.Millisecond))
-		}()
-		next(c)
+		l.logOpenClose(dst, c.RemoteAddr(), func() { next(c) })
 	}
+}
+
+// wrapUDP is like wrapTCP, but for a UDP flow, which closes once it
+// has been idle for the server's UDP idle timeout.
+//
+// Unlike wrapTCP, it doesn't log a nil next. Nothing refuses a UDP
+// flow; its packets are just dropped, and each one can ask for a
+// handler again, so logging them could flood the log.
+func (l *connLog) wrapUDP(dst string, next func(tailcat.ConnPacketConn)) func(tailcat.ConnPacketConn) {
+	if next == nil {
+		return nil
+	}
+	dst = "proto=udp " + dst
+	return func(c tailcat.ConnPacketConn) {
+		l.logOpenClose(dst, c.RemoteAddr(), func() { next(c) })
+	}
+}
+
+// logOpenClose logs the opening of a connection or flow to dst from
+// remote, runs serve, and then logs its closing.
+func (l *connLog) logOpenClose(dst string, remote net.Addr, serve func()) {
+	peer := "unknown"
+	via := "unknown"
+	if k, ok := l.srv.PeerKey(remote); ok {
+		peer = k.String()
+		via = l.path(k)
+	}
+	l.logf("[conn] open peer=%v %v via=%v", peer, dst, via)
+	start := time.Now()
+	defer func() {
+		l.logf("[conn] close peer=%v %v duration=%v", peer, dst, time.Since(start).Round(time.Millisecond))
+	}()
+	serve()
 }
 
 // path reports how packets currently reach peer k: the direct UDP
