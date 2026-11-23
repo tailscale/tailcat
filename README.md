@@ -596,6 +596,11 @@ server$ tailcat serve --allow=nodekey:cfb6bf...ddfd16 22
 # 🐈 Server listening with saved key "default": tcXXXXXXXXX
 ```
 
+For multiple clients, you can also put one public key per line in a
+text file and pass its path to `--allow-list`, for example
+`tailcat serve --allow-list=./whitelist.txt 22`. Blank lines and lines
+beginning with `#` are ignored.
+
 Publish the tailcat address in DNS as a TXT record:
 
 ```

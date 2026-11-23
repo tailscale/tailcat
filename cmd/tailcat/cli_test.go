@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
@@ -20,6 +21,7 @@ import (
 	"github.com/tailscale/tailcat"
 	"github.com/tailscale/tailcat/internal/localhostdns"
 	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 )
 
 func TestClassifyTailcatAddrArg(t *testing.T) {
@@ -100,7 +102,7 @@ func TestServeHelpListsServerFlags(t *testing.T) {
 		t.Fatal("no serve subcommand")
 	}
 	help := ffhelp.Command(serve).String()
-	for _, want := range []string{"--allow", "--full-address", "--hybrid", "--key", "--psk", "--ssh-authorized-keys"} {
+	for _, want := range []string{"--allow", "--allow-list", "--full-address", "--hybrid", "--key", "--psk", "--ssh-authorized-keys"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("serve help is missing %q", want)
 		}
@@ -152,6 +154,54 @@ func TestParseFilesFlagWriteOnlyModes(t *testing.T) {
 		if fs.Dir != dir || fs.Mode != tt.wantMode || modeName != tt.wantName {
 			t.Errorf("parseFilesFlag(%q) = {%q, %v}, %q; want {%q, %v}, %q", tt.suffix, fs.Dir, fs.Mode, modeName, dir, tt.wantMode, tt.wantName)
 		}
+	}
+}
+
+func TestParseAllowListFile(t *testing.T) {
+	allowed := key.NewNode().Public()
+	alsoAllowed := key.NewNode().Public()
+	notAllowed := key.NewNode().Public()
+	path := filepath.Join(t.TempDir(), "whitelist.txt")
+	content := fmt.Sprintf("# permitted clients\n\n%s\n  %s  \n", allowed.String(), alsoAllowed.String())
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := &tailcat.KeySet{}
+	if err := addAllowedKeysFromFile(got, path); err != nil {
+		t.Fatalf("addAllowedKeysFromFile(%q): %v", path, err)
+	}
+	for _, k := range []key.NodePublic{allowed, alsoAllowed} {
+		if !got.Contains(k) {
+			t.Errorf("parsed allow list does not contain %v", k)
+		}
+	}
+	if got.Contains(notAllowed) {
+		t.Errorf("parsed allow list unexpectedly contains %v", notAllowed)
+	}
+}
+
+func TestParseAllowFlagCommaSeparated(t *testing.T) {
+	allowed := key.NewNode().Public()
+	alsoAllowed := key.NewNode().Public()
+	got, err := parseAllowFlag(allowed.String() + "," + alsoAllowed.String())
+	if err != nil {
+		t.Fatalf("parseAllowFlag: %v", err)
+	}
+	for _, k := range []key.NodePublic{allowed, alsoAllowed} {
+		if !got.Contains(k) {
+			t.Errorf("parsed allow list does not contain %v", k)
+		}
+	}
+}
+
+func TestParseAllowListFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "whitelist.txt")
+	if _, err := parseCLI(t, "serve", "--allow-list="+path); err != nil {
+		t.Fatal(err)
+	}
+	if got := *flagAllowList; got != path {
+		t.Errorf("--allow-list = %q; want %q", got, path)
 	}
 }
 

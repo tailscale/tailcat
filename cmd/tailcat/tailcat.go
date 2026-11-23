@@ -57,6 +57,7 @@ var (
 	flagServe             *string
 	flagKey               *string
 	flagAllow             *string
+	flagAllowList         *string
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
@@ -106,6 +107,7 @@ func newRootCommand() *ff.Command {
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
+	flagAllowList = serveFS.StringLong("allow-list", "", "path to a text file with one public key per line to allow access to the server")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
 	flagQR = serveFS.BoolLong("qr", "display the tailcat address as a scannable QR code")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
@@ -1465,17 +1467,15 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	if servePerf {
 		s.ServedUDPPorts = []filter.PortRange{{First: perf.Port, Last: perf.Port}}
 	}
-	if *flagAllow != "" {
-		var allow tailcat.KeySet
-		for ks := range strings.SplitSeq(*flagAllow, ",") {
-			if ks == "none" {
-				continue // an empty set allows no clients
+	if *flagAllow != "" || *flagAllowList != "" {
+		allow := &tailcat.KeySet{}
+		if err := addAllowedKeys(allow, *flagAllow, ""); err != nil {
+			log.Fatal(err)
+		}
+		if *flagAllowList != "" {
+			if err := addAllowedKeysFromFile(allow, *flagAllowList); err != nil {
+				log.Fatal(err)
 			}
-			var k key.NodePublic
-			if err := k.UnmarshalText([]byte(ks)); err != nil {
-				log.Fatalf("invalid key %q in --allow: %v", ks, err)
-			}
-			allow.Add(k)
 		}
 		s.AllowClient = allow.Contains
 	}
@@ -1695,7 +1695,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 			fmt.Fprintf(os.Stderr, "# ⚠️ WARNING: saved key %q is not using a WireGuard PSK\n", *flagKey)
 		}
 	}
-	if sshWithoutAuth && *flagAllow == "" {
+	if sshWithoutAuth && *flagAllow == "" && *flagAllowList == "" {
 		if execArgs != nil {
 			fmt.Fprintln(os.Stderr, "# ⚠️ WARNING: no-auth-ssh runs the command for anyone with this address; keep it secret (never in a DNS TXT record) or restrict clients with --allow")
 		} else {
@@ -1753,6 +1753,46 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}()
 	}
 	select {}
+}
+
+// parseAllowFlag parses a comma-separated key list.
+func parseAllowFlag(v string) (*tailcat.KeySet, error) {
+	allow := &tailcat.KeySet{}
+	if err := addAllowedKeys(allow, v, ""); err != nil {
+		return nil, err
+	}
+	return allow, nil
+}
+
+func addAllowedKeys(allow *tailcat.KeySet, v, source string) error {
+	for ks := range strings.SplitSeq(v, ",") {
+		if ks == "none" {
+			continue
+		}
+		var k key.NodePublic
+		if err := k.UnmarshalText([]byte(ks)); err != nil {
+			return fmt.Errorf("invalid key %q in --allow%s: %w", ks, source, err)
+		}
+		allow.Add(k)
+	}
+	return nil
+}
+
+func addAllowedKeysFromFile(allow *tailcat.KeySet, path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading --allow-list file %q: %w", path, err)
+	}
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if err := addAllowedKeys(allow, line, fmt.Sprintf("-list file %q, line %d", path, i+1)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // localDialer dials the local services that incoming connections are
