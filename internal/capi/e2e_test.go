@@ -4,6 +4,7 @@
 package capi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,6 +154,59 @@ func TestE2ETCPRoundTripAndHalfClose(t *testing.T) {
 	}
 	if _, err := Accept(ln, x.token()); !errors.Is(err, ErrHandle) {
 		t.Fatalf("accept on closed listener: %v", err)
+	}
+}
+
+// TestE2EInfoAfterHalfClose verifies that Info still reports a TCP
+// connection's addresses after both directions have closed, at which point
+// the netstack conn of the side that closed second returns a nil RemoteAddr.
+func TestE2EInfoAfterHalfClose(t *testing.T) {
+	x := newE2E(t)
+	_, dialed, accepted := x.connect(TCP)
+	want := map[Handle]map[string]any{dialed: x.info(dialed), accepted: x.info(accepted)}
+
+	// The dialing side half-closes first. The accepting side sees EOF and
+	// half-closes second, which moves its endpoint through LAST_ACK to CLOSED
+	// while both handles stay registered.
+	if err := CloseWrite(dialed, x.token()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read(accepted, x.token(), make([]byte, 8)); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after peer half close = %v; want io.EOF", err)
+	}
+	if err := CloseWrite(accepted, x.token()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The endpoint state change is asynchronous. Wait until the underlying
+	// conn has dropped its remote address so Info is checked in the state
+	// that used to panic.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var gone bool
+		err := use(accepted, NoCancel, func(_ context.Context, _ *entry, c *connection) error {
+			gone = c.conn.RemoteAddr() == nil
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("accepted conn never dropped its remote address")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	for _, h := range []Handle{dialed, accepted} {
+		got := x.info(h)
+		for _, k := range []string{"local_address", "remote_address"} {
+			if got[k] != want[h][k] {
+				t.Errorf("handle %d: %s after half close = %v; want %v", h, k, got[k], want[h][k])
+			}
+		}
 	}
 }
 

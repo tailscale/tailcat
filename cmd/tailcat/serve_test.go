@@ -11,9 +11,11 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -67,6 +69,33 @@ func startUDPEcho(t *testing.T) uint16 {
 	return uint16(pc.LocalAddr().(*net.UDPAddr).Port)
 }
 
+// qrModuleRun matches a run of QR code module characters, which
+// qrcodes renders as either half/full block characters (the UTF-8
+// formats) or '#' (the ASCII fallback), depending on the terminal it
+// detects.
+var qrModuleRun = regexp.MustCompile(`[█▀▄#]{20,}`)
+
+// TestServeQR checks that serve --qr prints the address as a QR code
+// alongside the usual address line.
+func TestServeQR(t *testing.T) {
+	e := newTestEnv(t)
+	port := startEchoListener(t)
+	_, addr, serverStderr := e.startServer("serve", "--qr", strconv.Itoa(int(port)))
+
+	// Stderr is copied by a goroutine and can trail the address
+	// file, so poll for the QR code rather than checking once.
+	deadline := time.Now().Add(30 * time.Second)
+	for !qrModuleRun.MatchString(serverStderr.String()) {
+		if time.Now().After(deadline) {
+			t.Fatalf("server stderr lacks a QR code:\n%s", serverStderr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stderr := serverStderr.String(); !strings.Contains(stderr, addr) {
+		t.Errorf("server stderr lacks the tailcat address:\n%s", stderr)
+	}
+}
+
 func TestServeWithoutPSK(t *testing.T) {
 	t.Parallel()
 	e := newTestEnv(t)
@@ -89,6 +118,37 @@ func TestServeWithoutPSK(t *testing.T) {
 	}
 	if got != payload {
 		t.Errorf("server echoed %q; want %q", got, payload)
+	}
+}
+
+func TestServeHybrid(t *testing.T) {
+	for _, psk := range []bool{true, false} {
+		t.Run(fmt.Sprintf("psk=%v", psk), func(t *testing.T) {
+			t.Parallel()
+			e := newTestEnv(t)
+			port := startEchoListener(t)
+			_, addr, serverStderr := e.startServer("serve", "--hybrid", fmt.Sprintf("--psk=%v", psk), strconv.Itoa(int(port)))
+
+			ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ci.Hybrid {
+				t.Fatal("serve --hybrid produced a non-hybrid address")
+			}
+			if got := !ci.PresharedKey.IsZero(); got != psk {
+				t.Fatalf("address has PSK = %v; want %v", got, psk)
+			}
+
+			const payload = "echo over a hybrid handshake"
+			got, err := runClient(t, e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr, strconv.Itoa(int(port))), serverStderr, payload)
+			if err != nil {
+				t.Fatalf("client to hybrid server: %v", err)
+			}
+			if got != payload {
+				t.Errorf("server echoed %q; want %q", got, payload)
+			}
+		})
 	}
 }
 
@@ -416,5 +476,105 @@ func TestServePortMapping(t *testing.T) {
 	}
 	if got != payload {
 		t.Errorf("mapped port echoed %q; want %q", got, payload)
+	}
+}
+
+// startUnixEchoListener starts a Unix-domain socket server in dir,
+// closed with the test, that writes name and a colon and then echoes
+// what it reads. It returns the socket's path.
+func startUnixEchoListener(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name+".sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.WriteString(c, name+":")
+				io.Copy(c, c)
+			}()
+		}
+	}()
+	return path
+}
+
+// TestServeUnixSocket checks that a serve spec can proxy to Unix
+// sockets: a bare socket path takes connections to every port not
+// otherwise served, including the client's default port, and a
+// "port:unix:path" mapping takes priority over it for its port.
+func TestServeUnixSocket(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test needs Unix-domain socket mode checks, which are skipped on Windows")
+	}
+	t.Parallel()
+	e := newTestEnv(t)
+	dir := t.TempDir()
+	catchAll := startUnixEchoListener(t, dir, "catchall")
+	mapped := startUnixEchoListener(t, dir, "mapped")
+
+	_, addr, serverStderr := e.startServer("serve", catchAll+",8022:unix:"+mapped)
+	waitForLog(t, serverStderr, "# Proxying all other ports to unix:"+catchAll+"\n")
+	waitForLog(t, serverStderr, "# Proxying port 8022 to unix:"+mapped+"\n")
+
+	for _, tt := range []struct {
+		port string // client destination port, or "" for the default
+		want string // name of the socket that should answer
+	}{
+		{"", "catchall"},
+		{"8080", "catchall"},
+		{"8022", "mapped"},
+	} {
+		args := []string{"--key=new", "--derpmap-url=" + e.derpMapURL, addr}
+		if tt.port != "" {
+			args = append(args, tt.port)
+		}
+		const payload = "unix socket echo"
+		got, err := runClient(t, e.cmd(args...), serverStderr, payload)
+		if err != nil {
+			t.Fatalf("client to port %q: %v", tt.port, err)
+		}
+		if want := tt.want + ":" + payload; got != want {
+			t.Errorf("client to port %q got %q; want %q", tt.port, got, want)
+		}
+	}
+}
+
+// TestServeUnixSocketChecked checks that the server refuses to start
+// if a socket in its serve spec is missing or isn't a socket, rather
+// than failing each connection later.
+func TestServeUnixSocketChecked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test needs Unix-domain socket mode checks, which are skipped on Windows")
+	}
+	t.Parallel()
+	e := newTestEnv(t)
+	dir := t.TempDir()
+	notSocket := filepath.Join(dir, "plain-file")
+	if err := os.WriteFile(notSocket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		spec string
+		want string
+	}{
+		{filepath.Join(dir, "missing.sock"), "no such file or directory"},
+		{"8022:" + notSocket, "is not a Unix-domain socket"},
+	} {
+		out, err := e.cmd("serve", tt.spec).CombinedOutput()
+		if err == nil {
+			t.Errorf("serve %q succeeded; want failure", tt.spec)
+			continue
+		}
+		if !strings.Contains(string(out), "invalid Unix socket to serve") || !strings.Contains(string(out), tt.want) {
+			t.Errorf("serve %q output = %q; want an invalid Unix socket error containing %q", tt.spec, out, tt.want)
+		}
 	}
 }

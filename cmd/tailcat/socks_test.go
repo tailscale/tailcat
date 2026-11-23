@@ -204,6 +204,16 @@ func TestNormalizeListenAddrPort(t *testing.T) {
 			want:  "[2001:db8::1]:0",
 		},
 		{
+			name:  "omit port with unbracketed IPv6 address",
+			input: "::1",
+			want:  "[::1]:0",
+		},
+		{
+			name:  "omit port with unbracketed IPv6 unspecified address",
+			input: "::",
+			want:  "[::]:0",
+		},
+		{
 			name:  "others",
 			input: "foo",
 			want:  "foo:0",

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"maps"
 	"net"
@@ -45,6 +46,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/qrcodes"
 	"tailscale.com/util/set"
 	"tailscale.com/wgengine/filter"
 )
@@ -58,10 +60,13 @@ var (
 	flagFiles             *string
 	flagSSHAuthorizedKeys *string
 	flagPSK               *bool
+	flagHybrid            *bool
+	flagLog               *bool
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
 	flagDERPMapURL        *string
+	flagQR                *bool
 )
 
 var serveFS *ff.FlagSet
@@ -93,7 +98,7 @@ func getLogf() logger.Logf {
 // package-level flag value pointers.
 func newRootCommand() *ff.Command {
 	rootFS := ff.NewFlagSet("tailcat")
-	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio), 'perf' (accept throughput tests from 'tailcat perf'). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
+	flagServe = rootFS.StringLong("serve", "", "comma-separated list of port numbers, port ranges, port mappings, Unix socket paths, or service names to serve; the same list the serve subcommand takes as arguments. Service names are: 'all' (serve all ports), 'exit-node' (run an exit node for all addresses), 'ssh' (public-key-authenticated SSH server; see serve's --ssh-authorized-keys flag), 'no-auth-ssh' (auth-free SSH server), 'files' (file server for SFTP clients; see serve's --files flag), 'exec' (run the command after -- for each connection, with the connection as its stdio), 'perf' (accept throughput tests from 'tailcat perf'). If empty, it accepts a single connection on any port, writes it to stdout, and exits.")
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout; with perf, write the results as JSON")
@@ -102,9 +107,12 @@ func newRootCommand() *ff.Command {
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
 	flagFullAddress = serveFS.BoolLong("full-address", "print a longer tailcat address with embedded DERP server info instead of a reference to a DERP map region ID. This lets clients connect more quickly, without a DERP map fetch.")
+	flagQR = serveFS.BoolLong("qr", "display the tailcat address as a scannable QR code")
 	flagFiles = serveFS.StringLong("files", "", "directory to serve to SFTP clients (scp, sftp) with the 'files' service, with an optional :ro (read-only, the default), :rw (read-write), :wo (flat write-only drop box), or :wo+ (recursive write-only drop box) suffix. If empty, the current directory is served read-only. Giving --files implies the 'files' service.")
 	flagSSHAuthorizedKeys = serveFS.StringLong("ssh-authorized-keys", "", "comma-separated SSH public key sources for the 'ssh' service: authorized_keys file paths, literal OpenSSH public key lines, or names like 'alice@github' (fetched from https://github.com/alice.keys). All sources are loaded and validated at startup.")
 	flagPSK = serveFS.BoolLongDefault("psk", true, "include a WireGuard pre-shared key in the tailcat address (recommended). Set false only for shorter addresses and compatibility with tailcat clients v0.5.0 and earlier; this weakens security.")
+	flagHybrid = serveFS.BoolLong("hybrid", "EXPERIMENTAL: use the hybrid post-quantum (ML-KEM-768) WireGuard handshake, which doesn't depend on the tailcat address staying secret for its post-quantum protection. The address is shorter, with a 128-bit pre-shared key, but only works with clients that support the hybrid handshake; older clients reject it.")
+	flagLog = serveFS.BoolLong("log", "log an access record to stderr for each client that connects or is refused and each TCP connection or UDP flow it opens: the client's public key, the port or service reached, and whether it arrived directly or over a relay. Unlike --verbose, which turns on the library's debug logging, this logs only these events, tagged [peer] and [conn].")
 
 	recvFS := ff.NewFlagSet("recv").SetParent(serveFS)
 	flagRecvAcceptDirs := recvFS.BoolLong("accept-dirs", "accept directory trees (tailcat cp -r), keeping requested file names when available. The trade-off: senders can then make and stat directories and learn whether some names already exist in the drop box. The default flat mode reveals nothing about existing files, but accepts only single files, each saved under a server-chosen unique name.")
@@ -427,12 +435,19 @@ const serveLongHelp = `Run a tailcat server, printing its tailcat address for cl
 connect to. Running tailcat with no arguments is the same as running
 "tailcat serve" with no arguments.
 
-The arguments are port numbers, port ranges, port mappings, and
-service names, either as separate arguments or comma-separated.
-Ports are proxied to the same port on localhost. A port mapping
-"port:target" proxies a port elsewhere instead: to a different port
-on localhost ("8080:80") or to a host:port on the server's network
-("5555:10.2.200.213:5555", or "5555:[fd7a::1]:5555" for IPv6).
+The arguments are port numbers, port ranges, port mappings, Unix
+socket paths, and service names, either as separate arguments or
+comma-separated. Ports are proxied to the same port on localhost. A
+port mapping "port:target" proxies a port elsewhere instead: to a
+different port on localhost ("8080:80"), to a host:port on the
+server's network ("5555:10.2.200.213:5555", or "5555:[fd7a::1]:5555"
+for IPv6), or to a Unix-domain socket ("8022:/run/app.sock").
+
+An argument starting with "/" or "unix:" is a Unix-domain socket
+("unix:" also allows a relative path). Without a port, it serves every
+port not otherwise served, including the default port that "tailcat
+<tc-addr>" connects to, so "tailcat serve /run/app.sock" needs no port
+number at all. The server checks that each socket exists at startup.
 Service names are:
 
 	all          serve all ports
@@ -521,9 +536,23 @@ recursive write-only drop box:
 	tailcat serve --files=/inbox:wo files
 	tailcat serve --files=/tree-inbox:wo+ files
 
+Serve a port and also print the address as a scannable QR code:
+
+	tailcat serve --qr 8080
+
 Serve with a saved key (see genkey) and restrict clients:
 
 	tailcat serve --key=default --allow=nodekey:... 22
+
+Keep an access log of who connects and what they reach:
+
+	tailcat serve --log 22,80
+
+which writes lines like these to stderr, independent of --verbose:
+
+	[peer] allowed key=nodekey:abc...
+	[conn] open peer=nodekey:abc... proto=tcp port=22 service=forward via=derp:sfo
+	[conn] close peer=nodekey:abc... proto=tcp port=22 service=forward duration=8.104s
 
 Environment:
 
@@ -999,8 +1028,12 @@ func normalizeListenAddrPort(s string) string {
 		return net.JoinHostPort(host, port)
 	} else if port, err := strconv.ParseUint(s, 10, 16); err == nil {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
+	} else if _, err := netip.ParseAddr(s); err == nil {
+		// A bare IP address. JoinHostPort brackets an IPv6 address
+		// such as "::1", which appending ":0" would leave ambiguous.
+		return net.JoinHostPort(s, "0")
 	}
-	// Assume it's a hostname or IP without a port.
+	// Assume it's a hostname without a port.
 	return s + ":0"
 }
 
@@ -1242,9 +1275,16 @@ func splitExecArgs(args []string) (positional, execArgs []string) {
 // server runs a tailcat server. execArgs is the command given after
 // "--", or nil.
 func server(logf logger.Logf, serveSpec string, execArgs []string) {
-	portSet, services, targets, err := parsePortSet(serveSpec)
+	portSet, services, targets, catchAllSocket, err := parsePortSet(serveSpec)
 	if err != nil {
 		log.Fatalf("invalid port or service to serve: %v", err)
+	}
+	for _, t := range append(slices.Collect(maps.Values(targets)), catchAllSocket) {
+		if isSocketTarget(t) {
+			if err := checkSocketTarget(t); err != nil {
+				log.Fatalf("invalid Unix socket to serve: %v", err)
+			}
+		}
 	}
 	if execArgs != nil {
 		if len(execArgs) == 0 {
@@ -1259,6 +1299,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 			services = set.Set[string]{}
 		}
 		if !services.Contains("ssh") && !services.Contains("no-auth-ssh") {
+			if catchAllSocket != "" {
+				log.Fatal("a Unix socket for all other ports can't be combined with a command after --, which also accepts all ports")
+			}
 			services.Add("exec")
 		}
 	} else if services.Contains("exec") {
@@ -1306,7 +1349,7 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	// A server running only named services isn't the empty-port-list
 	// accept-one-connection stdout mode.
-	oneShotStdout := len(portSet) == 0 && len(services) == 0
+	oneShotStdout := len(portSet) == 0 && len(services) == 0 && catchAllSocket == ""
 
 	var reg *tailcfg.DERPRegion
 	var devDERP *derpserver.Server
@@ -1362,6 +1405,9 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		ci.PresharedKey = tailcat.PresharedKey{}
 	}
 	psk := ci.PresharedKey
+	if *flagHybrid {
+		psk = psk.ForHybrid()
+	}
 	if reg == nil {
 		// A key created with custom DERP hostnames (genkey --region=<host>)
 		// has pre-populated regions with no DERP map ID to reference, so its
@@ -1393,18 +1439,19 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	ci.ServerPublic = tailcat.NodePublic{NodePublic: priv.Public()}
 	ci.ServerDiscoPublic = tailcat.DiscoPublicForNode(priv)
+	ci.Hybrid = *flagHybrid
 	connStr := ci.Addr()
 
-	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Logf: logf, Region: reg}
+	s := &tailcat.Server{Key: priv, PresharedKey: psk, DisablePresharedKey: !usePSK, Hybrid: *flagHybrid, Logf: logf, Region: reg}
 	sshServices := services.Contains("ssh") || services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
 		log.Fatalf("Tailscale SSH server not supported on %v", runtime.GOOS)
 	}
 	// Outside the accept-one-connection stdout mode (and the exit-node
-	// and exec services, which accept any port), tighten the packet
-	// filter to just the served ports for defense in depth behind the
-	// OnTCP gate.
-	if !oneShotStdout && !services.Contains("exit-node") && !services.Contains("exec") {
+	// and exec services and a catch-all Unix socket, which accept any
+	// port), tighten the packet filter to just the served ports for
+	// defense in depth behind the OnTCP gate.
+	if !oneShotStdout && !services.Contains("exit-node") && !services.Contains("exec") && catchAllSocket == "" {
 		ports := slices.Sorted(maps.Keys(portSet))
 		if sshServices && !portSet.Contains(22) {
 			ports = append([]uint16{22}, ports...)
@@ -1433,27 +1480,30 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		s.AllowClient = allow.Contains
 	}
 
-	// localDialer dials the local services that incoming connections
-	// are proxied to. Its resolver answers "localhost" itself with
-	// both loopback addresses; see the localhostdns package comment
-	// for why the OS resolver can't be trusted to (issue #108).
-	localDialer := &net.Dialer{Resolver: localhostdns.Resolver}
-
-	// tcpTarget returns the host:port a served TCP port is proxied
-	// to: its mapping's target if the serve spec gave one, else the
-	// same port on localhost.
+	// tcpTarget returns the target a served TCP port is proxied to:
+	// its mapping's target (a host:port or a socket target) if the
+	// serve spec gave one, else the same port on localhost.
 	tcpTarget := func(port uint16) string {
 		if t, ok := targets[port]; ok {
 			return t
 		}
-		return fmt.Sprintf("localhost:%v", port)
+		return net.JoinHostPort("localhost", strconv.Itoa(int(port)))
 	}
 
-	tcpForwardTo := func(ipPortStr string) func(net.Conn) {
+	// tcpForwardTo returns a handler that proxies a connection to
+	// hostPort. That is an IP:port for exit node traffic, but a served
+	// port's target (see tcpTarget) is "localhost:port", a mapping's
+	// host:port, whose host can be a name such as "android.lan", or a
+	// Unix-domain socket target.
+	tcpForwardTo := func(hostPort string) func(net.Conn) {
+		network, addr, d := "tcp", hostPort, targetDialer(hostPort)
+		if isSocketTarget(hostPort) {
+			network, addr, d = "unix", socketPath(hostPort), systemDialer
+		}
 		return func(c net.Conn) {
-			localConn, err := localDialer.Dial("tcp", ipPortStr)
+			localConn, err := d.Dial(network, addr)
 			if err != nil {
-				logf("error proxying to %v: %v", ipPortStr, err)
+				logf("error proxying to %v: %v", hostPort, err)
 				c.Close()
 				return
 			}
@@ -1532,24 +1582,45 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	for _, port := range slices.Sorted(maps.Keys(targets)) {
 		fmt.Fprintf(os.Stderr, "# Proxying port %d to %v\n", port, targets[port])
 	}
+	if catchAllSocket != "" {
+		fmt.Fprintf(os.Stderr, "# Proxying all other ports to %v\n", catchAllSocket)
+	}
 
-	s.OnTCP = func(port uint16) (handler func(net.Conn)) {
+	// sshServiceName names the services behind sshHandler, which
+	// several can share on port 22.
+	var sshServiceName string
+	if sshServices {
+		var names []string
+		for _, n := range []string{"ssh", "no-auth-ssh", "files"} {
+			if services.Contains(n) {
+				names = append(names, n)
+			}
+		}
+		sshServiceName = strings.Join(names, "+")
+	}
+
+	// tcpHandler returns the handler for a connection to port, and
+	// the name of the service it reaches, for --log.
+	tcpHandler := func(port uint16) (handler func(net.Conn), service string) {
 		if port == 22 && sshHandler != nil {
-			return sshHandler
+			return sshHandler, sshServiceName
 		}
 		if port == perf.Port && perfSrv != nil {
-			return perfSrv.HandleTCP
+			return perfSrv.HandleTCP, "perf"
 		}
 		if portSet.Contains(port) {
-			return tcpForwardTo(tcpTarget(port))
+			return tcpForwardTo(tcpTarget(port)), "forward"
 		}
 		if execHandler != nil {
-			return execHandler
+			return execHandler, "exec"
+		}
+		if catchAllSocket != "" {
+			return tcpForwardTo(catchAllSocket), "forward"
 		}
 		if services.Contains("exit-node") {
 			// Being an exit node includes localhost without needing
 			// to specify all the local port ranges.
-			return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+			return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "exit-node"
 		}
 		if oneShotStdout {
 			return func(c net.Conn) {
@@ -1573,12 +1644,45 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 				defer cancel()
 				s.DrainTCP(ctx)
 				os.Exit(0)
-			}
+			}, "stdout"
 		}
 		if !portSet.Contains(port) {
-			return nil // RST
+			return nil, "" // RST
 		}
-		return tcpForwardTo(fmt.Sprintf("localhost:%v", port))
+		return tcpForwardTo(net.JoinHostPort("localhost", strconv.Itoa(int(port)))), "forward"
+	}
+
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		h, _ := tcpHandler(port)
+		return h
+	}
+	if *flagLog {
+		clog := newConnLog()
+		clog.attach(s)
+		s.OnTCP = func(port uint16) func(net.Conn) {
+			h, service := tcpHandler(port)
+			dst := fmt.Sprintf("port=%d", port)
+			if service != "" {
+				dst += " service=" + service
+			}
+			return clog.wrapTCP(dst, h)
+		}
+		if next := s.OnTCPForward; next != nil {
+			s.OnTCPForward = func(dst netip.AddrPort) func(net.Conn) {
+				return clog.wrapTCP("forward="+dst.String(), next(dst))
+			}
+		}
+		if next := s.OnUDPForward; next != nil {
+			s.OnUDPForward = func(dst netip.AddrPort) func(tailcat.ConnPacketConn) {
+				return clog.wrapUDP("forward="+dst.String(), next(dst))
+			}
+		}
+		// The perf service is the only one served over UDP.
+		if next := s.OnUDP; next != nil {
+			s.OnUDP = func(port uint16) func(tailcat.ConnPacketConn) {
+				return clog.wrapUDP(fmt.Sprintf("port=%d service=perf", port), next(port))
+			}
+		}
 	}
 
 	if err := s.Start(); err != nil {
@@ -1617,6 +1721,11 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	} else {
 		fmt.Fprintf(os.Stderr, "# 🐈 Server listening with saved key %q: %v\n", *flagKey, connStr)
 	}
+	if *flagQR {
+		if _, err := qrcodes.Fprintln(os.Stderr, qrcodes.FormatAuto, string(connStr)); err != nil {
+			log.Fatalf("failed to render QR code: %v", err)
+		}
+	}
 	if *flagJSON {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(connStr)})
 	}
@@ -1644,6 +1753,29 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 		}()
 	}
 	select {}
+}
+
+// localDialer dials the local services that incoming connections are
+// proxied to. Its resolver answers "localhost" itself with both
+// loopback addresses; see the localhostdns package comment for why
+// the OS resolver can't be trusted to (issue #108).
+var localDialer = &net.Dialer{Resolver: localhostdns.Resolver}
+
+// systemDialer dials proxy targets that aren't localhost names, using
+// the system resolver.
+var systemDialer = new(net.Dialer)
+
+// targetDialer returns the dialer for proxying to target, a host:port.
+// Localhost names go through localDialer. Any other host, such as a
+// port mapping's "android.lan", needs the system resolver:
+// localhostdns.Resolver answers every name but localhost with NXDOMAIN.
+// A target that doesn't parse as a host:port also gets systemDialer,
+// whose Dial then fails with the parse error.
+func targetDialer(target string) *net.Dialer {
+	if host, _, err := net.SplitHostPort(target); err == nil && localhostdns.IsLocalhost(host) {
+		return localDialer
+	}
+	return systemDialer
 }
 
 // parseFilesFlag parses the --files flag value: a directory with an
@@ -1684,16 +1816,36 @@ var (
 	numRx       = regexp.MustCompile(`^\d+$`)
 )
 
-// parsePortSet parses a serve spec: a comma-separated list of ports,
-// port ranges, service names, and port mappings of the form
-// "port:target", where target is a port on localhost or a host:port
-// elsewhere. It returns the set of served ports, the named services,
-// and the targets of the mapped ports; ports without a target are
-// proxied to the same port on localhost.
-func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], targets map[uint16]string, _ error) {
+// parsePortSet parses a serve spec. The spec is split on commas, and
+// each item, with surrounding spaces trimmed, is classified purely
+// lexically, without consulting the filesystem or network, by the
+// first of these rules that matches:
+//
+//   - A service name: all, ssh, no-auth-ssh, files, exec, exit-node,
+//     or perf.
+//   - A Unix-domain socket: an item starting with "/" or "unix:" (the
+//     prefix is dropped, and what follows may be a relative path).
+//     It is the catch-all target for connections to every port not
+//     otherwise served, like the exec service. At most one may be
+//     given, and not with all, exec, or exit-node.
+//   - A port mapping "port:target", split at the first colon. The
+//     target is a socket by the rule above, a bare port on
+//     localhost, or a host:port (an IPv6 host in brackets). A host
+//     named "unix" must be written some other way, such as by its
+//     IP address.
+//   - A port ("8080") or an inclusive port range ("8000-8010").
+//
+// Socket paths are not checked here; see checkSocketTarget.
+//
+// It returns the set of served ports, the named services, the
+// targets of the mapped ports, and the catch-all socket target, or ""
+// if none. Ports without a mapping are proxied to the same port on
+// localhost. Targets are dialable host:port strings, or socket
+// targets written as "unix:" and the path (see isSocketTarget).
+func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], targets map[uint16]string, catchAll string, _ error) {
 	services = set.Set[string]{}
 	if s == "" {
-		return nil, nil, nil, nil
+		return nil, nil, nil, "", nil
 	}
 	ret := set.Set[uint16]{}
 	targets = map[uint16]string{}
@@ -1709,7 +1861,7 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 			continue
 		case "ssh", "no-auth-ssh", "files":
 			if !tailCatSSHEnabled {
-				return nil, nil, nil, fmt.Errorf("SSH support not included in binary per build tags")
+				return nil, nil, nil, "", fmt.Errorf("SSH support not included in binary per build tags")
 			}
 			services.Add(r)
 			continue
@@ -1717,20 +1869,30 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 			services.Add(r)
 			continue
 		}
+		if target, ok, err := parseSocketTarget(r); ok {
+			if err != nil {
+				return nil, nil, nil, "", err
+			}
+			if catchAll != "" {
+				return nil, nil, nil, "", fmt.Errorf("more than one Unix socket (%s and %s) to serve all other ports; give each one a port, as in \"8022:%s\"", socketPath(catchAll), socketPath(target), r)
+			}
+			catchAll = target
+			continue
+		}
 		if portStr, targetStr, ok := strings.Cut(r, ":"); ok {
 			port, target, err := parsePortTarget(portStr, targetStr)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, "", err
 			}
 			if prev, ok := targets[port]; ok && prev != target {
-				return nil, nil, nil, fmt.Errorf("port %d is mapped to both %v and %v", port, prev, target)
+				return nil, nil, nil, "", fmt.Errorf("port %d is mapped to both %v and %v", port, prev, target)
 			}
 			ret.Add(port)
 			targets[port] = target
 			continue
 		}
 		if !numRx.MatchString(r) && !portRangeRx.MatchString(r) {
-			return nil, nil, nil, fmt.Errorf("%q is not a known named service (want one of: all, ssh, no-auth-ssh, files, exec, exit-node, perf)", r)
+			return nil, nil, nil, "", fmt.Errorf("%q is not a port, port range, port mapping, Unix socket path (starting with \"/\" or \"unix:\"), or service name (all, ssh, no-auth-ssh, files, exec, exit-node, perf)", r)
 		}
 		a, b := r, ""
 		if portRangeRx.MatchString(r) {
@@ -1739,35 +1901,59 @@ func parsePortSet(s string) (ports set.Set[uint16], services set.Set[string], ta
 
 		lo, err := strconv.ParseUint(a, 10, 16)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("%q is not a valid port", a)
+			return nil, nil, nil, "", fmt.Errorf("%q is not a valid port", a)
 		}
 		hi := lo
 		if b != "" {
 			hi, err = strconv.ParseUint(b, 10, 16)
 			if err != nil {
-				return nil, nil, nil, fmt.Errorf("%q is not a valid port number", b)
+				return nil, nil, nil, "", fmt.Errorf("%q is not a valid port number", b)
 			}
 		}
 		if hi < lo {
 			hi, lo = lo, hi
 		}
+		if lo == 0 {
+			return nil, nil, nil, "", fmt.Errorf("%q includes port 0, which is not a valid port", r)
+		}
 		for i := lo; i <= hi; i++ {
 			ret.Add(uint16(i))
 		}
 	}
-	return ret, services, targets, nil
+	if catchAll != "" {
+		for _, svc := range []string{"exec", "exit-node"} {
+			if services.Contains(svc) {
+				return nil, nil, nil, "", fmt.Errorf("a Unix socket for all other ports can't be combined with the %s service, which also accepts all ports", svc)
+			}
+		}
+		if len(ret) == 65535 {
+			return nil, nil, nil, "", fmt.Errorf("a Unix socket for all other ports can't be combined with \"all\", which serves every port")
+		}
+	}
+	return ret, services, targets, catchAll, nil
 }
 
 // parsePortTarget parses the two halves of a "port:target" serve
-// mapping. The target is either a bare port, meaning that port on
-// localhost, or a host:port (with an IPv6 host in brackets). It
-// returns the served port and the target as a dialable host:port.
+// mapping. The target is a Unix-domain socket (see parseSocketTarget),
+// a bare port, meaning that port on localhost, or a host:port (with an
+// IPv6 host in brackets). It returns the served port and the target as
+// a dialable host:port or a "unix:" socket target.
 func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil || port == 0 {
 		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", portStr, portStr+":"+targetStr)
 	}
+	if target, ok, err := parseSocketTarget(targetStr); ok {
+		if err != nil {
+			return 0, "", err
+		}
+		return uint16(port), target, nil
+	}
 	if numRx.MatchString(targetStr) {
+		p, err := strconv.ParseUint(targetStr, 10, 16)
+		if err != nil || p == 0 {
+			return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetStr, portStr+":"+targetStr)
+		}
 		return uint16(port), net.JoinHostPort("localhost", targetStr), nil
 	}
 	host, targetPort, err := net.SplitHostPort(targetStr)
@@ -1778,6 +1964,54 @@ func parsePortTarget(portStr, targetStr string) (uint16, string, error) {
 		return 0, "", fmt.Errorf("%q is not a valid port in mapping %q", targetPort, portStr+":"+targetStr)
 	}
 	return uint16(port), net.JoinHostPort(host, targetPort), nil
+}
+
+// socketPrefix marks a serve target as a Unix-domain socket path, both
+// in serve specs and in the targets parsePortSet returns.
+const socketPrefix = "unix:"
+
+// parseSocketTarget reports whether s, a serve spec item or a port
+// mapping's target, names a Unix-domain socket: it starts with "/" or
+// "unix:". If so, it returns the socket in its canonical "unix:" and
+// path form, or an error if the path is empty.
+func parseSocketTarget(s string) (target string, ok bool, _ error) {
+	path, hasPrefix := strings.CutPrefix(s, socketPrefix)
+	if !hasPrefix && !strings.HasPrefix(s, "/") {
+		return "", false, nil
+	}
+	if path == "" {
+		return "", true, fmt.Errorf("%q has no Unix socket path", s)
+	}
+	return socketPrefix + path, true, nil
+}
+
+// isSocketTarget reports whether target, as returned by parsePortSet,
+// is a Unix-domain socket rather than a host:port.
+func isSocketTarget(target string) bool {
+	return strings.HasPrefix(target, socketPrefix)
+}
+
+// socketPath returns the filesystem path of a socket target.
+func socketPath(target string) string {
+	return strings.TrimPrefix(target, socketPrefix)
+}
+
+// checkSocketTarget reports an error if the socket target doesn't
+// name an existing Unix-domain socket. The server checks each socket
+// at startup, so a typo fails immediately instead of on each
+// connection. A socket removed later fails at dial time.
+func checkSocketTarget(target string) error {
+	path := socketPath(target)
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	// On Windows, AF_UNIX socket files are reparse points that Go
+	// may not report as ModeSocket, so only existence is checked.
+	if runtime.GOOS != "windows" && fi.Mode().Type() != fs.ModeSocket {
+		return fmt.Errorf("%s is not a Unix-domain socket", path)
+	}
+	return nil
 }
 
 // portRanges coalesces the ascending-sorted ports into contiguous

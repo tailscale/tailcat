@@ -124,6 +124,45 @@ $ tailcat serve 5555:10.2.200.213:5555
 
 Then on the client, `tailcat forward tcXXXXXXXXX 5555` followed by `adb connect 127.0.0.1:5555`. Write IPv6 targets in brackets: `5555:[fd7a::1]:5555`.
 
+### Expose a local Unix-domain socket
+
+A serve argument starting with `/` (or `unix:`, which also allows a
+relative path) proxies connections to a local Unix-domain stream
+socket. Without a port, the socket gets every port not otherwise
+served, so a client needs no port number:
+
+```sh
+$ tailcat serve /run/git-annex/socket
+# Proxying all other ports to unix:/run/git-annex/socket
+# 🐈 Server listening with new address: tcXXXXXXXXX
+```
+
+```sh
+$ tailcat tcXXXXXXXXX
+```
+
+Each client connection gets its own connection to the socket. tailcat
+doesn't create the socket or change its permissions, and refuses to
+start if it doesn't exist. To serve several sockets, or a socket
+alongside other services, give each one a port with a mapping:
+
+```sh
+$ tailcat serve 22,8022:/run/app.sock
+```
+
+### Show the address as a QR code
+
+Pass `--qr` to `serve` to also print the tailcat address as a QR code,
+for copying it off a screen you can't paste from, such as a remote
+console. Scanning it with a phone camera gets you the address as text
+to copy; nothing opens automatically.
+
+```sh
+$ tailcat serve --qr 8080
+# 🐈 Server listening with new address: tcXXXXXXXXX
+[QR code]
+```
+
 ### Forward local ports to a tailcat server
 
 To make ports served by a tailcat server available as ordinary local TCP ports (for browsers, database clients, or other tools that do not support SOCKS or stdio), run `forward` with the server's tailcat address:
@@ -332,6 +371,37 @@ everyone else. `--via-derp` allows a relayed test through [a relay you
 run yourself](#bring-your-own-derp-relay); Tailscale's shared relays
 are always refused. `tailcat --json perf` prints the results as JSON.
 
+### Log incoming connections
+
+By default a server prints its address and then stays quiet. `--log`
+adds an access log on stderr: one line when a client is allowed in,
+and one when each of its TCP connections or UDP flows opens and
+closes. A UDP flow closes after two minutes without traffic.
+
+```sh
+$ tailcat serve --log 8000
+# 🐈 Server listening with new address: tcXXXXXXXXX
+2026/01/30 11:04:02 [peer] allowed key=nodekey:abc123...
+2026/01/30 11:04:02 [conn] open peer=nodekey:abc123... proto=tcp port=8000 service=forward via=derp:sfo
+2026/01/30 11:04:11 [conn] close peer=nodekey:abc123... proto=tcp port=8000 service=forward duration=8.104s
+```
+
+Clients are identified by public key, the same value `--allow` takes.
+A client's tailcat address is derived from its key, so it isn't
+logged. The `via` field is the only one with a real network address,
+and only once a direct path has replaced the DERP relay.
+
+With `--allow` set, clients that aren't on the list are logged too,
+once per key:
+
+```
+2026/01/30 11:07:30 [peer] refused key=nodekey:def456... reason=not-in-allow
+```
+
+This is separate from `--verbose`, which turns on the underlying
+library's debug logging. Both can be set at once, and the `[peer]` and
+`[conn]` tags stay greppable either way.
+
 ### Misc commands 
 
 Ping to test connectivity; each pong reports whether it arrived via a
@@ -433,6 +503,16 @@ WireGuard pre-shared keys are enabled by default and strongly recommended. For
 compatibility with tailcat clients v0.5.0 and earlier, `--psk=false` on `serve`
 or `genkey` produces shorter addresses, but removes post-quantum protection and
 protection from public DERP operators that observe the peers' public keys.
+
+The pre-shared key's post-quantum protection only lasts while the address
+stays secret. The experimental `tailcat serve --hybrid` flag instead uses
+a hybrid post-quantum (ML-KEM-768) WireGuard handshake, which protects
+recorded traffic even when the address is public, such as in a DNS TXT
+record. A hybrid address still contains a pre-shared key by default, to
+keep out DERP operators, but a shorter 128-bit one, so the address is
+shorter too.
+Clients need a tailcat version with hybrid support; older clients reject
+hybrid addresses.
 
 ```sh
 $ tailcat genkey --key=default --region=nyc
@@ -706,8 +786,10 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 - A separate path-discovery public key (Curve25519, 32 bytes)
 - By default, an independent WireGuard pre-shared key (256 random bits),
   which prevents a DERP operator that observes the peers' public keys from
-  joining the tunnel and provides post-quantum protection against recorded
-  traffic
+  joining the tunnel and, while the address stays secret, provides
+  post-quantum protection against recorded traffic
+- With `serve --hybrid` (experimental), a flag saying to use the hybrid
+  post-quantum WireGuard handshake, and only 128 bits of pre-shared key
 - DERP info. Either:
   1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
   2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
@@ -827,3 +909,12 @@ Go module client of the tailscale.com repo instead of a fork of it.
 
 It was open sourced August 2026 at the
 [TailscaleUp conference](https://tailscale.com/tailscaleup).
+
+## Swift / C bindings
+
+[`cmd/libtailcat/`](./cmd/libtailcat/) provides the C API.
+[`swift/`](./swift/) wraps that API as `TailcatKit`, a Swift 6 package with
+async/await servers, clients, and TCP connections for macOS 14+ and iOS 17+.
+Its Makefile builds the upstream C API as `CTailcat.xcframework` for macOS,
+iOS, and the simulator. See the [Swift README](./swift/README.md) for building,
+examples, and local relay tests.

@@ -1,0 +1,16 @@
+# Built by `make xcframework` in this directory.
+/CTailcat.xcframework
+# SwiftPM, xcodebuild (-derivedDataPath build) and Xcode state, except the
+# shared scheme below. xcodebuild's auto-generated SwiftPM schemes are
+# flaky on CI runners, so the TailcatKit scheme that CI builds with is
+# committed instead of generated.
+/.build
+/build
+/.swiftpm/*
+!/.swiftpm/xcode/
+/.swiftpm/xcode/*
+!/.swiftpm/xcode/xcshareddata/
+/.swiftpm/xcode/xcshareddata/*
+!/.swiftpm/xcode/xcshareddata/xcschemes/
+/.swiftpm/xcode/xcshareddata/xcschemes/*
+!/.swiftpm/xcode/xcshareddata/xcschemes/TailcatKit.xcscheme
