@@ -638,6 +638,128 @@ func TestDisconnectClient(t *testing.T) {
 	}
 }
 
+// TestClientRestartSameKey checks that when a client process restarts
+// with the same node key, the server stops using the old process's
+// direct UDP path as soon as the new process's meow arrives. The server
+// used to keep that path, so its WireGuard handshake response could go
+// to a dead port and the new client waited for the handshake retry,
+// about 5 s.
+func TestClientRestartSameKey(t *testing.T) {
+	t.Parallel()
+
+	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+	reg := dm.Regions[1]
+	if reg == nil {
+		t.Fatal("no region 1 in derpmap")
+	}
+
+	s := &Server{Key: key.NewNode(), Logf: mkLogger(t, "server"), Region: reg}
+	t.Cleanup(func() { s.Close() })
+	s.OnTCP = func(port uint16) func(net.Conn) {
+		if port != 80 {
+			return nil
+		}
+		return func(c net.Conn) {
+			io.WriteString(c, "hello\n")
+			c.Close()
+		}
+	}
+	if err := s.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+
+	dial := func(c *Client, timeout time.Duration) (time.Duration, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		t0 := time.Now()
+		conn, err := c.DialTCPPort(ctx, 80)
+		if err != nil {
+			return 0, err
+		}
+		defer conn.Close()
+		conn.SetReadDeadline(time.Now().Add(timeout))
+		got, err := io.ReadAll(conn)
+		if err != nil {
+			return 0, err
+		}
+		if string(got) != "hello\n" {
+			return 0, fmt.Errorf("read %q; want %q", got, "hello\n")
+		}
+		return time.Since(t0), nil
+	}
+
+	nodeKey := key.NewNode()
+
+	// serverPath reports the direct address the server uses for nodeKey,
+	// or "" if it sends over DERP.
+	serverPath := func() string {
+		if ps, ok := s.Status().Peer[nodeKey.Public()]; ok {
+			return ps.CurAddr
+		}
+		return ""
+	}
+	// waitDirect waits until c and the server both use a direct path and
+	// returns the server's address for c.
+	waitDirect := func(c *Client) string {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			res, err := c.DiscoPing(ctx)
+			cancel()
+			if err == nil && res.Endpoint != "" {
+				if p := serverPath(); p != "" {
+					return p
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no direct path both ways (last ping %+v, %v; server path %q)", res, err, serverPath())
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	prev := &Client{Server: s.TailcatAddr(), Key: nodeKey, Logf: mkLogger(t, "client0")}
+	t.Cleanup(func() { prev.Close() })
+	PingForTest(t, s, prev)
+	if _, err := dial(prev, 10*time.Second); err != nil {
+		t.Fatalf("client0: %v", err)
+	}
+
+	// Restart twice, so the second restart replaces a client that was
+	// itself a restart.
+	for i := 1; i <= 2; i++ {
+		oldPath := waitDirect(prev)
+		prev.Close()
+		// WireGuard rounds handshake timestamps down to about 16.8 ms and
+		// rejects one that isn't newer than the last from the same key
+		// as a replay. A real process restart takes longer than that.
+		time.Sleep(50 * time.Millisecond)
+
+		name := fmt.Sprintf("client%d", i)
+		c := &Client{Server: s.TailcatAddr(), Key: nodeKey, Logf: mkLogger(t, name)}
+		t.Cleanup(func() { c.Close() })
+
+		// Hand the new process's meow to the server before the client goes
+		// on the network. Once it is up, the client advertises its endpoints,
+		// and on a fast machine the server can find the new path that way
+		// before the first dial, which hides the bug. Here only the meow can
+		// make the server drop the previous process's path.
+		MeowForTest(t, s, c)
+		if p := serverPath(); p == oldPath {
+			t.Errorf("%s: after the new process's meow, the server still sends to the previous process at %s", name, p)
+		}
+
+		PingForTest(t, s, c)
+		d, err := dial(c, 10*time.Second)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Logf("%s dialed in %v", name, d)
+		prev = c
+	}
+}
+
 func TestUDP(t *testing.T) {
 	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
 	reg := dm.Regions[1]

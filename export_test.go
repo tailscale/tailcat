@@ -31,6 +31,20 @@ func WaitForDERPForTest(t testing.TB, s *Server, c *Client) {
 	}
 }
 
+// MeowForTest sets up c's network stack without going on the network and
+// hands its meow straight to s, as if it had arrived over DERP. A test can
+// then check how s took the client before c advertises any endpoints.
+func MeowForTest(t testing.TB, s *Server, c *Client) {
+	t.Helper()
+	c.startMu.Lock()
+	err := c.initLocked()
+	c.startMu.Unlock()
+	if err != nil {
+		t.Fatalf("initializing client: %v", err)
+	}
+	s.lb.onMeow(c.lb.pub, c.lb.discoPublic())
+}
+
 // PingForTest waits for the client's DERP connection and performs the
 // meow/meowed handshake.
 func PingForTest(t testing.TB, s *Server, c *Client) PingResult {
