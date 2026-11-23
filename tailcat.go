@@ -375,6 +375,12 @@ type locoBackend struct {
 	hybrid         bool // whether to use the hybrid post-quantum WireGuard handshake
 	isServer       bool
 
+	// discoPriv is the node's path-discovery key. A server derives it from
+	// its node key, because the key is part of its address. A client gets a
+	// fresh one per Client, so a server can tell a restarted client from the
+	// old one and drop the old one's direct path.
+	discoPriv key.DiscoPrivate
+
 	// discoPublic returns the node's disco public key, memoized to
 	// avoid redoing the curve25519 derivation for every client that
 	// joins.
@@ -686,7 +692,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 		return fmt.Errorf("missing RegionID in %v", logger.AsJSON(reg))
 	}
 
-	lb := newLocoBackend(priv, psk)
+	lb := newLocoBackend(priv, discoPrivateForNode(priv), psk)
 	lb.hybrid = s.Hybrid
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
@@ -1060,7 +1066,9 @@ func (s *Server) TailcatAddr() Addr {
 	return s.lb.tailcatAddr()
 }
 
-func newLocoBackend(priv key.NodePrivate, psk PresharedKey) *locoBackend {
+// newLocoBackend returns a backend for node key priv that uses discoPriv
+// for path discovery.
+func newLocoBackend(priv key.NodePrivate, discoPriv key.DiscoPrivate, psk PresharedKey) *locoBackend {
 	pub := priv.Public()
 	addr := tcAddrForKey(pub)
 	addrPrefix := netip.PrefixFrom(addr, addr.BitLen())
@@ -1071,8 +1079,9 @@ func newLocoBackend(priv key.NodePrivate, psk PresharedKey) *locoBackend {
 		addr:         addr,
 		addrPrefix:   addrPrefix,
 		presharedKey: psk,
+		discoPriv:    discoPriv,
 	}
-	lb.discoPublic = sync.OnceValue(func() key.DiscoPublic { return discoPrivateForNode(lb.priv).Public() })
+	lb.discoPublic = sync.OnceValue(func() key.DiscoPublic { return lb.discoPriv.Public() })
 	return lb
 }
 
@@ -1656,8 +1665,9 @@ func (b *locoBackend) onEngineStatus(st *wgengine.Status, err error) {
 // control plane flow uses in regular Tailscale. The peer's magicsock
 // reacts by disco-pinging those endpoints, which both teaches it a
 // direct path to us and teaches us its address from the pings we
-// receive back. It's called whenever our endpoints change and when a
-// peer first completes the meow handshake, and is idempotent.
+// receive back. It's called whenever our endpoints change, when a peer
+// first completes the meow handshake, and when a known client comes back
+// with a new disco key. It is idempotent.
 func (b *locoBackend) advertiseEndpoints() {
 	if runtime.GOOS == "js" {
 		// In browsers this does nothing: js/wasm has no UDP, so
@@ -1678,7 +1688,6 @@ func (b *locoBackend) advertiseEndpoints() {
 		return
 	}
 	payload := (&disco.CallMeMaybe{MyNumber: eps}).AppendMarshal(nil)
-	discoPriv := discoPrivateForNode(b.priv)
 	mc := b.sys.MagicSock.Get()
 	regionID := b.derpRegionID()
 	for _, p := range peers {
@@ -1688,7 +1697,7 @@ func (b *locoBackend) advertiseEndpoints() {
 		pkt := make([]byte, 0, 512)
 		pkt = append(pkt, disco.Magic...)
 		pkt = b.discoPublic().AppendTo(pkt)
-		pkt = append(pkt, discoPriv.Shared(p.DiscoKey()).Seal(payload)...)
+		pkt = append(pkt, b.discoPriv.Shared(p.DiscoKey()).Seal(payload)...)
 		if _, err := mc.SendDERPPacketTo(p.Key(), regionID, pkt); err != nil {
 			b.logf("advertiseEndpoints to %v: %v", p.Key().ShortString(), err)
 		}
@@ -1811,14 +1820,27 @@ func (lb *locoBackend) Start() error {
 }
 
 // onMeow handles a MeowPing from the client with node key src and
-// disco key discoPub, adding it as a WireGuard peer. It reports
-// whether the client is allowed and configured, meaning a "meowed"
+// disco key discoPub, adding it as a WireGuard peer. For a client it
+// already knows that comes back with a different disco key (a restarted
+// client), it updates the peer's disco key instead. It reports whether
+// the client is allowed and configured, meaning a "meowed"
 // acknowledgment may be sent.
 func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
 	b.logf("got meow from %v", src.String())
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, ok := b.clients[src]; ok {
+	if n, ok := b.clients[src]; ok {
+		if n.DiscoKey == discoPub {
+			return true
+		}
+		// The client restarted with a new disco key. Updating it makes
+		// magicsock forget the old process's direct path, so replies go
+		// through DERP until the new path is found.
+		n = n.Clone() // the old netmap still holds views of n
+		n.DiscoKey = discoPub
+		b.clients[src] = n
+		b.setNetworkMapLocked()
+		go b.advertiseEndpoints()
 		return true
 	}
 	if b.allowClient != nil {
@@ -2018,13 +2040,13 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 	if lb.isServer {
 		conf.DERPAppName = "tailcat-server"
 	}
-	// Both sides deterministically derive a separate disco key from their
-	// node private key. The public disco key, unlike the node key, is safe to
-	// expose in direct-path disco frames. Knowing our own disco private key
-	// is what lets either side seal the
-	// call-me-maybe messages that advertise our UDP endpoints (see
-	// locoBackend.advertiseEndpoints).
-	conf.ForceDiscoKey = discoPrivateForNode(lb.priv)
+	// The server derives a separate disco key from its node private key,
+	// and a client uses a fresh one (see locoBackend.discoPriv). The public
+	// disco key, unlike the node key, is safe to expose in direct-path
+	// disco frames. Knowing our own disco private key is what lets either
+	// side seal the call-me-maybe messages that advertise our UDP
+	// endpoints (see locoBackend.advertiseEndpoints).
+	conf.ForceDiscoKey = lb.discoPriv
 	netns.SetEnabled(false)
 	e, err := wgengine.NewUserspaceEngine(logf, conf)
 	if err != nil {
@@ -2122,7 +2144,7 @@ func (c *Client) initLocked() error {
 	if ci.ServerDiscoPublic.IsZero() {
 		return errors.New("legacy tailcat address lacks a separate disco key; generate a new address with an updated tailcat server")
 	}
-	lb := newLocoBackend(c.nodeKeyLocked(), ci.PresharedKey)
+	lb := newLocoBackend(c.nodeKeyLocked(), key.NewDisco(), ci.PresharedKey)
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
 	lb.serverPub = ci.ServerPublic.NodePublic
