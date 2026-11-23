@@ -176,6 +176,14 @@ $ tailcat forward tcXXXXXXXXX 18080:8080 3306
 
 A local port of 0 asks the operating system for a free port; each listener prints its address once it's listening.
 
+On Unix-like systems, a mapping with a non-numeric first component listens
+on that local Unix socket path and forwards to the remote port. For example:
+
+```sh
+$ tailcat forward tcXXXXXXXXX /tmp/server.sock:80
+$ tailcat forward tcXXXXXXXXX ./project/server.sock:80
+```
+
 To forward local ports to assets on the network reachable by an exit-node server, run the server in exit-node mode and specify each remote IP address and port in the mapping:
 
 ```sh
@@ -208,7 +216,7 @@ $ tailcat serve 80
 $ tailcat browse tcXXXXXXXXX
 ```
 
-This is an alias for `tailcat forward --open-browser <tc-addr> 0:80`: it opens `http://127.0.0.1:<port>/` in a web browser once the local listener is ready, then blocks, forwarding connections, until interrupted. The `--open-browser` flag works with any single `forward` port mapping.
+This is an alias for `tailcat forward --open-browser <tc-addr> 0:80`: it opens `http://127.0.0.1:<port>/` in a web browser once the local listener is ready, then blocks, forwarding connections, until interrupted. The `--open-browser` flag works with any single TCP `forward` port mapping.
 
 ### Public-key-authenticated SSH server
 
