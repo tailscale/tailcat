@@ -1,23 +1,120 @@
 # tailcat changelog
 
-## Unreleased
+## v0.8.0 (2026-11-22)
 
-- Releases now include an `android_arm64` binary for Termux. The
-  v0.7.0 notes said the linux binaries work under Termux, but on
-  Android 10 and newer Termux runs programs through Android's dynamic
-  linker, which rejects them with `has unexpected e_type: 2`. They
-  still work from `adb shell` or a rooted shell.
-  ([#184](https://github.com/tailscale/tailcat/issues/184); reported by
-  [@jy1655](https://github.com/jy1655))
+### Breaking Go API change
+
+- `Server.AllowedClients` and `Server.AddAllowedClient` are replaced
+  by the `Server.AllowClient` hook, a `func(key.NodePublic) bool`
+  asked about each client as it connects, so a program embedding
+  tailcat can decide at runtime, for example from a database, instead
+  of listing every key up front. A nil hook allows all clients. The
+  hook runs without any server lock held, so it may block and may call
+  other `Server` methods. For a list of keys, the new `KeySet` type's
+  `Contains` method is a ready-made hook:
+  `s.AllowClient = allow.Contains`. The new `Server.DisconnectClient`
+  drops a connected client; it does not reset the client's
+  connections, which stall instead. The `--allow` flag is unchanged.
+  ([#134](https://github.com/tailscale/tailcat/pull/134); see also
+  [#119](https://github.com/tailscale/tailcat/issues/119) and
+  [#120](https://github.com/tailscale/tailcat/pull/120) by
+  [@jormenjanssen](https://github.com/jormenjanssen), and
+  [#124](https://github.com/tailscale/tailcat/issues/124) and
+  [#125](https://github.com/tailscale/tailcat/pull/125) by
+  [@ybaelli](https://github.com/ybaelli))
+
+### New features
+
+- `tailcat serve` takes port mappings like `5555:10.2.200.213:5555`
+  to proxy a served port to a host on the server's network, or
+  `8080:80` to a different port on localhost, instead of always the
+  same port on localhost. This exposes one LAN service without the
+  whole network that `exit-node` would. Targets may be hostnames, such
+  as `5555:android.lan:5555`, resolved with the system resolver.
+  ([#128](https://github.com/tailscale/tailcat/pull/128);
+  hostnames in [#132](https://github.com/tailscale/tailcat/pull/132) by
+  [@breken-ai](https://github.com/breken-ai))
+- `tailcat serve` can proxy to a local Unix-domain socket. A serve
+  argument starting with `/` or `unix:` names the socket; given alone,
+  as in `tailcat serve /run/git-annex/socket`, it takes connections to
+  every port not otherwise served, so clients need no port number,
+  and as a mapping target, as in `8022:/run/app.sock`, it takes just
+  that port. The server refuses to start if a socket doesn't exist.
+  ([#93](https://github.com/tailscale/tailcat/issues/93), requested by
+  [@matrss](https://github.com/matrss);
+  [#104](https://github.com/tailscale/tailcat/pull/104) by
+  [@atirna](https://github.com/atirna))
+- `tailcat serve --log` writes an access log to stderr: a line when a
+  client is allowed in or refused by `--allow`, and lines when each of
+  its TCP connections or UDP flows opens and closes, with the client's
+  public key, the port and service or exit-node destination reached,
+  and whether the path is direct or via DERP. It is separate from
+  `--verbose`.
+  ([#39](https://github.com/tailscale/tailcat/issues/39);
+  [#99](https://github.com/tailscale/tailcat/pull/99) by
+  [@sksingh2005](https://github.com/sksingh2005), with UDP in
+  [#196](https://github.com/tailscale/tailcat/pull/196); thanks also to
+  [@avionicharshit-byte](https://github.com/avionicharshit-byte) and
+  [@SriVishnu230707](https://github.com/SriVishnu230707) for
+  [#127](https://github.com/tailscale/tailcat/pull/127) and
+  [#137](https://github.com/tailscale/tailcat/pull/137))
+- `tailcat serve --qr` also prints the server's address as a terminal
+  QR code, for copying it off a screen you can't paste from, such as a
+  remote console. This adds about 160 KB to release binaries.
+  ([#81](https://github.com/tailscale/tailcat/issues/81);
+  [#95](https://github.com/tailscale/tailcat/pull/95) by
+  [@harrisonhjones](https://github.com/harrisonhjones))
+- The `ssh` and `no-auth-ssh` services support SSH local port
+  forwarding (`ssh -L` and `ssh -D`) to loopback IP addresses on the
+  server, which VS Code Remote-SSH needs. Forwarding to hostnames
+  (including `localhost`) and remote forwarding (`ssh -R`) stay off,
+  as does forwarding for the `files` service and forced commands.
+  ([#141](https://github.com/tailscale/tailcat/pull/141) by
+  [@HappyAny](https://github.com/HappyAny))
+- `tailcat ssh` and `tailcat cp` take `-i <identity-file>` to log in
+  to a `tailcat serve ssh` server with a specific private key, without
+  an ssh config entry.
+  ([#177](https://github.com/tailscale/tailcat/pull/177) by
+  [@semmi88](https://github.com/semmi88))
+- New `tailcat perf` command and `perf` service run an iperf-like
+  throughput and latency test between a client and a server, over TCP
+  or UDP, in either or both directions, with one or more parallel
+  streams. UDP tests report loss, reordering, and jitter; all tests
+  report round-trip latency under load. By default the test refuses to
+  run until the path is direct, since a throughput test through a
+  shared DERP relay mostly measures its rate limit; `--via-derp` allows
+  relayed tests through your own relay, never through Tailscale's
+  shared ones.
+  ([#131](https://github.com/tailscale/tailcat/pull/131);
+  [#144](https://github.com/tailscale/tailcat/issues/144) and
+  [#145](https://github.com/tailscale/tailcat/pull/145) by
+  [@sntxrr](https://github.com/sntxrr) fixed relayed paths)
 - New experimental `tailcat serve --hybrid` flag (and `Server.Hybrid`
-  in the Go API) uses wireguard-go's hybrid post-quantum (ML-KEM-768)
-  WireGuard handshake, whose post-quantum protection doesn't depend on
-  the tailcat address staying secret. Hybrid addresses say so, so
-  clients use the hybrid handshake too, and carry a shorter 128-bit
-  pre-shared key, so they're shorter. Older clients reject hybrid
-  addresses that have a pre-shared key. ([#133](https://github.com/tailscale/tailcat/issues/133))
+  in the Go API) gives post-quantum protection that doesn't depend on
+  the tailcat address staying secret.
+
+  Through v0.5.0, tailcat had no post-quantum protection, and a DERP
+  relay's operator, who sees the public keys of everyone using the
+  relay, could connect to any server on it that didn't restrict
+  clients with `--allow`. v0.6.0 added a pre-shared key to tailcat
+  addresses, which DERP operators never see. It does two jobs: it
+  keeps DERP operators out, and it adds post-quantum protection. But
+  both only hold while the address stays secret; once it's published,
+  as in a DNS TXT record, neither does.
+
+  With `--hybrid`, the server and its clients use Tailscale's hybrid
+  key exchange, which adds ML-KEM-768 to the handshake, so connections
+  are post-quantum safe even when the address is public. The
+  pre-shared key stays, but its only job now is keeping out
+  compromised or malicious DERP operators, so hybrid addresses carry
+  128 bits of it instead of 256, making them shorter. Clients from
+  v0.7.0 and earlier can't use hybrid addresses and reject ones with a
+  pre-shared key at parse time.
+  ([#133](https://github.com/tailscale/tailcat/issues/133);
+  [#160](https://github.com/tailscale/tailcat/pull/160))
 - tailcat now works in restricted sandboxes such as ChatGPT Work's
-  ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412)):
+  ([tailscale/tailscale#22412](https://github.com/tailscale/tailscale/issues/22412);
+  [#176](https://github.com/tailscale/tailcat/pull/176)):
   - If a DERP relay's HTTP upgrade fails, tailcat retries by speaking
     DERP inside WebSockets, as browsers do. This gets through proxies
     that intercept TLS and allow WebSocket upgrades but block others.
@@ -26,45 +123,121 @@
     instead of failing to start.
   - Connections to DERP relays now go through the HTTP proxy named by
     `HTTPS_PROXY` (or the OS proxy settings, on Windows), or a SOCKS5
-    `ALL_PROXY`. Release binaries had compiled proxy support out.
-- **Breaking Go API change:** `Server.AllowedClients` and
-  `Server.AddAllowedClient` are replaced by the `Server.AllowClient`
-  hook, a `func(key.NodePublic) bool` asked about each client as it
-  connects, so a program embedding tailcat can decide at runtime, for
-  example from a database, instead of listing every key up front. A
-  nil hook allows all clients. The hook runs without any server lock
-  held, so it may block and may call other `Server` methods. For a
-  list of keys, the new `KeySet` type's `Contains` method is a
-  ready-made hook: `s.AllowClient = allow.Contains`. The new
-  `Server.DisconnectClient` drops a connected client; it does not
-  reset the client's connections, which stall instead. The `--allow`
-  flag is unchanged.
-  ([#119](https://github.com/tailscale/tailcat/issues/119) and
-  [#120](https://github.com/tailscale/tailcat/pull/120) by
-  [@jormenjanssen](https://github.com/jormenjanssen);
-  [#124](https://github.com/tailscale/tailcat/issues/124) and
-  [#125](https://github.com/tailscale/tailcat/pull/125) by
-  [@ybaelli](https://github.com/ybaelli))
-- New `tailcat perf` command and `perf` service run an iperf-like
-  throughput and latency test between a client and a server, over
-  TCP or UDP, in either or both directions, with one or more parallel
-  streams. UDP tests report loss, reordering, and jitter; all tests
-  report round-trip latency under load. By default the test refuses
-  to run until the path is direct, since a throughput test through a
-  shared DERP relay mostly measures its rate limit; `--via-derp`
-  allows relayed tests through your own relay, never through
-  Tailscale's shared ones.
-- `tailcat ssh` and `tailcat cp` take `-i <identity-file>` to log in
-  to a `tailcat serve ssh` server with a specific private key, without
-  an ssh config entry.
+    `ALL_PROXY`. Release binaries had compiled proxy support out;
+    keeping it adds about 250 KB.
+
+### Go library and language bindings
+
+- New `Server.PeerKey` returns the node key of the peer behind an
+  accepted connection or UDP flow, the key the tunnel authenticated,
+  so a program can tell which allowed client it is serving. This also
+  fixed `TAILCAT_PEER_KEY` being left out of the environment for UDP
+  flows. ([#129](https://github.com/tailscale/tailcat/pull/129) by
+  [@Mo3he](https://github.com/Mo3he))
+- New `Client.DERPRegion` reports which DERP region a client is using.
+- New C shared library, `cmd/libtailcat`, exposes servers, clients,
+  listeners, and connections through opaque handles, with per-call
+  error messages and tokens to cancel any operation from another
+  thread. It builds as a Windows DLL too, usable from MSVC through an
+  import library.
+  ([#130](https://github.com/tailscale/tailcat/pull/130) by
+  [@vvuk](https://github.com/vvuk); fixes in
+  [#169](https://github.com/tailscale/tailcat/pull/169) by
+  [@iyuzhang](https://github.com/iyuzhang) for
+  [#163](https://github.com/tailscale/tailcat/issues/163) reported by
+  [@rundel](https://github.com/rundel), and in
+  [#180](https://github.com/tailscale/tailcat/pull/180) and
+  [#191](https://github.com/tailscale/tailcat/pull/191) by
+  [@CJstate](https://github.com/CJstate))
+- New `TailcatKit` Swift package wraps the C library with Swift async
+  servers, clients, listeners, and connections for macOS 14+ and
+  iOS 17+. ([#64](https://github.com/tailscale/tailcat/pull/64) by
+  [@josuediazflores](https://github.com/josuediazflores))
+
+### Bug fixes
+
+- A client allowed to modify files on a `files` service (`:rw` or a
+  drop box) could crash the server with a malformed SFTP SETSTAT
+  request. ([#181](https://github.com/tailscale/tailcat/pull/181) by
+  [@CJstate](https://github.com/CJstate))
+- A client resetting a connection right after connecting could crash
+  an `exec` service server, along with every other connection on it.
+  ([#188](https://github.com/tailscale/tailcat/pull/188), from
+  [#167](https://github.com/tailscale/tailcat/pull/167) by
+  [@bra1nDump](https://github.com/bra1nDump))
+- An `exec` service connection whose client stayed connected without
+  sending anything kept running after the command exited, leaking a
+  zombie process. ([#189](https://github.com/tailscale/tailcat/pull/189);
+  thanks to [@CJstate](https://github.com/CJstate) for
+  [#182](https://github.com/tailscale/tailcat/pull/182))
+- A DERP map with a `null` region or node, from `--derpmap-url` or the
+  Go API, crashed tailcat instead of being ignored.
+  ([#183](https://github.com/tailscale/tailcat/pull/183) by
+  [@CJstate](https://github.com/CJstate))
+- `Addr.Resolve` kept the first two nodes of each region even if they
+  were STUN-only nodes, which can't relay and aren't encoded, leaving
+  the resolved address with fewer than two relays or none.
+  ([#173](https://github.com/tailscale/tailcat/pull/173) by
+  [@CJstate](https://github.com/CJstate))
+- `Server.Close` and `Client.Close` could hang forever, leaking the
+  WireGuard engine and DERP connection, after a few hundred recent
+  short connections. Closed TCP connections now linger in TIME-WAIT
+  for 5 seconds instead of 60, which also makes far fewer new
+  connections stall when they reuse a recent port.
+  ([#151](https://github.com/tailscale/tailcat/issues/151), reported by
+  [@FelineStateMachine](https://github.com/FelineStateMachine);
+  [#161](https://github.com/tailscale/tailcat/pull/161) by
+  [@dajiaohuang](https://github.com/dajiaohuang) and
+  [#186](https://github.com/tailscale/tailcat/pull/186))
+- On a host with no network interface other than loopback, such as a
+  build sandbox, a server could fail to pick a home DERP relay for its
+  first 20 to 26 seconds, so clients timed out.
+  ([#138](https://github.com/tailscale/tailcat/pull/138) by
+  [@sophronesis](https://github.com/sophronesis))
+- DNS now works on Android 9 and earlier, where v0.7.0 failed with
+  errors like `androiddns: bogus answer length`: those versions lack
+  the DNS resolver command that v0.7.0's Android support used.
+  ([#126](https://github.com/tailscale/tailcat/issues/126), reported by
+  [@risharde](https://github.com/risharde);
+  [#135](https://github.com/tailscale/tailcat/pull/135))
+- `tailcat serve` rejects port 0 in ports and ranges, and invalid
+  target ports like `5555:0` or `5555:99999` in mappings, instead of
+  accepting ports no client could reach.
+  ([#179](https://github.com/tailscale/tailcat/pull/179) by
+  [@CJstate](https://github.com/CJstate))
+- `tailcat socks --listen` accepts a bare IPv6 address such as `::1`,
+  as documented, instead of failing with "too many colons in address".
+  ([#155](https://github.com/tailscale/tailcat/pull/155) by
+  [@RaphaelFakhri](https://github.com/RaphaelFakhri))
+- Choosing a DERP region no longer leaves two UDP sockets and their
+  goroutines open for the life of the process (or of the caller's
+  context, for Go library callers).
+  ([#193](https://github.com/tailscale/tailcat/pull/193) by
+  [@joshuagay](https://github.com/joshuagay))
+- The web (WebAssembly) client kept a copy of every chunk it wrote
+  until the page closed.
+  ([#150](https://github.com/tailscale/tailcat/pull/150) by
+  [@gjija](https://github.com/gjija))
+
+### Packaging and dependencies
+
+- Releases now include an `android_arm64` binary for Termux. The
+  v0.7.0 notes said the linux binaries work under Termux, but on
+  Android 10 and newer Termux runs programs through Android's dynamic
+  linker, which rejects them with `has unexpected e_type: 2`. They
+  still work from `adb shell` or a rooted shell.
+  ([#184](https://github.com/tailscale/tailcat/issues/184), reported by
+  [@jy1655](https://github.com/jy1655);
+  [#185](https://github.com/tailscale/tailcat/pull/185))
+- Updated the tailscale.com dependency from its 2026-09-16 main branch
+  to its 2026-11-18 one, along with gVisor and wireguard-go. Building
+  from source now needs Go 1.27.4 or later. The WebAssembly build is
+  about 230 KB smaller, since it now omits UDP and NAT traversal code
+  a browser can't use.
+  ([#139](https://github.com/tailscale/tailcat/pull/139))
 
 ## v0.7.0 (2026-09-19)
 
-- `tailcat serve` takes port mappings like `5555:10.2.200.213:5555`
-  to proxy a served port to a host on the server's network, or
-  `8080:80` to a different port on localhost, instead of always the
-  same port on localhost. This exposes one LAN service without the
-  whole network that `exit-node` would.
 - `--serve=exit-node` servers now forward UDP flows; previously only
   TCP was forwarded, so DNS, QUIC, and other UDP traffic through an
   exit node went nowhere.
