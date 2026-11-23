@@ -23,23 +23,25 @@ import (
 func forwardCommand(parent *ff.FlagSet) *ff.Command {
 	fs := ff.NewFlagSet("forward").SetParent(parent)
 	bind := fs.StringLong("bind", "127.0.0.1", "listen address; used as the local address when a mapping only specifies a port")
-	openBrowser := fs.BoolLong("open-browser", "open a web browser to the local listener once it's listening; requires exactly one port mapping")
+	openBrowser := fs.BoolLong("open-browser", "open a web browser to the local listener once it's listening; requires exactly one TCP port mapping")
 	return &ff.Command{
 		Name:      "forward",
-		Usage:     "tailcat forward [flags] <tc-addr> <[local:]remote-port|local-port:remote-ip:remote-port> [<...> ...]",
-		ShortHelp: "forward local TCP ports to a tailcat server",
-		LongHelp: `Listen on local TCP ports and forward connections to a tailcat server.
+		Usage:     "tailcat forward [flags] <tc-addr> <[local:]remote-port|local-port:remote-ip:remote-port|socket-path:remote-port> [<...> ...]",
+		ShortHelp: "forward local TCP ports or Unix sockets to a tailcat server",
+		LongHelp: `Listen on local TCP ports or Unix sockets and forward connections to a tailcat server.
 
 A mapping with one port uses the same local and remote port. A mapping with
 local:remote uses different local and remote ports. A local port of 0 asks
 the operating system for a free port; each listener prints its address once
 it's listening. A mapping with a remote IP address and port requires the
-server to be running as an exit node. For example:
+server to be running as an exit node. A mapping whose first component is not
+a number uses a local Unix socket path and remote port. For example:
 
 	tailcat forward <tc-addr> 8080
 	tailcat forward --bind=0.0.0.0 <tc-addr> 18080:8080
 	tailcat forward <tc-addr> 0:8080
-	tailcat forward <tc-addr> 13306:192.168.1.10:3306`,
+	tailcat forward <tc-addr> 13306:192.168.1.10:3306
+	tailcat forward <tc-addr> /tmp/server.sock:80`,
 		Flags: fs,
 		Exec: func(ctx context.Context, args []string) error {
 			var onListen func(net.Listener)
@@ -55,9 +57,10 @@ server to be running as an exit node. For example:
 }
 
 type forwardSpec struct {
-	listenAddr string
-	target     netip.AddrPort
-	port       uint16
+	listenNetwork string
+	listenAddr    string
+	target        netip.AddrPort
+	port          uint16
 }
 
 func (s forwardSpec) remoteTarget() string {
@@ -104,7 +107,13 @@ func runForward(ctx context.Context, logf logger.Logf, bind string, args []strin
 			}
 			return usagef("mapping %q is invalid: %v", spec, err)
 		}
-		ln, err := net.Listen("tcp", mapping.listenAddr)
+		if onListen != nil && mapping.listenNetwork != "tcp" {
+			for _, ln := range listeners {
+				ln.Close()
+			}
+			return usagef("--open-browser requires a TCP port mapping")
+		}
+		ln, err := net.Listen(mapping.listenNetwork, mapping.listenAddr)
 		if err != nil {
 			for _, old := range listeners {
 				old.Close()
@@ -163,6 +172,21 @@ func forwardListener(ctx context.Context, logf logger.Logf, cl *tailcat.Client, 
 
 func parseForwardSpec(bind, spec string) (forwardSpec, error) {
 	local, target, hasColon := strings.Cut(spec, ":")
+	if !isDecimal(local) {
+		colon := strings.LastIndex(spec, ":")
+		if colon <= 0 {
+			return forwardSpec{}, fmt.Errorf("Unix socket mapping %q must include a remote port", spec)
+		}
+		remotePort, err := parseForwardPort(spec[colon+1:])
+		if err != nil {
+			return forwardSpec{}, fmt.Errorf("remote port: %w", err)
+		}
+		return forwardSpec{
+			listenNetwork: "unix",
+			listenAddr:    spec[:colon],
+			port:          remotePort,
+		}, nil
+	}
 	if !hasColon {
 		target = local
 	}
@@ -174,7 +198,10 @@ func parseForwardSpec(bind, spec string) (forwardSpec, error) {
 			return forwardSpec{}, fmt.Errorf("local port: %w", err)
 		}
 	}
-	mapping := forwardSpec{listenAddr: net.JoinHostPort(bind, strconv.Itoa(int(localPort)))}
+	mapping := forwardSpec{
+		listenNetwork: "tcp",
+		listenAddr:    net.JoinHostPort(bind, strconv.Itoa(int(localPort))),
+	}
 	if !hasColon {
 		mapping.port, err = parseForwardPort(target)
 		if err != nil {
@@ -193,6 +220,18 @@ func parseForwardSpec(bind, spec string) (forwardSpec, error) {
 	}
 	mapping.target = remoteAddr
 	return mapping, nil
+}
+
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseForwardPort(s string) (uint16, error) {

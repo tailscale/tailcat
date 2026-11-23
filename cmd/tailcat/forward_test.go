@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -17,21 +18,30 @@ import (
 
 func TestParseForwardSpec(t *testing.T) {
 	for _, tt := range []struct {
-		spec, wantAddr string
-		wantPort       uint16
-		wantTarget     string
-		wantErr        bool
+		spec, wantNetwork, wantAddr string
+		wantPort                    uint16
+		wantTarget                  string
+		wantErr                     bool
 	}{
-		{"8080", "127.0.0.1:8080", 8080, "", false},
-		{"18080:8080", "127.0.0.1:18080", 8080, "", false},
-		{"1:65535", "127.0.0.1:1", 65535, "", false},
-		{"0", "", 0, "", true},
-		{"0:8080", "127.0.0.1:0", 8080, "", false},
-		{"13306:192.168.1.10:3306", "127.0.0.1:13306", 0, "192.168.1.10:3306", false},
-		{"13306:[2001:db8::10]:3306", "127.0.0.1:13306", 0, "[2001:db8::10]:3306", false},
-		{"8080:0", "", 0, "", true},
-		{"8080:bad", "", 0, "", true},
-		{"8080:192.168.1.10:bad", "", 0, "", true},
+		{"8080", "tcp", "127.0.0.1:8080", 8080, "", false},
+		{"18080:8080", "tcp", "127.0.0.1:18080", 8080, "", false},
+		{"1:65535", "tcp", "127.0.0.1:1", 65535, "", false},
+		{"0", "", "", 0, "", true},
+		{"0:8080", "tcp", "127.0.0.1:0", 8080, "", false},
+		{"13306:192.168.1.10:3306", "tcp", "127.0.0.1:13306", 0, "192.168.1.10:3306", false},
+		{"13306:[2001:db8::10]:3306", "tcp", "127.0.0.1:13306", 0, "[2001:db8::10]:3306", false},
+		{"/tmp/server.sock:80", "unix", "/tmp/server.sock", 80, "", false},
+		{"/tmp/socket:with-colon.sock:80", "unix", "/tmp/socket:with-colon.sock", 80, "", false},
+		{"./project/server.sock:80", "unix", "./project/server.sock", 80, "", false},
+		{"../run/server.sock:80", "unix", "../run/server.sock", 80, "", false},
+		{"project/server.sock:80", "unix", "project/server.sock", 80, "", false},
+		{".server.sock:80", "unix", ".server.sock", 80, "", false},
+		{"8080:0", "", "", 0, "", true},
+		{"8080:bad", "", "", 0, "", true},
+		{"8080:192.168.1.10:bad", "", "", 0, "", true},
+		{"99999:80", "", "", 0, "", true},
+		{"project/server.sock:bad", "", "", 0, "", true},
+		{"project/server.sock", "", "", 0, "", true},
 	} {
 		t.Run(tt.spec, func(t *testing.T) {
 			got, err := parseForwardSpec("127.0.0.1", tt.spec)
@@ -45,10 +55,70 @@ func TestParseForwardSpec(t *testing.T) {
 			if got.target.IsValid() {
 				wantTarget = got.target.String()
 			}
-			if err != nil || got.listenAddr != tt.wantAddr || got.port != tt.wantPort || wantTarget != tt.wantTarget {
-				t.Fatalf("parseForwardSpec(%q) = %#v, %v; want address %q, port %d, target %q", tt.spec, got, err, tt.wantAddr, tt.wantPort, tt.wantTarget)
+			if err != nil || got.listenNetwork != tt.wantNetwork || got.listenAddr != tt.wantAddr || got.port != tt.wantPort || wantTarget != tt.wantTarget {
+				t.Fatalf("parseForwardSpec(%q) = %#v, %v; want network %q, address %q, port %d, target %q", tt.spec, got, err, tt.wantNetwork, tt.wantAddr, tt.wantPort, tt.wantTarget)
 			}
 		})
+	}
+}
+
+func TestForwardUnixSocketEndToEnd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix sockets are not supported by this test on Windows")
+	}
+	t.Parallel()
+	e := newTestEnv(t)
+	remotePort := startEchoListener(t)
+
+	_, tailcatAddr, serverStderr := e.startServer("--verbose", "serve", strconv.Itoa(int(remotePort)))
+	socketPath := filepath.Join(t.TempDir(), "server.sock")
+	forward := e.cmd("--verbose", "--key=new", "--derpmap-url="+e.derpMapURL, "forward", tailcatAddr, fmt.Sprintf("%s:%d", socketPath, remotePort))
+	stderrPath := filepath.Join(t.TempDir(), "forward-unix.stderr")
+	stderrFile, err := os.Create(stderrPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stderrFile.Close()
+	forward.Stderr = stderrFile
+	if err := forward.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = forward.Process.Kill()
+		_ = forward.Wait()
+	})
+	forwardStderr := func() string {
+		b, _ := os.ReadFile(stderrPath)
+		return string(b)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("forward never created Unix socket; stderr:\n%s\nserver stderr:\n%s", forwardStderr(), serverStderr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	const payload = "forwarded through a Unix socket"
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := conn.Read(got); err != nil {
+		t.Fatalf("read: %v\nforward stderr:\n%s\nserver stderr:\n%s", err, forwardStderr(), serverStderr)
+	}
+	if string(got) != payload {
+		t.Errorf("got %q; want %q", got, payload)
 	}
 }
 

@@ -373,9 +373,9 @@ Client mode, list the files a server offers:
 
 	tailcat ls [-l] <tc-addr>[:path]
 
-Client mode, forward local TCP ports to a tailcat server:
+Client mode, forward local TCP ports or Unix sockets to a tailcat server:
 
-	tailcat forward [--bind=<addr>] <tc-addr> <[local:]remote> ...
+	tailcat forward [--bind=<addr>] <tc-addr> <mapping> ...
 
 Client mode, run an ephemeral SOCKS5 proxy and pass its address
 as 'all_proxy' environment variable to a child process. Destination
