@@ -12,7 +12,7 @@ require (
 	github.com/peterbourgon/ff/v4 v4.0.0-beta.1
 	github.com/pkg/sftp v1.13.11
 	github.com/tailscale/gliderssh v0.3.4-0.20261026144310-31f7cf365d3a
-	github.com/tailscale/wireguard-go v0.0.0-20261117232807-a1800e9c5305
+	github.com/tailscale/wireguard-go v0.0.0-20261121000637-a8c4fbf26d6c
 	github.com/toqueteos/webbrowser v1.2.1
 	github.com/u-root/u-root v0.16.0
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
@@ -22,7 +22,7 @@ require (
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.50.0
 	gvisor.dev/gvisor v0.0.0-20261117040555-0303b2605d5e
-	tailscale.com v1.105.0-pre.0.20261118173401-6a92f86aceb2
+	tailscale.com v1.105.0-pre.0.20261122230636-678b3be66bd7
 )
 
 require (
