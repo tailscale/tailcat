@@ -1412,6 +1412,15 @@ func decodeDERPMap(data []byte) *tailcfg.DERPMap {
 	if err := json.Unmarshal(data, dm); err != nil {
 		return nil
 	}
+	// JSON nulls decode to nil pointers, which callers of
+	// [FetchDERPMap] would dereference. Drop them, as Expand does.
+	for rid, r := range dm.Regions {
+		if r == nil {
+			delete(dm.Regions, rid)
+			continue
+		}
+		r.Nodes = slices.DeleteFunc(r.Nodes, func(n *tailcfg.DERPNode) bool { return n == nil })
+	}
 	return dm
 }
 
